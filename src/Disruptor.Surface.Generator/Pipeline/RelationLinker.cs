@@ -58,11 +58,11 @@ internal static class RelationLinker
 
         // Variants whose own annotated members are empty get In / Out / Id / Payload
         // lifted from a matching annotated shared-shape interface (preview.56). Variants
-        // whose In or Out remain null after the lift attempt — either because no matching
-        // shared-shape interface is annotated, or the variant implements multiple
-        // annotated shared-shape interfaces — are dropped silently here, the same fail-
-        // soft contract the extractor used to enforce by returning null pre-lift.
-        var liftedVariants = LiftVariantsFromSharedShape(rewrittenVariants, sharedShapeCandidates, tableFullNames);
+        // whose In or Out remain null after the lift attempt — because no matching
+        // shared-shape interface is annotated — are dropped silently here, the same
+        // fail-soft contract the extractor used to enforce by returning null pre-lift.
+        // Real merge conflicts are still fail-closed, but now flow to emit as CG036.
+        var (liftedVariants, liftConflicts) = LiftVariantsFromSharedShape(rewrittenVariants, sharedShapeCandidates, tableFullNames);
 
         var unions = ComputeUnions(linked, forwardKinds, inverseKinds);
         var unionEndpoints = ComputeUnionEndpoints(linked, unionInterfaceCandidates, unionMembershipCandidates);
@@ -77,6 +77,7 @@ internal static class RelationLinker
             Unions: new EquatableArray<RelationUnion>(unions),
             UnionEndpoints: new EquatableArray<UnionEndpointModel>(unionEndpoints),
             SharedShapes: new EquatableArray<SharedShapeModel>(sharedShapes),
+            SharedShapeLiftConflicts: new EquatableArray<SharedShapeLiftConflict>(liftConflicts),
             Aggregates: new EquatableArray<AggregateModel>(aggregates),
             AggregateConflicts: new EquatableArray<string>(conflicts),
             CascadeCycles: new EquatableArray<string>(cascadeCycles),
@@ -95,14 +96,14 @@ internal static class RelationLinker
     /// emit-ready: every returned variant is guaranteed to have non-null In and Out.
     /// </para>
     /// </summary>
-    private static ImmutableArray<RelationVariantModel> LiftVariantsFromSharedShape(
+    private static (ImmutableArray<RelationVariantModel> Variants, ImmutableArray<SharedShapeLiftConflict> Conflicts) LiftVariantsFromSharedShape(
         ImmutableArray<RelationVariantModel> variants,
         ImmutableArray<SharedShapeInterfaceCandidate> candidates,
         HashSet<string> tableFullNames)
     {
         if (variants.Length == 0)
         {
-            return variants;
+            return (variants, ImmutableArray<SharedShapeLiftConflict>.Empty);
         }
 
         // Index candidates by FQN so the per-variant interface walk is O(1) per base.
@@ -119,6 +120,7 @@ internal static class RelationLinker
         }
 
         var builder = ImmutableArray.CreateBuilder<RelationVariantModel>(variants.Length);
+        var conflicts = ImmutableArray.CreateBuilder<SharedShapeLiftConflict>();
         foreach (var variant in variants)
         {
             var merged = variant;
@@ -131,8 +133,13 @@ internal static class RelationLinker
                     continue;
                 }
 
-                if (!TryMergeLift(merged, candidate, tableFullNames, out merged))
+                if (!TryMergeLift(merged, candidate, tableFullNames, out merged, out var conflict))
                 {
+                    if (conflict is not null)
+                    {
+                        conflicts.Add(conflict);
+                    }
+
                     conflicted = true;
                     break;
                 }
@@ -146,21 +153,37 @@ internal static class RelationLinker
             builder.Add(merged);
         }
 
-        return builder.ToImmutable();
+        return (builder.ToImmutable(), conflicts.ToImmutable());
     }
 
     private static bool TryMergeLift(
         RelationVariantModel variant,
         SharedShapeInterfaceCandidate lift,
         HashSet<string> tableFullNames,
-        out RelationVariantModel merged)
+        out RelationVariantModel merged,
+        out SharedShapeLiftConflict? conflict)
     {
         merged = variant;
+        conflict = null;
 
-        if (!TryMergeSingular(merged.In, RewriteLifted(lift.LiftedIn, tableFullNames), out var mergedIn)
-            || !TryMergeSingular(merged.Out, RewriteLifted(lift.LiftedOut, tableFullNames), out var mergedOut)
-            || !TryMergeSingular(merged.Id, RewriteLifted(lift.LiftedId, tableFullNames), out var mergedId))
+        var liftedIn = RewriteLifted(lift.LiftedIn, tableFullNames);
+        if (!TryMergeSingular(merged.In, liftedIn, out var mergedIn))
         {
+            conflict = CreateLiftConflict(variant, lift, merged.In!, liftedIn!);
+            return false;
+        }
+
+        var liftedOut = RewriteLifted(lift.LiftedOut, tableFullNames);
+        if (!TryMergeSingular(merged.Out, liftedOut, out var mergedOut))
+        {
+            conflict = CreateLiftConflict(variant, lift, merged.Out!, liftedOut!);
+            return false;
+        }
+
+        var liftedId = RewriteLifted(lift.LiftedId, tableFullNames);
+        if (!TryMergeSingular(merged.Id, liftedId, out var mergedId))
+        {
+            conflict = CreateLiftConflict(variant, lift, merged.Id!, liftedId!);
             return false;
         }
 
@@ -187,6 +210,7 @@ internal static class RelationLinker
 
             if (!CompatibleProperty(payload[existingIndex], rewritten))
             {
+                conflict = CreateLiftConflict(variant, lift, payload[existingIndex], rewritten);
                 return false;
             }
         }
@@ -222,6 +246,23 @@ internal static class RelationLinker
            && string.Equals(a.Name, b.Name, StringComparison.Ordinal)
            && string.Equals(a.Type.FullyQualifiedName, b.Type.FullyQualifiedName, StringComparison.Ordinal)
            && a.Type.IsNullable == b.Type.IsNullable;
+
+    private static SharedShapeLiftConflict CreateLiftConflict(
+        RelationVariantModel variant,
+        SharedShapeInterfaceCandidate lift,
+        RelationVariantPropertyModel existing,
+        RelationVariantPropertyModel lifted)
+        => new(
+            VariantFullName: variant.FullName,
+            InterfaceFullName: lift.InterfaceFullName,
+            ExistingRole: existing.Role,
+            ExistingName: existing.Name,
+            ExistingTypeFullName: existing.Type.FullyQualifiedName,
+            ExistingNullable: existing.Type.IsNullable,
+            LiftedRole: lifted.Role,
+            LiftedName: lifted.Name,
+            LiftedTypeFullName: lifted.Type.FullyQualifiedName,
+            LiftedNullable: lifted.Type.IsNullable);
 
     /// <summary>
     /// Per shared-shape interface candidate, collect every variant that lists the

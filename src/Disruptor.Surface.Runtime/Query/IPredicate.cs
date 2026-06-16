@@ -31,11 +31,29 @@ public sealed record RangePredicate(string Field, RangeOp Op, object? Value) : I
 public sealed record InPredicate(string Field, IReadOnlyList<object?> Values) : IPredicate;
 
 /// <summary>
+/// Negative set membership: <c>field NOT IN $param</c>. The parameter shape matches
+/// <see cref="InPredicate"/>.
+/// </summary>
+public sealed record NotInPredicate(string Field, IReadOnlyList<object?> Values) : IPredicate;
+
+/// <summary>
+/// Inclusive range: <c>field &gt;= $lower AND field &lt;= $upper</c>. Kept as one AST node
+/// so callers can express the common "between" shape without hand-composing two ranges.
+/// </summary>
+public sealed record BetweenPredicate(string Field, object? Lower, object? Upper) : IPredicate;
+
+/// <summary>
 /// Substring match for string fields. Compiles to <c>string::contains(field, $param)</c>.
 /// Case-sensitive — SurrealDB's <c>string::contains</c> doesn't fold case; pre-lower the
 /// substring or wrap in a case-insensitive variant if the schema needs one.
 /// </summary>
 public sealed record ContainsPredicate(string Field, string Substring) : IPredicate;
+
+/// <summary>String prefix match: <c>string::starts_with(field, $param)</c>.</summary>
+public sealed record StartsWithPredicate(string Field, string Prefix) : IPredicate;
+
+/// <summary>String suffix match: <c>string::ends_with(field, $param)</c>.</summary>
+public sealed record EndsWithPredicate(string Field, string Suffix) : IPredicate;
 
 /// <summary>Logical conjunction. Operands are AND-merged in compile order.</summary>
 public sealed record AndPredicate(IReadOnlyList<IPredicate> Operands) : IPredicate;

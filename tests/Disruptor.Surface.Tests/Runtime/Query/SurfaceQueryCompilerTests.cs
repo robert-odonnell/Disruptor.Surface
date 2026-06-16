@@ -1,5 +1,7 @@
 using Disruptor.Surface.Runtime;
 using Disruptor.Surface.Runtime.Query;
+using Disruptor.Surface.Tests.Runtime;
+using Disruptor.Surreal.Values;
 using Xunit;
 
 namespace Disruptor.Surface.Tests.Runtime.Query;
@@ -214,6 +216,26 @@ public sealed class SurfaceQueryCompilerTests
     }
 
     [Fact]
+    public void Compile_NotInPredicate_BindsArrayValue()
+    {
+        var pred = new NotInPredicate("status", ["closed", "ignored"]);
+
+        var sql = Invoke("issues", pred, pinnedId: null);
+
+        Assert.Equal("SELECT * FROM issues WHERE status NOT IN $_p0;", sql);
+    }
+
+    [Fact]
+    public void Compile_BetweenPredicate_ExpandsToInclusiveBounds()
+    {
+        var pred = new BetweenPredicate("priority", 2, 5);
+
+        var sql = Invoke("issues", pred, pinnedId: null);
+
+        Assert.Equal("SELECT * FROM issues WHERE (priority >= $_p0 AND priority <= $_p1);", sql);
+    }
+
+    [Fact]
     public void Compile_ContainsPredicate_EmitsStringContainsCall()
     {
         var pred = new ContainsPredicate("description", "security");
@@ -223,6 +245,20 @@ public sealed class SurfaceQueryCompilerTests
         Assert.Equal(
             "SELECT * FROM constraints WHERE string::contains(description, $_p0);",
             sql);
+    }
+
+    [Theory]
+    [InlineData("starts", "SELECT * FROM constraints WHERE string::starts_with(description, $_p0);")]
+    [InlineData("ends", "SELECT * FROM constraints WHERE string::ends_with(description, $_p0);")]
+    public void Compile_StringBoundaryPredicates_EmitStringFunctionCalls(string mode, string expected)
+    {
+        IPredicate pred = mode == "starts"
+            ? new StartsWithPredicate("description", "sec")
+            : new EndsWithPredicate("description", "ity");
+
+        var sql = Invoke("constraints", pred, pinnedId: null);
+
+        Assert.Equal(expected, sql);
     }
 
     [Fact]
@@ -287,6 +323,21 @@ public sealed class SurfaceQueryCompilerTests
     }
 
     [Fact]
+    public void PropertyExpr_NotIn_AndBetween_BuildExpectedNodes()
+    {
+        var expr = new PropertyExpr<int>("priority");
+
+        var notIn = Assert.IsType<NotInPredicate>(expr.NotIn(1, 2, 3));
+        var between = Assert.IsType<BetweenPredicate>(expr.Between(2, 5));
+
+        Assert.Equal("priority", notIn.Field);
+        Assert.Equal(3, notIn.Values.Count);
+        Assert.Equal("priority", between.Field);
+        Assert.Equal(2, between.Lower);
+        Assert.Equal(5, between.Upper);
+    }
+
+    [Fact]
     public void PropertyExpr_String_Contains_ExtensionBuildsContainsPredicate()
     {
         var expr = new PropertyExpr<string>("description");
@@ -296,6 +347,20 @@ public sealed class SurfaceQueryCompilerTests
         var c = Assert.IsType<ContainsPredicate>(pred);
         Assert.Equal("description", c.Field);
         Assert.Equal("security", c.Substring);
+    }
+
+    [Fact]
+    public void PropertyExpr_String_BoundaryExtensionsBuildPredicates()
+    {
+        var expr = new PropertyExpr<string>("description");
+
+        var starts = Assert.IsType<StartsWithPredicate>(expr.StartsWith("sec"));
+        var ends = Assert.IsType<EndsWithPredicate>(expr.EndsWith("ity"));
+
+        Assert.Equal("description", starts.Field);
+        Assert.Equal("sec", starts.Prefix);
+        Assert.Equal("description", ends.Field);
+        Assert.Equal("ity", ends.Suffix);
     }
 
     // ─────────────────────── Traversal coverage ───────────────────────
@@ -789,6 +854,60 @@ public sealed class SurfaceQueryCompilerTests
         Assert.Throws<InvalidOperationException>(() => query.CompileIdsOnly());
     }
 
+    [Fact]
+    public void CompileCount_WithWhereAndPinnedId_EmitsGroupAll()
+    {
+        var (sql, bindings) = new SurfaceQuery<TestTable>("symbols")
+            .WithId(new RecordId("symbols", "01HX7AF5"))
+            .Where(new PropertyExpr<string>("kind").Eq("method"))
+            .OrderBy(new PropertyExpr<string>("name"))
+            .Limit(10)
+            .Start(20)
+            .CompileCount();
+
+        Assert.Equal("SELECT count() AS count FROM symbols WHERE id = $_p0 AND kind = $_p1 GROUP ALL;", sql);
+        var id = Assert.IsType<SurrealRecordIdValue>(bindings["_p0"]);
+        Assert.Equal("symbols", id.SurrealRecordId.Table.Name);
+        Assert.Equal(new StringSurrealValue("method"), bindings["_p1"]);
+    }
+
+    [Fact]
+    public void CompileCount_WithIncludes_Throws()
+    {
+        var include = new IncludeChildrenNode(
+            ChildTable: "constraints",
+            ParentField: "design",
+            Filter: null,
+            Nested: []);
+        var query = new SurfaceQuery<TestTable>("designs").WithInclude(include);
+
+        Assert.Throws<InvalidOperationException>(() => query.CompileCount());
+    }
+
+    [Fact]
+    public async Task CountAsync_ReturnsCountFromFirstResultRow()
+    {
+        var (db, conn) = FakeSurreal.NullWithRecording();
+        conn.Responder = (method, _, _) => method switch
+        {
+            "query" => WrapAsQueryResponse(new SurrealListValue(
+            [
+                new SurrealObjectValue(new SurrealObject { ["count"] = 42 }),
+            ])),
+            _ => SurrealValue.None,
+        };
+
+        var count = await new SurfaceQuery<TestTable>("symbols")
+            .Where(new PropertyExpr<string>("kind").Eq("method"))
+            .CountAsync(db);
+
+        Assert.Equal(42, count);
+        var query = conn.Sent.Single(s => s.Method == "query");
+        var (sql, bindings) = ExtractQueryParts(query.Params);
+        Assert.Equal("SELECT count() AS count FROM symbols WHERE kind = $_p0 GROUP ALL;", sql);
+        Assert.Equal(new StringSurrealValue("method"), bindings["_p0"]);
+    }
+
     /// <summary>Test stand-in for a generated entity — minimal IEntity shape so Query&lt;T&gt; can construct.</summary>
     private sealed class TestTable : IEntity
     {
@@ -832,6 +951,25 @@ public sealed class SurfaceQueryCompilerTests
             throw tie.InnerException;
         }
     }
+
+    private static (string Sql, SurrealObject Bindings) ExtractQueryParts(SurrealValue? @params)
+    {
+        var list = Assert.IsType<SurrealListValue>(@params);
+        var sql = Assert.IsType<StringSurrealValue>(list.List[0]).Value;
+        var bindings = Assert.IsType<SurrealObjectValue>(list.List[1]).Object;
+        return (sql, bindings);
+    }
+
+    private static SurrealValue WrapAsQueryResponse(SurrealValue rows)
+        => new SurrealListValue(
+        [
+            new SurrealObjectValue(new SurrealObject
+            {
+                ["status"] = "OK",
+                ["time"] = "1ms",
+                ["result"] = rows,
+            }),
+        ]);
 
     /// <summary>Test stand-in for the generator-emitted typed id structs.</summary>
     private readonly record struct TypedTestId(string Table, string Value) : IRecordId

@@ -216,10 +216,10 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     private readonly MaterializedSessionState state = new();
 
 
-    // One-shot lifecycle invariant: a session represents one loaded snapshot plus one
-    // pending mutation batch. Successful CommitAsync or AbandonAsync flips `_closed` to
-    // true, after which every public method throws. Hydrate-side helpers stay open
-    // because they only ever run during initial load — before the user gets a handle.
+    // One-shot lifecycle invariant: a session represents one loaded snapshot. Abandon
+    // or any failed async dispatch closes it, after which every public method throws.
+    // Hydrate-side helpers stay open because they only ever run during initial load —
+    // before the user gets a handle.
     private bool closed;
 
     private void ThrowIfClosed()
@@ -231,7 +231,7 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
         }
     }
 
-    /// <summary>True after <see cref="CommitAsync"/> or <see cref="Abandon"/> has run; further reads or writes throw.</summary>
+    /// <summary>True after <see cref="Abandon"/> or a failed async dispatch; further reads or writes throw.</summary>
     public bool IsClosed => closed;
 
     // Filled by the loader's IHydrationSink.Track. ISaveContext.IsTracked checks
@@ -402,11 +402,9 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
 
     // ──────────────────────────── writes ─────────────────────────────────────
     //
-    // All writes mutate the in-memory snapshot and append to the dirty batch. Nothing
-    // touches Surreal until CommitAsync runs, so the session doesn't gate writes on
-    // any "is this writable?" flag — domain code is free to mutate freely. Persistence
-    // permission is the caller's concern, expressed through whether they hold a
-    // WriterLease and choose to call CommitAsync.
+    // Sync operations mutate the in-memory snapshot; async operations dispatch through
+    // the caller's SurrealTransaction immediately. The session doesn't gate writes on an
+    // ownership flag — persistence permission is the caller's concern.
 
     /// <summary>
     /// Register a fresh entity with this session. <c>Bind</c> wires the session into the

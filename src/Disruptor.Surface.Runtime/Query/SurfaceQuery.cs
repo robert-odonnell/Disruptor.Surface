@@ -217,6 +217,39 @@ public sealed class SurfaceQuery<T>
     }
 
     /// <summary>
+    /// Compile this query as a flat count selection:
+    /// <c>SELECT count() AS count FROM table ... GROUP ALL</c>. Includes are not
+    /// supported, and ordering/paging are ignored because count reports the number of
+    /// rows matching the query's id pin and filters.
+    /// </summary>
+    public (string Sql, SurrealObject Bindings) CompileCount()
+    {
+        if (Includes.Count > 0)
+        {
+            throw new InvalidOperationException(
+                "CompileCount does not support Include* calls. Drop the includes before counting.");
+        }
+        return SurfaceQueryCompiler.CompileCount(Table, Filter, PinnedId);
+    }
+
+    /// <summary>Execute this query as a server-side count.</summary>
+    public Task<long> CountAsync(SurrealClient db, CancellationToken ct = default)
+        => CountAsync(db.QueryAsync, ct);
+
+    /// <inheritdoc cref="CountAsync(Disruptor.Surreal.SurrealClient, CancellationToken)"/>
+    public Task<long> CountAsync(SurrealTransaction tx, CancellationToken ct = default)
+        => CountAsync(tx.QueryAsync, ct);
+
+    private async Task<long> CountAsync(
+        Func<string, SurrealObject?, CancellationToken, Task<SurrealQueryResponse>> queryFn,
+        CancellationToken ct)
+    {
+        var (sql, bindings) = CompileCount();
+        var response = await queryFn(sql, bindings, ct);
+        return ExtractCount(ExtractRows(response));
+    }
+
+    /// <summary>
     /// Compile, execute, and hydrate the query against a caller-supplied
     /// <see cref="SurrealSession"/>. The session receives every traversed slice
     /// (root rows, inline-ref expansions, nested children) through
@@ -299,6 +332,48 @@ public sealed class SurfaceQuery<T>
     /// </summary>
     internal static SurrealValue? ExtractRows(SurrealQueryResponse response)
         => response.Count == 0 ? null : response.Take(0);
+
+    private static long ExtractCount(SurrealValue? rows)
+    {
+        if (rows is null or SurrealNullValue or SurrealNoneValue)
+        {
+            return 0;
+        }
+
+        if (rows is SurrealNumberValue number)
+        {
+            return number.SurrealNumber.AsInt();
+        }
+
+        if (rows is SurrealListValue { List.Count: 0 })
+        {
+            return 0;
+        }
+
+        if (rows is SurrealListValue list)
+        {
+            return ExtractCount(list.List[0]);
+        }
+
+        if (rows is SurrealObjectValue obj)
+        {
+            if (obj.Object.TryGetValue("count", out var count))
+            {
+                return ExtractCount(count);
+            }
+
+            if (obj.Object.Count == 1)
+            {
+                foreach (var pair in obj.Object)
+                {
+                    return ExtractCount(pair.Value);
+                }
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"Count query returned {rows.GetType().FullName}, expected a number or an object with a 'count' field.");
+    }
 
     /// <summary>
     /// Recursively hydrate the included slices on a single row and mark each visited

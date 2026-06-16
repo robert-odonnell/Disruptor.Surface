@@ -18,7 +18,7 @@ public sealed record ReferenceFieldInfo(
 /// an implementation per consumer (<c>GeneratedReferenceRegistry</c>) and exposes it as
 /// a static property on the user's <c>[CompositionRoot]</c> partial — e.g.
 /// <c>Workspace.ReferenceRegistry</c>. <see cref="SurrealSession"/> takes one in its
-/// constructor and <see cref="CommitPlanner.Build"/> reads through it; there is no
+/// constructor and reads through it during delete planning; there is no
 /// process-global registry, so multiple Disruptor.Surface-generated models can coexist in the
 /// same process without trampling each other.
 /// </summary>

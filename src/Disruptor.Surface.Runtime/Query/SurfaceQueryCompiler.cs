@@ -118,6 +118,23 @@ internal static class SurfaceQueryCompiler
     }
 
     /// <summary>
+    /// Build the SurrealQL + bindings for a matching-row count. Count is a flat terminal:
+    /// traversal includes and projection shape are intentionally outside this compiler path.
+    /// </summary>
+    public static (string Sql, SurrealObject Bindings) CompileCount(
+        string table,
+        IPredicate? filter,
+        RecordId? pinnedId)
+    {
+        var b = new Builder();
+        var sb = new StringBuilder();
+        sb.Append("SELECT count() AS count FROM ").Append(table.Identifier());
+        b.AppendWhere(sb, filter, pinnedId);
+        sb.Append(" GROUP ALL;");
+        return (sb.ToString(), b.Bindings);
+    }
+
+    /// <summary>
     /// Per-compile mutable state: the bindings accumulator + a monotonic counter that
     /// names each placeholder. Keeps the <see cref="SurfaceQueryCompiler"/> static surface clean
     /// while letting the recursive subselect / predicate walk share the binding stream.
@@ -147,6 +164,17 @@ internal static class SurfaceQueryCompiler
             int? limit,
             int? start)
         {
+            AppendWhere(sb, filter, pinnedId);
+
+            // SurrealQL clause order is fixed: ORDER BY → LIMIT → START. Stable order
+            // matches the docs and avoids "why doesn't this paginate" surprises.
+            AppendOrderBy(sb, orderClauses);
+            AppendLimit(sb, limit);
+            AppendStart(sb, start);
+        }
+
+        public void AppendWhere(StringBuilder sb, IPredicate? filter, RecordId? pinnedId)
+        {
             var hasWhere = false;
             if (pinnedId is { } id)
             {
@@ -157,12 +185,6 @@ internal static class SurfaceQueryCompiler
             {
                 sb.Append(hasWhere ? " AND " : " WHERE ").Append(CompilePredicate(filter));
             }
-
-            // SurrealQL clause order is fixed: ORDER BY → LIMIT → START. Stable order
-            // matches the docs and avoids "why doesn't this paginate" surprises.
-            AppendOrderBy(sb, orderClauses);
-            AppendLimit(sb, limit);
-            AppendStart(sb, start);
         }
 
         private static void AppendOrderBy(StringBuilder sb, IReadOnlyList<OrderClause>? clauses)
@@ -295,7 +317,11 @@ internal static class SurfaceQueryCompiler
             EqPredicate eq        => $"{eq.Field.Identifier()} = {Allocate(eq.Value)}",
             RangePredicate rp     => $"{rp.Field.Identifier()} {RangeOpText(rp.Op)} {Allocate(rp.Value)}",
             InPredicate ip        => $"{ip.Field.Identifier()} IN {Allocate(ip.Values)}",
+            NotInPredicate nip    => $"{nip.Field.Identifier()} NOT IN {Allocate(nip.Values)}",
+            BetweenPredicate bp   => $"({bp.Field.Identifier()} >= {Allocate(bp.Lower)} AND {bp.Field.Identifier()} <= {Allocate(bp.Upper)})",
             ContainsPredicate cp  => $"string::contains({cp.Field.Identifier()}, {Allocate(cp.Substring)})",
+            StartsWithPredicate sp => $"string::starts_with({sp.Field.Identifier()}, {Allocate(sp.Prefix)})",
+            EndsWithPredicate ep   => $"string::ends_with({ep.Field.Identifier()}, {Allocate(ep.Suffix)})",
             AndPredicate a        => $"({string.Join(" AND ", a.Operands.Select(CompilePredicate))})",
             OrPredicate  o        => $"({string.Join(" OR ", o.Operands.Select(CompilePredicate))})",
             NotPredicate n        => $"!({CompilePredicate(n.Operand)})",

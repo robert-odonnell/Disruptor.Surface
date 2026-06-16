@@ -286,6 +286,7 @@ public sealed class EmissionShapeTests
 
         // Schema chunks live behind a static accessor on the user's [CompositionRoot].
         Assert.Contains("public static System.Collections.Generic.IReadOnlyList<string> Schema", allSrc);
+        Assert.Matches("public static string SchemaFingerprint => \"[0-9a-f]{64}\";", allSrc);
         // Reference registry exposed the same way; the impl class is internal.
         Assert.Contains("public static global::Disruptor.Surface.Runtime.IReferenceRegistry ReferenceRegistry", allSrc);
         Assert.Contains("internal sealed class GeneratedReferenceRegistry", allSrc);
@@ -2210,10 +2211,10 @@ public sealed class EmissionShapeTests
     }
 
     [Fact]
-    public void Lift_ConflictingAnnotatedInterfaces_DropsVariant()
+    public void Lift_ConflictingAnnotatedInterfaces_FiresCG036_AndDropsVariant()
     {
-        // Compatible fragments merge, but conflicting endpoint contracts still fail
-        // closed. The linker must not guess which Source type defines the edge table.
+        // Compatible fragments merge, but conflicting endpoint contracts fail closed
+        // with CG036. The linker must not guess which Source type defines the edge table.
         var source = """
             using Disruptor.Surface.Annotations;
             using Disruptor.Surface.Runtime;
@@ -2251,7 +2252,16 @@ public sealed class EmissionShapeTests
             [CompositionRoot] public partial class Workspace { }
             """;
 
-        var (result, _, _, _) = GeneratorHarness.Run(source);
+        var (result, _, runDiags, _) = GeneratorHarness.Run(source);
+        var diagnostic = Assert.Single(runDiags.Where(d => d.Id == "CG036"));
+        var message = diagnostic.GetMessage();
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+        Assert.Contains("M.CallsRelation", message);
+        Assert.Contains("M.ICodeSymbolEdgeB", message);
+        Assert.Contains("Source", message);
+        Assert.Contains("CodeSymbolId", message);
+        Assert.Contains("OtherSymbolId", message);
+
         var variant = GeneratorHarness.FindGeneratedFile(result, "CallsRelation.RelationVariant.g.cs");
         Assert.Null(variant);
     }

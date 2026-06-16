@@ -6,7 +6,7 @@
 
     <IsPackable>true</IsPackable>
     <PackageId>Disruptor.Surface.Runtime</PackageId>
-    <Description>Runtime types for Disruptor.Surface — typed RecordId structs, SurrealSession, IRelationKind, WriterLease, the Surreal HTTP transport, and the commit pipeline. Pair with Disruptor.Surface.Generator (analyzer-style PackageReference) to drive [Table]-based code generation.</Description>
+    <Description>Runtime types for Disruptor.Surface — typed RecordId structs, SurrealSession, relation markers, hydration helpers, and query primitives. Pair with Disruptor.Surface.Generator (analyzer-style PackageReference) to drive [Table]-based code generation.</Description>
   </PropertyGroup>
 
   <ItemGroup>

@@ -542,6 +542,30 @@ public sealed class ModelGenerator : IIncrementalGenerator
         // hydration dispatcher) emit alongside.
         RelationVariantEmitter.Emit(spc, graph);
 
+        // CG036 — a relation variant attempted to lift annotated shared-shape members
+        // from multiple sources, but an overlapping role/name/type/nullability contract
+        // disagreed. The variant stays dropped; this diagnostic explains why.
+        foreach (var conflict in graph.SharedShapeLiftConflicts)
+        {
+            spc.ReportDiagnostic(Diagnostic.Create(
+                Diagnostics.SharedShapeLiftConflict,
+                Location.None,
+                conflict.VariantFullName,
+                conflict.InterfaceFullName,
+                conflict.LiftedName,
+                conflict.ExistingName,
+                DescribeSharedShapeLiftMember(
+                    conflict.LiftedRole,
+                    conflict.LiftedName,
+                    conflict.LiftedTypeFullName,
+                    conflict.LiftedNullable),
+                DescribeSharedShapeLiftMember(
+                    conflict.ExistingRole,
+                    conflict.ExistingName,
+                    conflict.ExistingTypeFullName,
+                    conflict.ExistingNullable)));
+        }
+
         // CG033 — shared-shape interface must be declared partial to receive the
         // emitted static Create<TKind> factory fragment. CG035 — interface attributed
         // as a shared shape (derived from IRelationVariant) but no variant implements
@@ -573,6 +597,18 @@ public sealed class ModelGenerator : IIncrementalGenerator
     private static TypeRef UnwrapTask(TypeRef t) => t.FullyQualifiedName.StartsWith("global::System.Threading.Tasks.Task<") && t.TypeArguments.Count > 0
         ? t.TypeArguments[0]
         : t;
+
+    private static string DescribeSharedShapeLiftMember(
+        RelationVariantPropertyRole role,
+        string name,
+        string typeFullName,
+        bool nullable)
+    {
+        var type = nullable && !typeFullName.EndsWith("?", StringComparison.Ordinal)
+            ? $"{typeFullName}?"
+            : typeFullName;
+        return $"{role} {name}: {type}";
+    }
 
     /// <summary>
     /// BFS from the aggregate root through <c>[Parent]</c>-pointing tables, collecting

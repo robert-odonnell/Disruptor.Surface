@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using Disruptor.Surface.Generator.Model;
 using Microsoft.CodeAnalysis;
@@ -66,6 +67,7 @@ internal static class SchemaEmitter
         }
 
         var chunks = BuildChunks(graph);
+        var fingerprint = ComputeFingerprint(chunks);
 
         var writer = new CodeWriter().Header();
         using (writer.Namespace(root.Namespace))
@@ -75,6 +77,7 @@ internal static class SchemaEmitter
             using (writer.Block(FormatTypeDeclaration(root.DeclaredAccessibility, root.Name)))
             {
                 writer.Line("public static System.Collections.Generic.IReadOnlyList<string> Schema => DisruptorSurfaceSchema._chunks;");
+                writer.Line($"public static string SchemaFingerprint => \"{fingerprint}\";");
                 using (writer.Block("public static async global::System.Threading.Tasks.Task ApplySchemaAsync(global::Disruptor.Surreal.SurrealClient db, global::System.Threading.CancellationToken ct = default)"))
                 using (writer.Block("foreach (var chunk in Schema)"))
                 {
@@ -111,6 +114,19 @@ internal static class SchemaEmitter
         }
 
         spc.AddSource($"{root.FullName}.Schema.g.cs", writer.ToSourceText());
+    }
+
+    private static string ComputeFingerprint(IReadOnlyList<string> chunks)
+    {
+        var canonical = string.Join("\n-- chunk --\n", chunks.Select(c => c.Replace("\r\n", "\n").Replace('\r', '\n')));
+        using var sha = SHA256.Create();
+        var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(canonical));
+        var sb = new StringBuilder(bytes.Length * 2);
+        foreach (var b in bytes)
+        {
+            sb.Append(b.ToString("x2"));
+        }
+        return sb.ToString();
     }
 
     private static void WriteRawStringContent(CodeWriter writer, string content)
@@ -456,10 +472,8 @@ internal static class SchemaEmitter
           .AppendLine("ENFORCED;");
 
         // Schema-level uniqueness on (in, out) — duplicate edges between the same pair
-        // are rejected at the index. The runtime relies on this as the sole uniqueness
-        // guard: a duplicate RELATE errors against the index, so idempotent re-imports
-        // require loading the aggregate first (the commit planner skips RELATE for
-        // edges already present at session start).
+        // are rejected at the index. Relation-variant SaveAsync uses INSERT RELATION
+        // and lets the substrate enforce pair uniqueness.
         sb.Append("DEFINE INDEX IF NOT EXISTS unique_relationship ON TABLE ")
           .Append(edgeName).AppendLine(" COLUMNS in, out UNIQUE;");
 

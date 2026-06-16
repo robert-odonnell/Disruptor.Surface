@@ -213,4 +213,12 @@ internal static class Diagnostics
         category: Category,
         defaultSeverity: DiagnosticSeverity.Warning,
         isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor SharedShapeLiftConflict = new(
+        id: "CG036",
+        title: "Shared-shape lift conflict",
+        messageFormat: "Relation variant '{0}' cannot lift shared-shape interface '{1}' because lifted member '{2}' conflicts with existing member '{3}' ({4} vs {5})",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
 }

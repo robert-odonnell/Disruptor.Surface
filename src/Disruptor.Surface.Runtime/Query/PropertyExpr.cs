@@ -36,6 +36,15 @@ public readonly record struct PropertyExpr<T>(string Field)
     /// <summary>Set membership: <c>field IN [v0, v1, …]</c> from any enumerable source.</summary>
     public IPredicate In(IEnumerable<T> values) => new InPredicate(Field, ToObjectArray(values));
 
+    /// <summary>Negative set membership: <c>field NOT IN [v0, v1, ...]</c>.</summary>
+    public IPredicate NotIn(params T[] values) => new NotInPredicate(Field, ToObjectArray(values));
+
+    /// <summary>Negative set membership from any enumerable source.</summary>
+    public IPredicate NotIn(IEnumerable<T> values) => new NotInPredicate(Field, ToObjectArray(values));
+
+    /// <summary>Inclusive range: <c>field &gt;= lower AND field &lt;= upper</c>.</summary>
+    public IPredicate Between(T lower, T upper) => new BetweenPredicate(Field, lower, upper);
+
     private static object?[] ToObjectArray(IEnumerable<T> values)
     {
         if (values is not ICollection<T> col)
@@ -66,4 +75,12 @@ public static class PropertyExprStringExtensions
     /// <summary>Substring containment: <c>string::contains(field, $substring)</c>.</summary>
     public static IPredicate Contains(this PropertyExpr<string> expr, string substring)
         => new ContainsPredicate(expr.Field, substring);
+
+    /// <summary>Prefix match: <c>string::starts_with(field, $prefix)</c>.</summary>
+    public static IPredicate StartsWith(this PropertyExpr<string> expr, string prefix)
+        => new StartsWithPredicate(expr.Field, prefix);
+
+    /// <summary>Suffix match: <c>string::ends_with(field, $suffix)</c>.</summary>
+    public static IPredicate EndsWith(this PropertyExpr<string> expr, string suffix)
+        => new EndsWithPredicate(expr.Field, suffix);
 }
