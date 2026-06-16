@@ -2,6 +2,7 @@ using System.Collections.Immutable;
 using Disruptor.Surface.Generator.Annotations;
 using Disruptor.Surface.Generator.Model;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace Disruptor.Surface.Generator.Pipeline;
 
@@ -61,7 +62,8 @@ internal static class TableExtractor
         var attrs = p.GetAttributes();
         var kinds = ResolvePropertyKinds(attrs);
         var (role, kindFullName) = ResolveRelationRole(attrs);
-        if (kinds == PropertyKind.None && role == RelationRole.None)
+        var indexes = ResolveIndexAnnotations(attrs, p);
+        if (kinds == PropertyKind.None && role == RelationRole.None && indexes.Count == 0)
         {
             return null;
         }
@@ -89,6 +91,7 @@ internal static class TableExtractor
             IsStatic: p.IsStatic,
             DeclaredAccessibility: p.DeclaredAccessibility.ToString(),
             InlineMembers: ResolveInlineMembers(p.Type),
+            Indexes: indexes,
             IsInline: isInline);
     }
 
@@ -231,6 +234,57 @@ internal static class TableExtractor
         return (RelationRole.None, null);
     }
 
+    private static EquatableArray<IndexAnnotationModel> ResolveIndexAnnotations(
+        ImmutableArray<AttributeData> attrs,
+        IPropertySymbol property)
+    {
+        var (declarationKey, sourceOrder) = ResolveSourceLocation(property);
+        var indexes = ImmutableArray.CreateBuilder<IndexAnnotationModel>();
+
+        foreach (var attr in attrs)
+        {
+            var cls = attr.AttributeClass;
+            if (cls is null)
+            {
+                continue;
+            }
+
+            if (!InheritsFrom(cls, AnnotationsMetadata.Index))
+            {
+                continue;
+            }
+
+            var fullName = AttributeFullName(attr);
+            if (fullName is null)
+            {
+                continue;
+            }
+
+            indexes.Add(new IndexAnnotationModel(
+                AttributeFullName: fullName,
+                AttributeName: cls.Name,
+                IsUnique: InheritsFrom(cls, AnnotationsMetadata.UniqueIndex),
+                DeclarationKey: declarationKey,
+                SourceOrder: sourceOrder));
+        }
+
+        return new EquatableArray<IndexAnnotationModel>(indexes.ToImmutable());
+    }
+
+    private static (string DeclarationKey, int SourceOrder) ResolveSourceLocation(IPropertySymbol property)
+    {
+        var syntaxRef = property.DeclaringSyntaxReferences.FirstOrDefault();
+        if (syntaxRef?.GetSyntax() is not PropertyDeclarationSyntax declaration)
+        {
+            return (string.Empty, int.MaxValue);
+        }
+
+        var typeDeclaration = declaration.Ancestors().OfType<TypeDeclarationSyntax>().FirstOrDefault();
+        var filePath = declaration.SyntaxTree.FilePath ?? string.Empty;
+        var declarationStart = typeDeclaration?.SpanStart ?? 0;
+        return ($"{filePath}:{declarationStart}", declaration.SpanStart);
+    }
+
     internal static bool InheritsFromForwardRelation(INamedTypeSymbol cls)
     {
         for (var current = cls.BaseType; current is not null; current = current.BaseType)
@@ -257,12 +311,31 @@ internal static class TableExtractor
         return false;
     }
 
+    internal static bool InheritsFrom(INamedTypeSymbol cls, string metadataName)
+    {
+        for (INamedTypeSymbol? current = cls; current is not null; current = current.BaseType)
+        {
+            if (NormaliseFullName(current) == metadataName)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     internal static string? AttributeFullName(AttributeData attr) => attr.AttributeClass is null ? null : NormaliseFullName(attr.AttributeClass);
 
     internal static string NormaliseFullName(INamedTypeSymbol symbol)
     {
         var ns = symbol.ContainingNamespace?.ToDisplayString() ?? string.Empty;
-        var name = symbol.MetadataName;
+        var parts = new Stack<string>();
+        for (INamedTypeSymbol? current = symbol; current is not null; current = current.ContainingType)
+        {
+            parts.Push(current.MetadataName);
+        }
+
+        var name = string.Join(".", parts);
         return string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}";
     }
 

@@ -33,6 +33,14 @@ public sealed class ChildrenAttribute : Attribute;
 [AttributeUsage(AttributeTargets.Property, AllowMultiple = true)]
 public sealed class ReferenceAttribute : Attribute;
 
+/// <summary>Abstract base for user-defined entity index attributes. Derive directly and apply the resulting parameterless attribute to one or more persisted fields on the same [Table].</summary>
+[AttributeUsage(AttributeTargets.Property, AllowMultiple = true)]
+public abstract class IndexAttribute : Attribute;
+
+/// <summary>Abstract base for user-defined unique entity index attributes. Derive directly and apply the resulting parameterless attribute to one or more non-null persisted fields on the same [Table].</summary>
+[AttributeUsage(AttributeTargets.Property, AllowMultiple = true)]
+public abstract class UniqueIndexAttribute : IndexAttribute;
+
 /// <summary>Pairs with <see cref="ReferenceAttribute"/> to mark the reference as an owned/compositional sidecar (e.g. <c>Details</c>). The aggregate loader inline-expands the referenced record into the same query (<c>field.*</c> projection) and hydrates it alongside the owner. Plain <c>[Reference]</c> without <c>[Inline]</c> stores only the id — the referenced record is treated as a foreign pointer that the caller resolves separately.</summary>
 [AttributeUsage(AttributeTargets.Property)]
 public sealed class InlineAttribute : Attribute;

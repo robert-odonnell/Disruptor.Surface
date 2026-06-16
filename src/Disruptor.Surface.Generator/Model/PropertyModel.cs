@@ -73,4 +73,5 @@ public sealed record PropertyModel(
     bool IsStatic,
     string DeclaredAccessibility,
     EquatableArray<InlineMember> InlineMembers,
+    EquatableArray<IndexAnnotationModel> Indexes,
     bool IsInline);

@@ -53,7 +53,9 @@ internal static class PartialEmitter
         // [Table] with no partial members still gets IEntity scaffolding (Bind, Initialize,
         // Hydrate, OnDeleting) and is fully Track-able / Load-able. Just an entity that
         // carries nothing but its identity.
-        var partialProps = table.Properties.Where(p => p.IsPartial).ToArray();
+        var partialProps = table.Properties
+            .Where(p => p.IsPartial && (p.Kinds != PropertyKind.None || p.RelationRole != RelationRole.None))
+            .ToArray();
 
         var writer = new CodeWriter().Header();
         using (writer.Namespace(table.Namespace))

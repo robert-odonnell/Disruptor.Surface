@@ -10,9 +10,9 @@ public partial class UserStory
     [Reference, Cascade, Inline] public partial Details? Details { get; set; }
     [Reference, Unset] public partial Design? Design { get; set; }
 
-    [Parent] public partial Feature Feature { get; set; }
+    [ByFeaturePersona, Parent] public partial Feature Feature { get; set; }
 
-    [Property] public partial string AsA { get; set; }
+    [ByFeaturePersona, Property] public partial string AsA { get; set; }
     [Property] public partial string IWant { get; set; }
     [Property] public partial string SoThat { get; set; }
 

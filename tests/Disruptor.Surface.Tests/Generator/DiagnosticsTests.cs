@@ -370,4 +370,125 @@ public sealed class DiagnosticsTests
         var (_, _, runDiags, _) = GeneratorHarness.Run(src);
         Assert.Contains(runDiags, d => d.Id == "CG028");
     }
+
+    [Fact]
+    public void CG037_IndexRequiresPersistedEntityField()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public sealed class LookupAttribute : IndexAttribute;
+
+            [Table]
+            public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Lookup] public partial string ExternalKey { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG037");
+    }
+
+    [Fact]
+    public void CG038_CompositeIndexFieldsMustStayInSamePartialDeclaration()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public sealed class ByExternalAndStatusAttribute : IndexAttribute;
+
+            [Table]
+            public partial class Story {
+                [Id] public partial StoryId Id { get; set; }
+                [ByExternalAndStatus, Property] public partial string ExternalKey { get; set; }
+            }
+
+            public partial class Story {
+                [ByExternalAndStatus, Property] public partial string Status { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG038");
+    }
+
+    [Fact]
+    public void CG039_UniqueIndexRejectsNullableFields()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public sealed class SlugAttribute : UniqueIndexAttribute;
+
+            [Table]
+            public partial class Story {
+                [Id] public partial StoryId Id { get; set; }
+                [Slug, Property] public partial string? Slug { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG039");
+    }
+
+    [Fact]
+    public void CG040_IndexSchemaNameCollision()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public static class A {
+                public sealed class LookupAttribute : IndexAttribute;
+            }
+
+            public static class B {
+                public sealed class LookupAttribute : IndexAttribute;
+            }
+
+            [Table]
+            public partial class Story {
+                [Id] public partial StoryId Id { get; set; }
+                [A.Lookup, Property] public partial string ExternalKey { get; set; }
+                [B.Lookup, Property] public partial string Slug { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG040");
+    }
+
+    [Fact]
+    public void CG041_IndexAttributeCanOnlyAppearOncePerField()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public sealed class LookupAttribute : IndexAttribute;
+
+            [Table]
+            public partial class Story {
+                [Id] public partial StoryId Id { get; set; }
+                [Lookup, Lookup, Property] public partial string ExternalKey { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG041");
+    }
 }

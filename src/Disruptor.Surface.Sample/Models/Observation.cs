@@ -11,9 +11,9 @@ public partial class Observation
 
     [Reference, Cascade, Inline] public partial Details? Details { get; set; }
 
-    [Parent] public partial Review Review { get; set; }
+    [ByReviewKind, Parent] public partial Review Review { get; set; }
 
-    [Property] public partial string Kind { get; set; }
+    [ByReviewKind, Property] public partial string Kind { get; set; }
     [Property] public partial string Description { get; set; }
     [Property] public partial string Excerpt { get; set; }
     [Property] public partial string Confidence { get; set; }

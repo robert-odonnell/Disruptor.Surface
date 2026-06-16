@@ -303,6 +303,96 @@ public sealed class EmissionShapeTests
     }
 
     [Fact]
+    public void EntityIndex_SingleColumn_EmitsSchemaIndex()
+    {
+        var source = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public sealed class ByExternalKeyAttribute : IndexAttribute;
+
+            [Table]
+            public partial class UserStory {
+                [Id] public partial UserStoryId Id { get; set; }
+                [ByExternalKey, Property] public partial string ExternalKey { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (result, _, _, compileDiags) = GeneratorHarness.Run(source);
+        Assert.Empty(compileDiags);
+
+        var schema = GeneratorHarness.FindGeneratedFile(result, "Workspace.Schema.g.cs");
+        Assert.NotNull(schema);
+        Assert.Contains(
+            "DEFINE INDEX IF NOT EXISTS idx_user_stories_by_external_key ON TABLE user_stories COLUMNS external_key;",
+            schema!.ToString());
+    }
+
+    [Fact]
+    public void EntityIndex_UniqueColumn_EmitsUniqueSchemaIndex()
+    {
+        var source = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public sealed class SlugAttribute : UniqueIndexAttribute;
+
+            [Table]
+            public partial class UserStory {
+                [Id] public partial UserStoryId Id { get; set; }
+                [Slug, Property] public partial string Slug { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (result, _, _, compileDiags) = GeneratorHarness.Run(source);
+        Assert.Empty(compileDiags);
+
+        var schema = GeneratorHarness.FindGeneratedFile(result, "Workspace.Schema.g.cs");
+        Assert.NotNull(schema);
+        Assert.Contains(
+            "DEFINE INDEX IF NOT EXISTS uq_user_stories_slug ON TABLE user_stories COLUMNS slug UNIQUE;",
+            schema!.ToString());
+    }
+
+    [Fact]
+    public void EntityIndex_Composite_UsesPropertyDeclarationOrder()
+    {
+        var source = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public sealed class ByOwnerStatusAttribute : IndexAttribute;
+
+            [Table]
+            public partial class User {
+                [Id] public partial UserId Id { get; set; }
+            }
+
+            [Table]
+            public partial class UserStory {
+                [Id] public partial UserStoryId Id { get; set; }
+                [ByOwnerStatus, Reference] public partial User Owner { get; set; }
+                [ByOwnerStatus, Property] public partial string Status { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (result, _, _, compileDiags) = GeneratorHarness.Run(source);
+        Assert.Empty(compileDiags);
+
+        var schema = GeneratorHarness.FindGeneratedFile(result, "Workspace.Schema.g.cs");
+        Assert.NotNull(schema);
+        Assert.Contains(
+            "DEFINE INDEX IF NOT EXISTS idx_user_stories_by_owner_status ON TABLE user_stories COLUMNS owner, status;",
+            schema!.ToString());
+    }
+
+    [Fact]
     public void NoCompositionRoot_SuppressesLoadMethodEmission()
     {
         var src = """

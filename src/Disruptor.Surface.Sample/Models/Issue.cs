@@ -11,9 +11,9 @@ public partial class Issue
 
     [Reference, Cascade, Inline] public partial Details? Details { get; set; }
 
-    [Parent] public partial Review Review { get; set; }
+    [ByReviewSeverity, Parent] public partial Review Review { get; set; }
 
-    [Property] public partial string Severity { get; set; }
+    [ByReviewSeverity, Property] public partial string Severity { get; set; }
     [Property] public partial string Disposition { get; set; }
     [Property] public partial string DispositionReason { get; set; }
 

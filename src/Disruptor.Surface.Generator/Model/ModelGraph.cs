@@ -20,6 +20,8 @@ public sealed record ModelGraph(
     EquatableArray<UnionEndpointModel> UnionEndpoints,
     EquatableArray<SharedShapeModel> SharedShapes,
     EquatableArray<SharedShapeLiftConflict> SharedShapeLiftConflicts,
+    EquatableArray<IndexModel> Indexes,
+    EquatableArray<IndexIssueModel> IndexIssues,
     EquatableArray<AggregateModel> Aggregates,
     EquatableArray<string> AggregateConflicts,
     EquatableArray<string> CascadeCycles,
@@ -155,30 +157,14 @@ public sealed record ModelGraph(
     }
 
     private static bool HasForwardAttribute(TableModel table, string forwardKindFullName)
-    {
-        foreach (var p in table.Properties)
-        {
-            if (p.RelationRole == RelationRole.ForwardRelation && p.RelationKindFullName == forwardKindFullName)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
+        => table.Properties.Any(
+            p => p.RelationRole == RelationRole.ForwardRelation && p.RelationKindFullName == forwardKindFullName
+        );
 
     private static bool HasInverseAttribute(TableModel table, string inverseKindFullName)
-    {
-        foreach (var p in table.Properties)
-        {
-            if (p.RelationRole == RelationRole.InverseRelation && p.RelationKindFullName == inverseKindFullName)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
+        => table.Properties.Any(
+            p => p.RelationRole == RelationRole.InverseRelation && p.RelationKindFullName == inverseKindFullName
+        );
 
     /// <summary>
     /// Returns the aggregate root that owns <paramref name="tableFullName"/>, or null if
@@ -186,17 +172,9 @@ public sealed record ModelGraph(
     /// <c>Details</c>). The CG011 conflict check guarantees at most one root per entity.
     /// </summary>
     public string? AggregateRootOf(string tableFullName)
-    {
-        foreach (var agg in Aggregates)
-        {
-            if (agg.MemberFullNames.Any(m => m == tableFullName))
-            {
-                return agg.RootFullName;
-            }
-        }
-
-        return null;
-    }
+        => Aggregates.Where(agg => agg.MemberFullNames.Any(m => m == tableFullName))
+            .Select(agg => agg.RootFullName)
+            .FirstOrDefault();
 
     /// <summary>
     /// True iff the relation kind crosses aggregate boundaries — any pair of (source,

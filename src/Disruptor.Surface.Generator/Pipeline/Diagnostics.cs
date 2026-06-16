@@ -221,4 +221,44 @@ internal static class Diagnostics
         category: Category,
         defaultSeverity: DiagnosticSeverity.Error,
         isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor IndexedFieldUnsupported = new(
+        id: "CG037",
+        title: "Indexed field is not a persisted entity field",
+        messageFormat: "Index '{1}' on table '{0}' includes unsupported member '{2}': {3}",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor CompositeIndexSplitAcrossPartials = new(
+        id: "CG038",
+        title: "Composite index fields must be declared together",
+        messageFormat: "Index '{1}' on table '{0}' is composite but its fields are split across partial declarations; {2}",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor UniqueIndexRequiresNonNullable = new(
+        id: "CG039",
+        title: "Unique index fields must be non-nullable",
+        messageFormat: "Unique index '{1}' on table '{0}' includes nullable member '{2}'; {3}",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor IndexNameCollision = new(
+        id: "CG040",
+        title: "Index schema name collision",
+        messageFormat: "Table '{0}' has multiple indexes that resolve to schema name '{1}' ({2}); rename one of the index attribute types",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor DuplicateIndexedField = new(
+        id: "CG041",
+        title: "Index attribute applied more than once to the same field",
+        messageFormat: "Index '{1}' on table '{0}' includes member '{2}' more than once; {3}",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
 }

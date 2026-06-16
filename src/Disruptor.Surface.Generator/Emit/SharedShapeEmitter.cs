@@ -99,11 +99,10 @@ internal static class SharedShapeEmitter
             writer.Line($"{interfaceFqn} __instance;");
 
             var first = true;
-            foreach (var binding in shape.Variants)
+            foreach (var (variantFullName, marker, _) in shape.Variants)
             {
-                var marker = binding.KindMarkerFullName; // already global::-prefixed
-                var variantFqn = $"global::{binding.VariantFullName}";
-                var keyword = first ? "if" : "else if";
+                var variantFqn = $"global::{variantFullName}";
+                var keyword = first ? "if" : "else if";    
                 writer.Line($"{keyword} (typeof(TKind) == typeof({marker}))");
                 using (writer.BracedBlock())
                 {

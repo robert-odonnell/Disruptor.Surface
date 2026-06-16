@@ -270,6 +270,12 @@ public sealed class ModelGenerator : IIncrementalGenerator
             AggregateLoaderEmitter.Emit(spc, graph);
         }
         ReferenceRegistryEmitter.Emit(spc, graph);
+
+        foreach (var issue in graph.IndexIssues)
+        {
+            ReportIndexIssue(spc, issue);
+        }
+
         SchemaEmitter.Emit(spc, graph);
         QueryRootEmitter.Emit(spc, graph);
         EdgeQueryRootEmitter.Emit(spc, graph);
@@ -592,6 +598,60 @@ public sealed class ModelGenerator : IIncrementalGenerator
         // Per-shared-shape interface: emit a partial fragment carrying a typed
         // Create<TKind>(Action<I> init) factory keyed off the per-kind marker class.
         SharedShapeEmitter.Emit(spc, graph);
+    }
+
+    private static void ReportIndexIssue(SourceProductionContext spc, IndexIssueModel issue)
+    {
+        switch (issue.Kind)
+        {
+            case IndexIssueKind.UnsupportedField:
+                spc.ReportDiagnostic(Diagnostic.Create(
+                    Diagnostics.IndexedFieldUnsupported,
+                    Location.None,
+                    issue.TableFullName,
+                    issue.SchemaName,
+                    issue.PropertyName ?? "<unknown>",
+                    issue.Detail));
+                break;
+
+            case IndexIssueKind.DuplicateField:
+                spc.ReportDiagnostic(Diagnostic.Create(
+                    Diagnostics.DuplicateIndexedField,
+                    Location.None,
+                    issue.TableFullName,
+                    issue.SchemaName,
+                    issue.PropertyName ?? "<unknown>",
+                    issue.Detail));
+                break;
+
+            case IndexIssueKind.SplitCompositeDeclaration:
+                spc.ReportDiagnostic(Diagnostic.Create(
+                    Diagnostics.CompositeIndexSplitAcrossPartials,
+                    Location.None,
+                    issue.TableFullName,
+                    issue.SchemaName,
+                    issue.Detail));
+                break;
+
+            case IndexIssueKind.NullableUniqueField:
+                spc.ReportDiagnostic(Diagnostic.Create(
+                    Diagnostics.UniqueIndexRequiresNonNullable,
+                    Location.None,
+                    issue.TableFullName,
+                    issue.SchemaName,
+                    issue.PropertyName ?? "<unknown>",
+                    issue.Detail));
+                break;
+
+            case IndexIssueKind.NameCollision:
+                spc.ReportDiagnostic(Diagnostic.Create(
+                    Diagnostics.IndexNameCollision,
+                    Location.None,
+                    issue.TableFullName,
+                    issue.SchemaName,
+                    issue.Detail));
+                break;
+        }
     }
 
     private static TypeRef UnwrapTask(TypeRef t) => t.FullyQualifiedName.StartsWith("global::System.Threading.Tasks.Task<") && t.TypeArguments.Count > 0

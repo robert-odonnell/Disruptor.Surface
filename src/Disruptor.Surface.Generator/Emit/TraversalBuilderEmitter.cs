@@ -176,24 +176,10 @@ internal static class TraversalBuilderEmitter
     /// the C# member that becomes <c>Include{PropertyName}()</c>.
     /// </summary>
     private static List<InlineRefMember> CollectInlineRefs(TableModel table)
-    {
-        var result = new List<InlineRefMember>();
-        foreach (var p in table.Properties)
-        {
-            if (!p.Kinds.HasFlag(PropertyKind.Reference))
-            {
-                continue;
-            }
-
-            if (!p.IsInline)
-            {
-                continue;
-            }
-
-            result.Add(new InlineRefMember(p.Name, SurrealNaming.ToFieldName(p.Name)));
-        }
-        return result;
-    }
+        => table.Properties.Where(p => p.Kinds.HasFlag(PropertyKind.Reference))
+            .Where(p => p.IsInline)
+            .Select(p => new InlineRefMember(p.Name, SurrealNaming.ToFieldName(p.Name)))
+            .ToList();
 
     /// <summary>
     /// Children members for traversal: <c>[Children]</c> properties on the table whose

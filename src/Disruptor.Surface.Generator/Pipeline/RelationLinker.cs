@@ -67,6 +67,7 @@ internal static class RelationLinker
         var unions = ComputeUnions(linked, forwardKinds, inverseKinds);
         var unionEndpoints = ComputeUnionEndpoints(linked, unionInterfaceCandidates, unionMembershipCandidates);
         var sharedShapes = ComputeSharedShapes(sharedShapeCandidates, liftedVariants, forwardKinds, inverseKinds);
+        var (indexes, indexIssues) = ComputeIndexes(linked);
         var (aggregates, conflicts) = ComputeAggregates(linked);
         var cascadeCycles = ComputeCascadeCycles(linked);
 
@@ -78,11 +79,253 @@ internal static class RelationLinker
             UnionEndpoints: new EquatableArray<UnionEndpointModel>(unionEndpoints),
             SharedShapes: new EquatableArray<SharedShapeModel>(sharedShapes),
             SharedShapeLiftConflicts: new EquatableArray<SharedShapeLiftConflict>(liftConflicts),
+            Indexes: new EquatableArray<IndexModel>(indexes),
+            IndexIssues: new EquatableArray<IndexIssueModel>(indexIssues),
             Aggregates: new EquatableArray<AggregateModel>(aggregates),
             AggregateConflicts: new EquatableArray<string>(conflicts),
             CascadeCycles: new EquatableArray<string>(cascadeCycles),
             CompositionRoots: new EquatableArray<CompositionRootModel>(compositionRoots));
     }
+
+    private static (ImmutableArray<IndexModel> Indexes, ImmutableArray<IndexIssueModel> Issues) ComputeIndexes(
+        ImmutableArray<TableModel> tables)
+    {
+        var indexes = ImmutableArray.CreateBuilder<IndexModel>();
+        var issues = ImmutableArray.CreateBuilder<IndexIssueModel>();
+
+        foreach (var table in tables)
+        {
+            var grouped = new Dictionary<string, List<(PropertyModel Property, IndexAnnotationModel Annotation)>>(StringComparer.Ordinal);
+            foreach (var property in table.Properties)
+            {
+                foreach (var annotation in property.Indexes)
+                {
+                    if (!grouped.TryGetValue(annotation.AttributeFullName, out var entries))
+                    {
+                        entries = [];
+                        grouped[annotation.AttributeFullName] = entries;
+                    }
+
+                    entries.Add((property, annotation));
+                }
+            }
+
+            var tableIndexes = new List<IndexModel>();
+            foreach (var group in grouped.Values
+                         .OrderBy(g => g.Min(e => e.Annotation.SourceOrder))
+                         .ThenBy(g => g[0].Annotation.AttributeFullName, StringComparer.Ordinal))
+            {
+                var ordered = group
+                    .OrderBy(e => e.Annotation.SourceOrder)
+                    .ThenBy(e => e.Property.Name, StringComparer.Ordinal)
+                    .ToList();
+                var first = ordered[0].Annotation;
+                var schemaName = IndexSchemaName(table, first);
+
+                var duplicate = ordered
+                    .GroupBy(e => e.Property.Name, StringComparer.Ordinal)
+                    .FirstOrDefault(g => g.Count() > 1);
+                if (duplicate is not null)
+                {
+                    issues.Add(new IndexIssueModel(
+                        Kind: IndexIssueKind.DuplicateField,
+                        TableFullName: table.FullName,
+                        IndexAttributeFullName: first.AttributeFullName,
+                        SchemaName: schemaName,
+                        PropertyName: duplicate.Key,
+                        Detail: $"Property '{duplicate.Key}' carries index attribute '{first.AttributeName}' more than once."));
+                    continue;
+                }
+
+                if (ordered.Count > 1
+                    && ordered.Select(e => e.Annotation.DeclarationKey).Distinct(StringComparer.Ordinal).Count() > 1)
+                {
+                    issues.Add(new IndexIssueModel(
+                        Kind: IndexIssueKind.SplitCompositeDeclaration,
+                        TableFullName: table.FullName,
+                        IndexAttributeFullName: first.AttributeFullName,
+                        SchemaName: schemaName,
+                        PropertyName: null,
+                        Detail: "Composite index fields must be declared in the same partial type declaration so source order is stable."));
+                    continue;
+                }
+
+                var fields = ImmutableArray.CreateBuilder<IndexFieldModel>(ordered.Count);
+                var invalid = false;
+                foreach (var entry in ordered)
+                {
+                    if (!TryCreateIndexField(entry.Property, out var field, out var detail))
+                    {
+                        issues.Add(new IndexIssueModel(
+                            Kind: IndexIssueKind.UnsupportedField,
+                            TableFullName: table.FullName,
+                            IndexAttributeFullName: first.AttributeFullName,
+                            SchemaName: schemaName,
+                            PropertyName: entry.Property.Name,
+                            Detail: detail));
+                        invalid = true;
+                        continue;
+                    }
+
+                    if (first.IsUnique && field.IsNullable)
+                    {
+                        issues.Add(new IndexIssueModel(
+                            Kind: IndexIssueKind.NullableUniqueField,
+                            TableFullName: table.FullName,
+                            IndexAttributeFullName: first.AttributeFullName,
+                            SchemaName: schemaName,
+                            PropertyName: entry.Property.Name,
+                            Detail: "Unique indexes over nullable fields are not supported in this first cut."));
+                        invalid = true;
+                        continue;
+                    }
+
+                    fields.Add(field);
+                }
+
+                if (invalid)
+                {
+                    continue;
+                }
+
+                tableIndexes.Add(new IndexModel(
+                    TableFullName: table.FullName,
+                    TableName: table.Name,
+                    AttributeFullName: first.AttributeFullName,
+                    AttributeName: first.AttributeName,
+                    SchemaName: schemaName,
+                    IsUnique: first.IsUnique,
+                    Fields: new EquatableArray<IndexFieldModel>(fields.ToImmutable())));
+            }
+
+            var collidingNames = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var collision in tableIndexes
+                         .GroupBy(i => i.SchemaName, StringComparer.Ordinal)
+                         .Where(g => g.Count() > 1))
+            {
+                collidingNames.Add(collision.Key);
+                issues.Add(new IndexIssueModel(
+                    Kind: IndexIssueKind.NameCollision,
+                    TableFullName: table.FullName,
+                    IndexAttributeFullName: string.Empty,
+                    SchemaName: collision.Key,
+                    PropertyName: null,
+                    Detail: string.Join(", ", collision
+                        .Select(i => i.AttributeFullName)
+                        .OrderBy(n => n, StringComparer.Ordinal))));
+            }
+
+            foreach (var index in tableIndexes
+                         .Where(i => !collidingNames.Contains(i.SchemaName))
+                         .OrderBy(i => i.SchemaName, StringComparer.Ordinal))
+            {
+                indexes.Add(index);
+            }
+        }
+
+        return (indexes.ToImmutable(), issues.ToImmutable());
+    }
+
+    private static bool TryCreateIndexField(PropertyModel property, out IndexFieldModel field, out string detail)
+    {
+        field = new IndexFieldModel(
+            PropertyName: property.Name,
+            FieldName: SurrealNaming.ToFieldName(property.Name),
+            TypeFullName: property.Type.FullyQualifiedName,
+            IsNullable: property.Type.IsNullable);
+
+        if (property.RelationRole != RelationRole.None)
+        {
+            detail = "Relation read collections are not persisted entity fields and cannot be indexed.";
+            return false;
+        }
+
+        if (property.Kinds.HasFlag(PropertyKind.Id))
+        {
+            detail = "[Id] is the record key and is already indexed by the database.";
+            return false;
+        }
+
+        if (property.Kinds.HasFlag(PropertyKind.Children))
+        {
+            detail = "[Children] is a computed reverse lookup and cannot be indexed as an entity field.";
+            return false;
+        }
+
+        var roleCount = 0;
+        if (property.Kinds.HasFlag(PropertyKind.Property))
+        {
+            roleCount++;
+        }
+
+        if (property.Kinds.HasFlag(PropertyKind.Reference))
+        {
+            roleCount++;
+        }
+
+        if (property.Kinds.HasFlag(PropertyKind.Parent))
+        {
+            roleCount++;
+        }
+
+        if (roleCount != 1)
+        {
+            detail = "Indexed members must carry exactly one of [Property], [Reference], or [Parent].";
+            return false;
+        }
+
+        if (property.Kinds.HasFlag(PropertyKind.Reference))
+        {
+            if (property.Type.IsTableType)
+            {
+                detail = string.Empty;
+                return true;
+            }
+
+            detail = "[Reference] indexes must target a [Table] type.";
+            return false;
+        }
+
+        if (property.Kinds.HasFlag(PropertyKind.Parent))
+        {
+            if (property.Type.IsTableType)
+            {
+                detail = string.Empty;
+                return true;
+            }
+
+            detail = "[Parent] indexes must target a [Table] type.";
+            return false;
+        }
+
+        if (IsElementCollection(property.Type) || property.InlineMembers.Count > 0)
+        {
+            detail = "Element-collection and inline object properties cannot be indexed in this first cut.";
+            return false;
+        }
+
+        if (SchemaEmitter.IsMappableScalar(property.Type))
+        {
+            detail = string.Empty;
+            return true;
+        }
+
+        detail = $"[Property] type '{property.Type.FullyQualifiedName}' has no SurrealDB scalar mapping.";
+        return false;
+    }
+
+    private static string IndexSchemaName(TableModel table, IndexAnnotationModel annotation)
+    {
+        var prefix = annotation.IsUnique ? "uq" : "idx";
+        var tableName = SurrealNaming.ToTableName(table.Name);
+        var attributeName = SurrealNaming.ToFieldName(SurrealNaming.StripAttributeSuffix(annotation.AttributeName));
+        return $"{prefix}_{tableName}_{attributeName}";
+    }
+
+    private static bool IsElementCollection(TypeRef type) =>
+        type.MetadataName is "System.Collections.Generic.IReadOnlyList`1"
+                         or "System.Collections.Generic.IList`1"
+                         or "System.Collections.Generic.List`1";
 
     /// <summary>
     /// preview.56+ — fills in or augments <see cref="RelationVariantModel.In"/> /

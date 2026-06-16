@@ -12,7 +12,7 @@ public partial class Design
 
     [Reference, Cascade, Inline] public partial Details? Details { get; set; }
 
-    [Property] public partial string RepositoryRoot { get; set; }
+    [RepositoryRoot, Property] public partial string RepositoryRoot { get; set; }
     [Property] public partial string Description { get; set; }
 
     [Children] public partial IReadOnlyCollection<Constraint> Constraints { get; }

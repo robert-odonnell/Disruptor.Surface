@@ -18,6 +18,8 @@ internal static class AnnotationsMetadata
     public const string Parent               = $"{Namespace}.ParentAttribute";
     public const string Children             = $"{Namespace}.ChildrenAttribute";
     public const string Reference            = $"{Namespace}.ReferenceAttribute";
+    public const string Index                = $"{Namespace}.IndexAttribute";
+    public const string UniqueIndex          = $"{Namespace}.UniqueIndexAttribute";
     public const string Inline               = $"{Namespace}.InlineAttribute";
     public const string Reject               = $"{Namespace}.RejectAttribute";
     public const string Unset                = $"{Namespace}.UnsetAttribute";

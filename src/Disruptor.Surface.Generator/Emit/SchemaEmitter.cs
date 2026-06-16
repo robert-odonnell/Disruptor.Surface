@@ -237,6 +237,14 @@ internal static class SchemaEmitter
                 continue;
             }
 
+            if (!p.Kinds.HasFlag(PropertyKind.Reference)
+                && !p.Kinds.HasFlag(PropertyKind.Parent)
+                && !p.Kinds.HasFlag(PropertyKind.Children)
+                && !p.Kinds.HasFlag(PropertyKind.Property))
+            {
+                continue;
+            }
+
             if (!any)
             {
                 sb.Append("// ").AppendLine(tableName);
@@ -262,6 +270,32 @@ internal static class SchemaEmitter
                 EmitPropertyField(sb, tableName, fieldName, p);
             }
         }
+
+        foreach (var index in graph.Indexes
+                     .Where(i => i.TableFullName == table.FullName)
+                     .OrderBy(i => i.SchemaName, StringComparer.Ordinal))
+        {
+            if (!any)
+            {
+                sb.Append("// ").AppendLine(tableName);
+                any = true;
+            }
+
+            EmitTableIndex(sb, tableName, index);
+        }
+    }
+
+    private static void EmitTableIndex(StringBuilder sb, string tableName, IndexModel index)
+    {
+        sb.Append("DEFINE INDEX IF NOT EXISTS ").Append(index.SchemaName)
+          .Append(" ON TABLE ").Append(tableName)
+          .Append(" COLUMNS ").Append(string.Join(", ", index.Fields.Select(f => f.FieldName)));
+        if (index.IsUnique)
+        {
+            sb.Append(" UNIQUE");
+        }
+
+        sb.AppendLine(";");
     }
 
     private static void EmitReferenceField(StringBuilder sb, string tableName, string fieldName, PropertyModel p)
