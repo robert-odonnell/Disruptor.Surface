@@ -26,6 +26,8 @@ The doc is organised top-down: packages → modeling attributes → what gets em
 | `[Inline]` | with `[Reference]` | Hydrates the referenced record inline with its owner. Without `[Inline]`, only the referenced id is hydrated. |
 | `[Parent]` | partial property | Parent link for aggregate hierarchy. |
 | `[Children]` | partial get-only collection | Reverse lookup over child records. |
+| `IndexAttribute` | base class for user-defined property attributes | Standard entity index marker. Derive a parameterless attribute and apply it to one or more persisted fields. |
+| `UniqueIndexAttribute` | base class for user-defined property attributes | Unique entity index marker. Same grouping rules as `IndexAttribute`, but generated DDL includes `UNIQUE`. |
 | `[Reject]` | with `[Reference]` | Schema-level: SurrealDB blocks deletion of the target while this reference points at it. Default behavior. |
 | `[Unset]` | with nullable `[Reference]` | Schema-level: SurrealDB clears this reference when the target is deleted. |
 | `[Cascade]` | with `[Reference]` | Schema-level: SurrealDB deletes the referencing record when the target is deleted. |
@@ -40,6 +42,41 @@ The doc is organised top-down: packages → modeling attributes → what gets em
 - `[Parent]` / `[Children]` — when one entity *owns* the other within the same aggregate (a `Design` owns its `Constraints`). The parent is the loadable unit; children load with the aggregate; deleting the parent cascades to children. Use these when the child has no independent life outside the parent.
 - `[Reference]` — a non-owning link to another record in the *same* aggregate, or to a shared record outside every aggregate. Examples: a `Constraint`'s pointer to a shared `Severity` lookup row, or a `Design`'s `[Reference, Inline] Details` sidecar that's owned-but-not-a-child. Cross-aggregate references produce `CG021` at compile time — use a relation kind instead.
 - Forward / inverse relation pair (`ForwardRelation` + `InverseRelation<TForward>`) — links that cross aggregate boundaries (a `Constraint` restricts a `UserStory` in another aggregate), or any time you need a payload-carrying edge. See [Relations](#relations).
+
+### Entity indexes
+
+Indexes use the same "derive a parameterless attribute type" pattern as relation kinds. The attribute type names the index; applying the same attribute to multiple fields on the same table creates a composite index.
+
+```csharp
+public sealed class ByOwnerStatusAttribute : IndexAttribute;
+public sealed class SlugAttribute : UniqueIndexAttribute;
+
+[Table]
+public partial class UserStory
+{
+    [Id] public partial UserStoryId Id { get; set; }
+
+    [ByOwnerStatus, Reference] public partial User Owner { get; set; }
+    [ByOwnerStatus, Property]  public partial string Status { get; set; }
+    [Slug, Property]           public partial string Slug { get; set; }
+}
+```
+
+Generated schema:
+
+```sql
+DEFINE INDEX IF NOT EXISTS idx_user_stories_by_owner_status ON TABLE user_stories COLUMNS owner, status;
+DEFINE INDEX IF NOT EXISTS uq_user_stories_slug ON TABLE user_stories COLUMNS slug UNIQUE;
+```
+
+V1 rules:
+
+- Allowed fields: scalar `[Property]`, `[Reference]`, and `[Parent]`.
+- Rejected fields: `[Id]`, `[Children]`, relation read collections, index-only members, inline object/list fields, and unmapped scalar types.
+- Composite column order is the C# property declaration order.
+- Composite fields for one index must live in the same partial type declaration so that order is stable.
+- Unique indexes over nullable fields are rejected in this first cut.
+- Schema names are `idx_{table}_{attribute}` or `uq_{table}_{attribute}`, stripping the `Attribute` suffix and snake-casing both parts.
 
 ## Generated Entity API
 
@@ -182,6 +219,8 @@ public Task<SurrealSession> LoadDesignAsync(
 There are two `Load{Root}Async` overloads per `[AggregateRoot]` — one taking `Surreal db` (read-only — no transaction; the load just queries), one taking `Transaction tx` (write-mode — load query runs inside the txn so it sees in-txn writes from the same transaction). Both produce a `SurrealSession` rooted at the requested aggregate; both delegate to `{Root}AggregateLoader.PopulateAsync`.
 
 The unified query terminal `Workspace.Query.{Root}.WithId(...).LoadAsync(db | tx)` is the filtered-load equivalent — same hydrated session for a no-`Include*` call, narrower hydration when `Include*` is chained. Use `Workspace.Load{Root}Async` when you want the entire aggregate; use `Workspace.Query.{Root}.WithId(id).Include*(…).LoadAsync` when you want to control which slices hydrate.
+
+`Workspace.Schema` includes entity tables, fields, entity indexes declared through `IndexAttribute` / `UniqueIndexAttribute` derivatives, and relation table DDL. Every statement is emitted with `IF NOT EXISTS` so repeated application is idempotent.
 
 ### End-to-end shape
 
@@ -857,14 +896,14 @@ public partial interface ICodeSymbolEdge : IEdgePayload, IRelationVariant
 
 - Local self-declared `partial` members on the variant always win for the role they declare. The linker only fills overlapping roles when the variant's slot is null.
 - Non-overlapping interface contributions (e.g. one interface declares `[In]/[Out]`, a different one declares `[Property]`) accumulate.
-- Overlapping contributions must agree on `Role + Name + Type FQN + IsNullable`. Mismatches drop the variant silently — same fail-soft contract as malformed input. (A `CG036` diagnostic naming the conflicting interfaces is the natural follow-up; not yet shipped.)
+- Overlapping contributions must agree on `Role + Name + Type FQN + IsNullable`. Mismatches drop the variant and report `CG036`, naming the variant, lifted interface, and conflicting member shapes.
 - Half-populated variants (variant declares `[In]` but no `[Out]`) pass through with one endpoint null for the linker to fill from an interface.
 
 #### Scope
 
 The shared-shape interface helps with *construction* and *shape declaration* only. Reads stay per-kind — relation kinds remain distinct edge tables, and querying still requires per-kind dispatch (`session.QueryVariantsOutgoingAsync<TVariant>` per kind, concatenate). The interface gives `IEnumerable<I>` uniform handling once you've collected variants from multiple per-kind queries, but the generator doesn't synthesise "all variants of these kinds" reads.
 
-Diagnostics: **CG033** (interface must be partial — the generator can't graft the static factory otherwise), **CG035** (no implementing variants — warning; the interface still works as a marker type, but the factory has nothing to dispatch to).
+Diagnostics: **CG033** (interface must be partial — the generator can't graft the static factory otherwise), **CG035** (no implementing variants — warning; the interface still works as a marker type, but the factory has nothing to dispatch to), **CG036** (annotated shared-shape lift conflict).
 
 ## Runtime Types
 
@@ -1091,7 +1130,7 @@ These are public for diagnostics and tests but most consumers do not call them d
 
 ## Diagnostics
 
-The generator emits diagnostics for invalid model shapes. Most are errors (compile fails); the two warnings are flagged inline. For the rationale behind aggregate boundaries (`CG011`, `CG020`, `CG021`) and the reference-delete behaviors (`CG012`–`CG017`), see [`architecture.md`](architecture.md#aggregate-boundaries).
+The generator emits diagnostics for invalid model shapes. Most are errors (compile fails); warnings are flagged inline. For the rationale behind aggregate boundaries (`CG011`, `CG020`, `CG021`) and the reference-delete behaviors (`CG012`–`CG017`), see [`architecture.md`](architecture.md#aggregate-boundaries).
 
 | Code | Meaning |
 | --- | --- |
@@ -1121,3 +1160,9 @@ The generator emits diagnostics for invalid model shapes. Most are errors (compi
 | `CG032` | Union endpoint interface has no per-table marker enrolling any `[Table]` in the union — the union is unreachable. Warning. |
 | `CG033` | Shared-shape relation interface (a `partial interface I... : IRelationVariant`) must be declared `partial` so the generator can graft the static `Create<TKind>` factory. |
 | `CG035` | Shared-shape relation interface has no implementing variant classes — the generated `Create<TKind>` factory would have nothing to dispatch to. Warning. |
+| `CG036` | Annotated shared-shape lift conflict — a relation variant cannot merge interface-lifted members with its existing shape. |
+| `CG037` | Entity index includes a member that is not a supported persisted field. |
+| `CG038` | Composite entity index fields are split across partial type declarations. |
+| `CG039` | Unique entity index includes a nullable field. |
+| `CG040` | Multiple entity indexes resolve to the same schema name. |
+| `CG041` | The same index attribute appears more than once on one field. |

@@ -51,7 +51,7 @@ Runtime types referenced throughout this doc (`IEntity`, `IRecordId`, `IRelation
 
 | Stream | How it discovers | Discovered shape | Lives in |
 | --- | --- | --- | --- |
-| Tables | `ForAttributeWithMetadataName(TableAttribute)` | `TableModel` (name, properties, aggregate-root flag, partial flag) | `TableExtractor` |
+| Tables | `ForAttributeWithMetadataName(TableAttribute)` | `TableModel` (name, properties including entity-index annotations, aggregate-root flag, partial flag) | `TableExtractor` |
 | Forward relation kinds | `CreateSyntaxProvider` over class-with-base-list, semantic-model confirm | `RelationKindModel(Direction = Forward)` | `RelationKindExtractor` |
 | Inverse relation kinds | Same as forward, filtered by base derivation from `InverseRelation<>` | `RelationKindModel(Direction = Inverse)` | `RelationKindExtractor` |
 | Composition root | `ForAttributeWithMetadataName(CompositionRootAttribute)` | `CompositionRootModel` | `CompositionRootExtractor` |
@@ -67,18 +67,19 @@ The streams' predicates are syntax-only so the incremental cache keys hash cheap
 1. **Rewrites `TypeRef`s** so `TypeRef.IsTableType` is true for every type that turned out to be a `[Table]` after the full table set is known. Per-symbol extractors can't see this; they seed `IsTableType` from immediately-visible attributes and the linker patches up forward references.
 2. **Computes per-kind union sets** (`Unions`) — the source-side and target-side `[Table]` members for each forward kind. 2+ members → a marker interface emitted by `UnionInterfaceEmitter` (with both an entity-side and an id-side variant).
 3. **Computes union endpoints** (`UnionEndpoints`) — stitches the union-interface candidates and per-table membership opt-ins into `UnionEndpointModel`s keyed by interface FQN.
-4. **Lifts variant shapes from annotated shared-shape interfaces** (`LiftVariantsFromSharedShape`, preview.56/.57) — each variant's `In/Out/Id/Payload` is merged with every annotated shared-shape candidate it implements (transitive base closure, sorted by FQN). Local self-declared members win for overlapping roles; non-overlapping interface contributions accumulate; hard conflicts (incompatible `Role + Name + Type + IsNullable` for the same property) drop the variant silently.
+4. **Lifts variant shapes from annotated shared-shape interfaces** (`LiftVariantsFromSharedShape`, preview.56/.57) — each variant's `In/Out/Id/Payload` is merged with every annotated shared-shape candidate it implements (transitive base closure, sorted by FQN). Local self-declared members win for overlapping roles; non-overlapping interface contributions accumulate; hard conflicts (incompatible `Role + Name + Type + IsNullable` for the same property) drop the variant and flow to CG036.
 5. **Computes shared-shape models** (`SharedShapes`) — for each candidate interface, lists every variant whose `ImplementedInterfaceFullNames` includes it.
-6. **Computes aggregates and aggregate conflicts** (CG011) by walking `[Children]` from each `[AggregateRoot]`.
-7. **Detects cascade-only reference cycles** (CG014) on the `[Reference, Cascade]` subgraph.
+6. **Computes entity indexes** (`Indexes` / `IndexIssues`) — groups `IndexAttribute` / `UniqueIndexAttribute` derivatives by attribute type per table, validates supported fields, and preserves property declaration order for composites.
+7. **Computes aggregates and aggregate conflicts** (CG011) by walking `[Children]` from each `[AggregateRoot]`.
+8. **Detects cascade-only reference cycles** (CG014) on the `[Reference, Cascade]` subgraph.
 
 The output is a `ModelGraph` record (see [Model graph shape](#model-graph-shape) below).
 
 **Diagnostics fire from three layers.** The split matters when you're adding a new one:
 
 - **Inside an extractor.** Cheap structural checks that don't need cross-table information (e.g. "is this property partial?"). Rare; most extractors stay pure and let the linker decide.
-- **Inside `RelationLinker`.** Cross-table checks that need the full model — currently used for CG014 (cascade-only cycles) and the aggregate-conflict computation feeding CG011. The shared-shape lift conflict path (preview.57) also lives here but currently fail-soft drops without a CGxxx; a `CG036` ("shared-shape lift conflict") is the planned follow-up — if you're adding it, thread conflict descriptors out of `TryMergeLift` / `TryMergeSingular` into a new `ModelGraph` array (mirroring `AggregateConflicts` / `CascadeCycles`) and have `ModelGenerator.Emit` walk it.
-- **Inside `ModelGenerator.Emit`.** Everything else. The bulk of the per-table validation (CG001, CG008, CG022, CG024–CG028) lives here in long sequential loops; cross-aggregate reference checks (CG021), composition-root presence (CG018/CG019), and per-aggregate parent-reachability (CG020) also fire here. Shared-shape diagnostics (CG033, CG035) fire late, after `SharedShapeEmitter` has run.
+- **Inside `RelationLinker`.** Cross-table checks that need the full model — currently used for CG014 (cascade-only cycles), the aggregate-conflict computation feeding CG011, shared-shape lift conflicts feeding CG036, and entity-index validation feeding CG037–CG041.
+- **Inside `ModelGenerator.Emit`.** Everything else. The bulk of the per-table validation (CG001, CG008, CG022, CG024–CG028) lives here in long sequential loops; cross-aggregate reference checks (CG021), composition-root presence (CG018/CG019), and per-aggregate parent-reachability (CG020) also fire here. Shared-shape diagnostics (CG033, CG035, CG036) and entity-index diagnostics (CG037–CG041) are reported from linker output.
 
 Most contributors adding a diagnostic want the `ModelGenerator.Emit` layer — the model is fully linked, the source-production-context is in hand, and the convention is established. Add a descriptor in `Pipeline/Diagnostics.cs` and a `spc.ReportDiagnostic(...)` call at the appropriate loop body.
 
@@ -94,7 +95,7 @@ Main emitter responsibilities:
 | `SharedShapeEmitter` | Partial fragment per user-declared `partial interface I... : IRelationVariant` carrying a `static {I} Create<TKind>(Action<{I}> init) where TKind : IRelationKind` factory. Body is an if-chain dispatching on `typeof(TKind)` to instantiate the matching variant. |
 | `AggregateLoaderEmitter` | Internal loader per aggregate root, with two `PopulateAsync` overloads (Surreal db / Transaction tx). |
 | `CompositionRootEmitter` | `Load{Root}Async` methods on the user's composition root — two overloads per aggregate root (db / tx). |
-| `SchemaEmitter` | Ordered idempotent SurrealDB DDL chunks plus `ApplySchemaAsync(db)` / `ApplySchemaAsync(tx)`. Multi-variant relation kinds get `SCHEMALESS` edge tables; single-variant kinds keep `SCHEMAFULL`. Union-endpoint `FROM` / `TO` clauses expand to every member table. |
+| `SchemaEmitter` | Ordered idempotent SurrealDB DDL chunks plus `ApplySchemaAsync(db)` / `ApplySchemaAsync(tx)`. Emits entity tables, fields, entity indexes, and relation tables. Multi-variant relation kinds get `SCHEMALESS` edge tables; single-variant kinds keep `SCHEMAFULL`. Union-endpoint `FROM` / `TO` clauses expand to every member table. |
 | `ReferenceRegistryEmitter` | Model-scoped reference metadata + a `Workspace.ReferenceRegistry` static accessor on the user's composition root. |
 | `QueryRootEmitter` | `Workspace.Query` accessor + per-table `SurfaceQuery<T>` roots. |
 | `EdgeQueryRootEmitter` | `Workspace.Query.Edges.{Kind}` accessors with id-side type parameters (per-table id for single-target sides, generated id-side union marker for multi-target sides). |
@@ -128,6 +129,9 @@ The fully-linked output of `RelationLinker.Build` is a `ModelGraph` record with 
 | `Unions` | Auto-computed source/target unions per forward kind with 2+ members. Feeds `UnionInterfaceEmitter`. |
 | `UnionEndpoints` | User-declared union-endpoint interfaces, each with its member table list. |
 | `SharedShapes` | User-declared shared-shape interfaces, each with its implementing variants. (preview.56+: candidates also carry `Lifted{In,Out,Id,Payload}` extracted from interface members across the transitive base closure; `RelationLinker.LiftVariantsFromSharedShape` consumes these to fill in / merge variant shapes before `SharedShapes` is computed.) |
+| `SharedShapeLiftConflicts` | Per-variant shared-shape merge conflicts reported as CG036. |
+| `Indexes` | Valid entity indexes grouped by user-defined index attribute type. Feeds `SchemaEmitter`. |
+| `IndexIssues` | Entity-index validation failures reported as CG037–CG041. |
 | `Aggregates` | Per-`[AggregateRoot]` membership, computed by `[Children]` BFS from each root. |
 | `AggregateConflicts` | `"Member\|Root1,Root2,…"` strings for CG011 (member reachable from 2+ roots). |
 | `CascadeCycles` | Cycle path strings for CG014. |
@@ -180,9 +184,12 @@ Each `[Table]` maps to a SurrealDB `SCHEMAFULL` table. The generated schema incl
 - `option<record<target>>` for nullable references.
 - Parent fields with `REFERENCE ON DELETE REJECT`.
 - Computed reverse fields for `[Children]`.
+- Entity indexes from `IndexAttribute` / `UniqueIndexAttribute` derivatives.
 - Relation tables for forward relation kinds, with `DEFINE INDEX … COLUMNS in, out UNIQUE`.
 
 `[Reference, Inline]` is the owned-sidecar carve-out. The aggregate loader expands that reference with `field.*` and hydrates the linked row in the same session. Plain `[Reference]` stores and hydrates the id only.
+
+Entity-index names are generated as `idx_{table}_{attribute}` or `uq_{table}_{attribute}`, with `Attribute` stripped from the user-defined attribute type and snake_case applied. Composite indexes use property declaration order and are rejected if the participating fields are split across partial declarations.
 
 ## Aggregate Boundaries
 

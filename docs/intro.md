@@ -39,12 +39,14 @@ using Disruptor.Surface.Runtime;
 
 namespace MyApp.Model;
 
+public sealed class ByTitleAttribute : IndexAttribute;
+
 [Table, AggregateRoot]
 public partial class Design
 {
     [Id] public partial DesignId Id { get; set; }
 
-    [Property] public partial string Title { get; set; }
+    [ByTitle, Property] public partial string Title { get; set; }
     [Reference, Cascade, Inline] public partial Details? Details { get; set; }
 
     [Children] public partial IReadOnlyCollection<Constraint> Constraints { get; }
@@ -79,6 +81,7 @@ For that model, the generator contributes:
 - Implementations for the partial properties.
 - Two `Workspace.LoadDesignAsync` overloads — one taking `Disruptor.Surreal.SurrealClient db` (read-only), one taking `Disruptor.Surreal.SurrealTransaction tx` (write-mode load that sees in-txn writes from the same transaction). Both hydrate the aggregate into a `SurrealSession`.
 - `Workspace.Schema` and `Workspace.ApplySchemaAsync(db)` / `ApplySchemaAsync(tx)` for applying the generated SurrealDB schema at startup.
+- Any entity indexes declared through parameterless `IndexAttribute` / `UniqueIndexAttribute` derivatives, including composite indexes when the same index attribute appears on multiple persisted fields.
 - `Workspace.ReferenceRegistry`, used by reference metadata at session construction time.
 - A typed query surface rooted at `Workspace.Query`. The pieces:
 

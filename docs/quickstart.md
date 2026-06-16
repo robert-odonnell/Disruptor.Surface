@@ -42,12 +42,14 @@ using Disruptor.Surface.Runtime;
 
 namespace MyApp.Model;
 
+public sealed class ByTitleAttribute : IndexAttribute;
+
 [Table, AggregateRoot]
 public partial class Design
 {
     [Id] public partial DesignId Id { get; set; }
 
-    [Property] public partial string Title { get; set; }
+    [ByTitle, Property] public partial string Title { get; set; }
 
     // [Reference, Inline, Cascade]:
     //   [Reference]  — record link to another table.
@@ -88,6 +90,8 @@ public partial class Workspace
 ```
 
 Build the project. The generator will emit typed ids, property bodies, schema metadata, and two `Workspace.LoadDesignAsync(...)` overloads (one taking `Surreal db`, one taking `Transaction tx`).
+
+The `[ByTitle]` attribute is an optional schema index example. Indexes are user-defined parameterless attribute types: derive from `IndexAttribute` for a standard index or `UniqueIndexAttribute` for a unique index, then apply the derived attribute to persisted `[Property]`, `[Reference]`, or `[Parent]` fields. Applying the same index attribute to multiple fields on one table emits a composite index in property declaration order.
 
 ## 3. Connect To SurrealDB
 

@@ -28,11 +28,13 @@ using Disruptor.Surface.Runtime;
 
 namespace MyApp.Model;
 
+public sealed class ByTitleAttribute : IndexAttribute;
+
 [Table, AggregateRoot]
 public partial class Design
 {
     [Id]                         public partial DesignId Id { get; set; }
-    [Property]                   public partial string Title { get; set; }
+    [ByTitle, Property]          public partial string Title { get; set; }
     [Reference, Inline, Cascade] public partial Details? Details { get; set; }
     [Children]                   public partial IReadOnlyCollection<Constraint> Constraints { get; }
 }
@@ -101,6 +103,8 @@ dotnet build Disruptor.Surface.slnx
 ```
 
 Generated files for the sample land in `src/Disruptor.Surface.Sample/obj/Debug/net10.0/generated/Disruptor.Surface.Generator/Disruptor.Surface.Generator.ModelGenerator/` — inspect them to see what the generator emitted for a given `[Table]` class. Full build/test/inspection commands in [`docs/notes.md`](docs/notes.md#build--run).
+
+Entity indexes are declared the same low-intrusion way as relation kinds: derive a parameterless attribute from `IndexAttribute` or `UniqueIndexAttribute`, then apply it to one or more persisted fields. Reusing the same attribute on multiple fields emits a composite index in declaration order.
 
 ## Running the harness
 

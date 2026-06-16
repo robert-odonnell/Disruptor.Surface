@@ -104,7 +104,7 @@ The generated partials are not standalone — they call into a small runtime tha
 
 When working in `Disruptor.Surface.Sample/Models` (or any consumer):
 
-- A `[Table]` class **must** be `partial` (CG001) and declare exactly **one** `[Id]` partial property (CG007/CG008). The id type is the generated `{Name}Id` struct.
+- A `[Table]` class **must** be `partial` (CG001). `[Id]` is optional; when present it is the user-facing typed-id accessor and at most one may be declared (CG008). The id type is the generated `{Name}Id` struct.
 - Exactly one class **may** be tagged `[CompositionRoot]` and **must** be `partial` (CG018/CG019). The generator grafts `Load{Root}Async` instance methods onto it; you own the ctor, fields, etc. Without one, the load methods aren't emitted; you can still call `{Root}AggregateLoader.PopulateAsync` directly.
 - `[AggregateRoot]` on the root entity of an aggregate (e.g. `Design`, `Review`). Membership is computed by walking `[Children]` from the root; entities reachable from 2+ roots produce CG011.
 - **Entity reads are sync; writes split into sync (in-memory) + async (dispatch).** Sync property setters write directly to backing fields. Async dispatch happens through `session.SaveAsync` / `DeleteAsync` / `UnrelateAsync` against an app-owned `SurrealTransaction`. Edges are written by `Save`-ing a relation variant (`session.SaveAsync(new TVariant { Source = …, Target = … }, tx)`).

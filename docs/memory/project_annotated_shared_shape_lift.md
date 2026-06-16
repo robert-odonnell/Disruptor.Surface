@@ -18,7 +18,7 @@ Shape:
 
 **How to apply:**
 - Lift is *opt-in* — annotate the interface to use it. preview.55 self-describing variants (own attributed `partial` members) still work and continue to win wherever they overlap with an interface contribution.
-- The linker MERGES rather than picks: it walks every annotated shared-shape interface the variant implements (transitive base closure), accumulating non-overlapping contributions. Local self-declared members and compatible interface fragments merge cleanly; only HARD conflicts (overlapping role+name with incompatible Type / IsNullable) drop the variant silently.
+- The linker MERGES rather than picks: it walks every annotated shared-shape interface the variant implements (transitive base closure), accumulating non-overlapping contributions. Local self-declared members and compatible interface fragments merge cleanly; only HARD conflicts (overlapping role+name with incompatible Type / IsNullable) drop the variant and report CG036.
 - The merge composes across the interface chain too: payload shape can live on `IPayload : IRelationVariant`, endpoint shape on `IEdge : IPayload`, and a variant `: IEdge` gets both — `SharedShapeExtractor` walks `iface.AllInterfaces` + `iface` itself, sorted by FQN for stability.
 - Half-populated variants (declares own `[In]` but not `[Out]`, or vice versa) now pass through the extractor with one endpoint null for the linker to fill — only multiplicity violations (`>1` of a role) still fail at extraction.
 - Unannotated shared-shape interfaces (preview.55 default) → lift is inert; an empty-body variant under one produces no emit.
