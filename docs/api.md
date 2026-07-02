@@ -842,8 +842,8 @@ public partial class CallsRelation : ICodeSymbolEdge
 }
 
 // Empty-body variant (preview.56+) — inherits the full shape from the interface.
-[References]
-public partial class ReferencesRelation : ICodeSymbolEdge;
+[RefersTo]
+public partial class RefersToRelation : ICodeSymbolEdge;
 ```
 
 #### Call site — `Create<TKind>` factory
@@ -867,7 +867,7 @@ public static partial I Create<TKind>(System.Action<I> init)
     where TKind : IRelationKind;
 ```
 
-The body is an if-chain dispatching on `typeof(TKind)` — `new CallsRelation()` for `Calls`, `new ReferencesRelation()` for `References`, etc. — runs the user's initialiser, then returns the instance. An unknown `TKind` throws `InvalidOperationException`.
+The body is an if-chain dispatching on `typeof(TKind)` — `new CallsRelation()` for `Calls`, `new RefersToRelation()` for `RefersTo`, etc. — runs the user's initialiser, then returns the instance. An unknown `TKind` throws `InvalidOperationException`.
 
 #### Composition — split contracts across the interface chain
 

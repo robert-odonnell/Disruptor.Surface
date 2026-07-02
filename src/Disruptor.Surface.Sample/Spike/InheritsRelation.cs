@@ -17,7 +17,7 @@ public partial interface ICodeSymbolInheritsRelation : IRelationVariant
 }
 
 // Empty body — the linker lifts In/Out/Property from the interface above. Compare
-// CallsRelation / ReferencesRelation which keep the per-variant declarations even
+// CallsRelation / RefersToRelation which keep the per-variant declarations even
 // though their shape is identical; preview.56 is opt-in, the existing self-describing
 // shape stays valid.
 [Inherits]

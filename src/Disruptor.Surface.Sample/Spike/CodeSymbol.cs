@@ -3,7 +3,7 @@ using Disruptor.Surface.Annotations;
 namespace Disruptor.Surface.Sample.Spike;
 
 // Each CodeSymbol is its own [AggregateRoot]; edges between two of them cross
-// aggregates and so use typed-id endpoints (see CallsRelation / ReferencesRelation).
+// aggregates and so use typed-id endpoints (see CallsRelation / RefersToRelation).
 [Table, AggregateRoot]
 public partial class CodeSymbol
 {
