@@ -503,6 +503,20 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     /// are marked loaded on their owners — subsequent reads against those slices stop
     /// throwing <see cref="LoadShapeViolationException"/>.
     /// <para>
+    /// <b>Enforced contract:</b> Fetch is a slice widener over a root the session already
+    /// holds — it never invents new aggregate roots. The query MUST pin a root id via
+    /// <see cref="SurfaceQuery{T}.WithId"/> (a pin-less query throws
+    /// <see cref="ArgumentException"/> before any wire dispatch; the session stays open —
+    /// pure API misuse, same stance as <see cref="UnrelateAsync{TKind}"/>'s both-null guard),
+    /// and the pinned id must already be tracked in this session (an unknown pin throws
+    /// <see cref="InvalidOperationException"/> before dispatch and closes the session with
+    /// <see cref="SessionCloseKind.RejectedFetch"/> — a fetch rooted at an id the snapshot
+    /// doesn't hold means the caller's view of the session is already wrong). A returned
+    /// root row whose id differs from the pin is rejected mid-hydration (session closes,
+    /// row is not tracked). Nested includes may still hydrate new children / relation
+    /// targets — only the ROOT must not be new.
+    /// </para>
+    /// <para>
     /// <b>Caveat:</b> Fetch is a slice widener, not a polite refresh. Re-Hydrate of an
     /// entity already in the session overwrites its scalar fields with whatever the DB
     /// returns. If you've mutated an entity in memory, save first or accept the clobber —
@@ -512,7 +526,7 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     /// Typical usage: a property read raises a <see cref="LoadShapeViolationException"/>;
     /// catch it (or pre-empt it) and call <c>session.FetchAsync(Workspace.Query.{Root}.WithId(id).Include*(...))</c>
     /// to extend the load shape. The query must root at the same entity whose slice you
-    /// want to top up — Fetch never invents new aggregate roots.
+    /// want to top up.
     /// </para>
     /// </summary>
     public Task FetchAsync<T>(SurfaceQuery<T> query, SurrealClient db, CancellationToken ct = default)
@@ -531,6 +545,32 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
         where T : class, IEntity, new()
     {
         ThrowIfClosed();
+
+        // Pre-dispatch contract enforcement — see the public overload's doc. A pin-less
+        // query is pure API misuse (the query shape is wrong regardless of session
+        // state): throw without closing, mirroring UnrelateAsync's both-null guard.
+        if (query.PinnedId is not { } pinned)
+        {
+            throw new ArgumentException(
+                $"FetchAsync requires the query to pin a root id via WithId(...) — Fetch is a slice widener "
+                + $"over an entity already in this session, never a bulk import. The query on '{query.Table}' "
+                + "has no pinned id. Pin the tracked root (e.g. Workspace.Query.{Root}.WithId(id).Include*(...)), "
+                + "or use LoadAsync / ExecuteAsync for a fresh load.",
+                nameof(query));
+        }
+
+        // An unknown pin reflects session state gone wrong (the caller believes the
+        // session holds a root it doesn't) — reject before dispatch AND close, the
+        // CascadeRejectException precedent for pre-flight rejections.
+        if (!state.Entities.ContainsKey(pinned))
+        {
+            var rejection = new InvalidOperationException(
+                $"FetchAsync is pinned to {pinned}, which is not tracked in this session. Fetch tops up "
+                + "slices on a root the session already holds — load the aggregate first, then Fetch to widen.");
+            Close(new SessionCloseReason(SessionCloseKind.RejectedFetch, pinned, rejection));
+            throw rejection;
+        }
+
         try
         {
             var (sql, bindings) = query.Compile();
@@ -549,13 +589,13 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
                 {
                     if (row is SurrealObjectValue obj)
                     {
-                        HydrateMergingRoot<T>(obj, sink, query.Includes);
+                        HydrateMergingRoot(obj, sink, query.Includes, pinned);
                     }
                 }
             }
             else if (rows is SurrealObjectValue single)
             {
-                HydrateMergingRoot<T>(single, sink, query.Includes);
+                HydrateMergingRoot(single, sink, query.Includes, pinned);
             }
         }
         catch (Exception ex)
@@ -563,32 +603,37 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
             // Fail-closed like every other async boundary: a mid-loop hydration failure
             // would otherwise leave an open session that is half old state, half new,
             // violating the one-shot invariant.
-            Close(new SessionCloseReason(SessionCloseKind.FetchFailed, Cause: ex));
+            Close(new SessionCloseReason(SessionCloseKind.FetchFailed, pinned, ex));
             throw;
         }
     }
 
     /// <summary>
-    /// Hydrate one root row (or re-Hydrate over an existing tracked entity), then recurse
+    /// Re-Hydrate one root row over the pinned, already-tracked entity, then recurse
     /// through <paramref name="includes"/>. Re-Hydrate clobbers existing scalar fields —
     /// the slice-widening contract documented on <see cref="FetchAsync{T}(SurfaceQuery{T}, SurrealClient, CancellationToken)"/>.
+    /// A root row whose id differs from <paramref name="pinnedId"/> is rejected before
+    /// anything hydrates — Fetch never invents (or touches) other aggregate roots; the
+    /// throw rides FetchAsync's fail-closed catch. Never constructs a new root instance:
+    /// the pre-dispatch pin check guarantees the pinned id is in the identity map.
     /// </summary>
-    private void HydrateMergingRoot<T>(SurrealObjectValue row, IHydrationSink sink, IReadOnlyList<IIncludeNode> includes)
-        where T : class, IEntity, new()
+    private void HydrateMergingRoot(SurrealObjectValue row, IHydrationSink sink, IReadOnlyList<IIncludeNode> includes, RecordId pinnedId)
     {
         if (!HydrationValue.TryReadRecordId(row, "id", out var id))
         {
             return;
         }
 
+        if (id != pinnedId)
+        {
+            throw new InvalidOperationException(
+                $"FetchAsync response contained root row {id}, but the query is pinned to {pinnedId}. "
+                + "Fetch never invents new aggregate roots — the row was rejected and the session is closed.");
+        }
+
         if (state.Entities.TryGetValue(id, out var existing))
         {
             existing.Hydrate(row, sink);
-        }
-        else
-        {
-            var entity = new T();
-            entity.Hydrate(row, sink);
         }
 
         HydrateMergingNested(row, includes, sink);
