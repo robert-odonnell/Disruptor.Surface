@@ -24,11 +24,13 @@ public readonly record struct RecordId(string Table, string Value) : IRecordId, 
         => new(table, RecordIdFormat.HashText(text, prefix));
 
     /// <summary>
-    /// Deferred edge-id strategy: the <c>Value</c> is left empty as a sentinel and the
-    /// dispatcher resolves it at write time as <c>HashText("{source}|{Table}|{target}")</c>
-    /// — same triple → same hash, so re-running the same edge dispatch lands on the same
-    /// row. Used by relation-variant <c>SaveAsync</c> bodies to mint a stable edge id
-    /// from <c>(in, edge-table, out)</c> without changing the entity-id surface.
+    /// Deferred edge-id strategy: the <c>Value</c> is left empty as a sentinel. Nothing
+    /// resolves the sentinel automatically today — the emitted relation-variant
+    /// <c>SaveAsync</c> bodies mint Ulid-backed edge ids of their own, and a sentinel
+    /// that reaches dispatch un-resolved is sent without an explicit id, so the
+    /// substrate mints a random row id (i.e. NOT idempotent in practice). Callers who
+    /// want content-addressed edge ids call <see cref="Resolve"/> themselves before
+    /// dispatch; no automatic plumbing exists.
     /// <para>
     /// Only meaningful as the edge id on a relation row — using an idempotent id
     /// elsewhere will produce empty-value strings in rendered SurrealQL.
@@ -38,18 +40,23 @@ public readonly record struct RecordId(string Table, string Value) : IRecordId, 
 
     /// <summary>
     /// True iff this id is the deferred-idempotent sentinel: <see cref="Table"/> is set
-    /// and <see cref="Value"/> is empty. The empty value is unambiguous — every other
-    /// id form (Ulid, slug, hash) is at least one character long and is rejected by
-    /// <see cref="RecordIdFormat.Validate"/> if empty.
+    /// and <see cref="Value"/> is empty. <c>default(RecordId)</c> (both components
+    /// <c>null</c> — the in-band "no endpoint" sentinel <see cref="Command.Unrelate"/>
+    /// logs) is NOT idempotent, and this property must stay null-safe for it. The empty
+    /// value is otherwise unambiguous — every other id form (Ulid, slug, hash) is at
+    /// least one character long and is rejected by <see cref="RecordIdFormat.Validate"/>
+    /// if empty.
     /// </summary>
-    public bool IsIdempotent => Value.Length == 0 && !string.IsNullOrEmpty(Table);
+    public bool IsIdempotent => Value is { Length: 0 } && !string.IsNullOrEmpty(Table);
 
     /// <summary>
     /// Resolve a deferred-idempotent edge id against its <paramref name="source"/> and
     /// <paramref name="target"/> endpoints. No-op for already-resolved ids; for the
     /// idempotent sentinel, returns a concrete <see cref="RecordId"/> whose value is
     /// <see cref="RecordIdFormat.HashText"/> of <c>{source}|{Table}|{target}</c>. Same
-    /// triple always lands on the same row.
+    /// triple always lands on the same row. The library never calls this itself (see
+    /// <see cref="Idempotent"/>) — it exists for callers minting content-addressed edge
+    /// ids by hand.
     /// </summary>
     public RecordId Resolve(RecordId source, RecordId target)
         => IsIdempotent
