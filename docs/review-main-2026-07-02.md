@@ -1,40 +1,18 @@
 # Code review — 2026-07-02 (main / `master`)
 
-Scope: current default branch (`master`) after the 2026-07-02 review-and-fix pass. This is a source review of the generator pipeline, emitted contracts, runtime session boundary, relation-variant persistence, query layer, docs, and backlog. I did not run a live SurrealDB substrate in this pass; anything that needs live parser/runtime validation is called out separately.
+Scope: current default branch (`master`) after the 2026-07-02 review-and-fix pass. This is a source review of the generator pipeline, emitted contracts, runtime session boundary, relation-variant persistence, query layer, and docs.
+
+This pass is intentionally aligned against [`docs/remaining-work.md`](remaining-work.md) and [`../Improvements.md`](../Improvements.md). Findings below exclude backlog items already captured there: live-substrate validation, SurrealQL identifier quoting, deterministic-edge-id smoke against pre-existing data, union semantic resolution, AOT/trim, query/delete feature backlog, ecosystem packages, and per-element emit granularity.
 
 Severity: **H** = can corrupt persisted/session identity or break users in a normal flow; **M** = real defect with plausible trigger; **L** = docs / DX / latent robustness.
 
 ## Verdict
 
-Main is materially stronger than the reviewed branch. The big session-boundary issues that worried me are fixed: `FetchAsync` is now pinned to an already-tracked root, foreign root rows are rejected fail-closed, `ExecuteIntoSessionAsync` closes a supplied session on hydration/wire failure, nullable relation payload duplicate-update variables bind explicitly, and relation variants now derive deterministic edge ids for the normal endpoint-first save path.
+Main is materially stronger than the reviewed branch. The earlier high-risk session-boundary issues are fixed: `FetchAsync` is now pinned to an already-tracked root, foreign root rows are rejected fail-closed, `ExecuteIntoSessionAsync` closes a supplied session on hydration/wire failure, nullable relation payload duplicate-update variables bind explicitly, and relation variants derive deterministic edge ids for the normal endpoint-first save path.
 
-I would still hold a release tag until the relation-variant id escape hatch below is fixed. It is not a theoretical style gripe; it can recreate the exact identity-map lie the deterministic-edge-id work was meant to remove.
+After removing already-planned work from the review, two uncaptured issues remain worth acting on: one release-blocking relation-variant identity hole, and one API/docs mismatch in the hydration workflow.
 
-## Verified fixed since the previous review
-
-### Fetch/session boundary is now correct
-
-`FetchAsync` now requires `SurfaceQuery<T>.WithId(...)`, rejects pin-less queries before dispatch, requires the pinned id to already be tracked, and rejects any returned root row whose id differs from the pin. Nested includes may still hydrate new child/target rows, but the root can no longer be invented into the session. The regression tests cover pin-less query, unknown pinned id, foreign response row, and legitimate rehydrate-over-existing behavior.
-
-This addresses the earlier trust-boundary concern.
-
-### Public session hydration now fails closed
-
-`SurfaceQuery<T>.ExecuteIntoSessionAsync(session, ...)` now wraps dispatch/hydration in a try/catch and calls `session.CloseAsFailed(SessionCloseKind.HydrationFailed, ex)` before rethrow. That closes the hole where a caller-supplied session could be left half-mutated but still usable.
-
-### Nullable relation payload duplicate updates now bind variables
-
-Relation-variant save generation now branches nullable payload bindings: null binds `SurrealValue.None`, non-null goes through `ContentValue.Set`. This fixes the previous `ON DUPLICATE KEY UPDATE field = $_p_field` with an unbound `$_p_field` variable.
-
-### Deterministic edge ids were added for the normal path
-
-`RecordId.ForEdge(edgeTable, source, target)` derives the row id from `(source, edge, target)`, and the relation-variant id anchor now uses it when both endpoints are available. The tests pin same-endpoint saves producing the same id, different targets producing different ids, and nullable payload behavior.
-
-That normal path is good. The escape hatch below is the remaining problem.
-
----
-
-## Findings
+## Findings not already covered by the backlog
 
 ### 1. User-assigned or prematurely-read relation variant ids can still recreate duplicate-edge id drift — H
 
@@ -65,7 +43,9 @@ await session.SaveAsync(new CrossLink { Id = X, Source = a, Target = b }, tx);
 
 The reverse order has the same problem: first save with assigned/random id `X`, later save without assignment derives `D`; duplicate update hits `X`, while `MarkSaved` tracks `D`.
 
-**Fix shape:** relation variant identity should be canonical. I would remove user-assigned ids from variants entirely: reject `[Id]` on relation variants with a diagnostic, always derive from `(in, edge, out)`, and make `__MintId()` throw when endpoints are not yet resolvable instead of falling back to a random id. If you really want explicit edge ids later, that needs a different duplicate policy; with `UNIQUE(in,out)`, arbitrary ids and replay-replace semantics are at odds.
+This is distinct from `remaining-work.md`'s pre-existing-data migration question. That item is about rows written before deterministic ids existed. This finding is about fresh code paths in the current branch that can still create non-canonical ids.
+
+**Fix shape:** relation variant identity should be canonical. I would remove user-assigned ids from variants entirely: reject `[Id]` on relation variants with a diagnostic, always derive from `(in, edge, out)`, and make `__MintId()` throw when endpoints are not yet resolvable instead of falling back to a random id. If explicit edge ids are needed later, that needs a different duplicate policy; with `UNIQUE(in,out)`, arbitrary ids and replay-replace semantics are at odds.
 
 ### 2. The documented hydration flow calls `session.GetAll<T>()`, but the runtime does not expose it — M
 
@@ -86,17 +66,9 @@ Users can work around it by keeping the original id list and calling `session.Ge
 public IReadOnlyCollection<T> GetAll<T>() where T : class, IEntity
 ```
 
-filtering the identity map by `T`, with `ThrowIfClosed()` and deterministic ordering if you care about stable test output. Alternatively, change the docs to iterate the original id list and call `Get<T>(id)`, but adding `GetAll<T>()` is the better API.
+filtering the identity map by `T`, with `ThrowIfClosed()` and deterministic ordering if stable output matters. Alternatively, change the docs to iterate the original id list and call `Get<T>(id)`, but adding `GetAll<T>()` is the better API.
 
-### 3. SurrealQL identifier quoting is still an open correctness risk — M / live-validation needed
-
-Identifiers are still emitted bare. `SurrealFormatter.Identifier()` only validates the regex `\A[A-Za-z_][A-Za-z0-9_]*\z`; it does not quote or reject SurrealQL keywords/literals. The schema emitter also concatenates table, field, index, and edge names directly into DDL strings.
-
-That means a C# property/type/relation name that snake-cases to something meaningful to the SurrealQL parser — for example `None`, `Order`, `Group`, or similar — can produce syntactically valid-looking but semantically wrong or parser-rejected SQL. `Improvements.md` already tracks this as needing live SurrealDB validation, and I agree with that classification.
-
-**Fix shape:** centralize identifier rendering into a single quote-aware function and use it from both query compilation and schema emission. Backtick-quote every generated identifier unless live validation proves a smaller reserved-word table is safer. This will change generated SQL snapshots, so do it deliberately and with live substrate coverage.
-
-### 4. Stale docs/comments still describe old session and projection shapes — L
+### 3. Stale docs/comments still describe old session and projection shapes — L
 
 A few docs/comments are now behind the code:
 
@@ -106,19 +78,16 @@ A few docs/comments are now behind the code:
 
 These are not runtime blockers, but stale docs in a source-generator persistence library are not harmless. Users debug generated systems by reading comments and examples; if those lie, they will waste time.
 
----
-
 ## Public API fit
 
 The public shape is still coherent for the narrow audience: SurrealDB + C# + aggregate-shaped models + explicit transaction ownership + source-generated persistence. The project should keep describing itself that way. Do not market it as a general ORM.
 
-The new validation and fail-closed contracts make the library much more credible than the earlier branch. The remaining code blocker is relation-variant identity. Fix that and the main branch looks like a serious preview rather than a prototype with nice architecture.
+The new validation and fail-closed contracts make the library much more credible than the earlier branch. The remaining uncaptured code blocker is relation-variant identity. Fix that and the main branch looks like a serious preview rather than a prototype with nice architecture.
 
-## Recommended next work
+## Recommended next work from this review
 
 1. Fix relation variant identity: disallow/ignore user-assigned variant ids and remove the random fallback from `__MintId()`.
 2. Add `SurrealSession.GetAll<T>()` or rewrite the hydration docs/examples around `Get<T>(id)`.
-3. Live-validate identifier quoting and apply a single quoting policy across query and DDL emission.
-4. Clean stale XML/docs comments so the public mental model matches the runtime.
+3. Clean stale XML/docs comments so the public mental model matches the runtime.
 
-After item 1, I would be comfortable calling the main branch a focused, useful preview for its intended niche. Without item 1, relation variants still have a sharp edge exactly where identity matters most.
+Everything else I saw that matters is already in `docs/remaining-work.md` or `Improvements.md`, so I am not duplicating it here.
