@@ -45,6 +45,18 @@ public readonly record struct PropertyExpr<T>(string Field)
     /// <summary>Inclusive range: <c>field &gt;= lower AND field &lt;= upper</c>.</summary>
     public IPredicate Between(T lower, T upper) => new BetweenPredicate(Field, lower, upper);
 
+    /// <summary>
+    /// Field-unset test: <c>(field IS NONE OR field IS NULL)</c>. The write path omits
+    /// keys for null values, so an optional field with no value is stored as NONE
+    /// (absent) — this is the predicate that matches it. NULL is accepted too, for rows
+    /// written by tools that store explicit nulls. Same compiled shape as <c>Eq(null)</c>;
+    /// this is the discoverable, intent-naming form.
+    /// </summary>
+    public IPredicate IsNone() => new IsNonePredicate(Field);
+
+    /// <summary>Field-set test: <c>(field IS NOT NONE AND field IS NOT NULL)</c> — the complement of <see cref="IsNone"/>.</summary>
+    public IPredicate IsNotNone() => new IsNotNonePredicate(Field);
+
     private static object?[] ToObjectArray(IEnumerable<T> values)
     {
         if (values is not ICollection<T> col)

@@ -236,21 +236,23 @@ public sealed class SurfaceQueryCompilerTests
     }
 
     [Fact]
-    public void Compile_ContainsPredicate_EmitsStringContainsCall()
+    public void Compile_ContainsPredicate_EmitsGuardedStringContainsCall()
     {
+        // The `!= NONE` guard keeps SurrealDB's strict function typing from failing the
+        // whole SELECT when a single row has the option<string> field unset.
         var pred = new ContainsPredicate("description", "security");
 
         var sql = Invoke("constraints", pred, pinnedId: null);
 
         Assert.Equal(
-            "SELECT * FROM constraints WHERE string::contains(description, $_p0);",
+            "SELECT * FROM constraints WHERE (description != NONE AND string::contains(description, $_p0));",
             sql);
     }
 
     [Theory]
-    [InlineData("starts", "SELECT * FROM constraints WHERE string::starts_with(description, $_p0);")]
-    [InlineData("ends", "SELECT * FROM constraints WHERE string::ends_with(description, $_p0);")]
-    public void Compile_StringBoundaryPredicates_EmitStringFunctionCalls(string mode, string expected)
+    [InlineData("starts", "SELECT * FROM constraints WHERE (description != NONE AND string::starts_with(description, $_p0));")]
+    [InlineData("ends", "SELECT * FROM constraints WHERE (description != NONE AND string::ends_with(description, $_p0));")]
+    public void Compile_StringBoundaryPredicates_EmitGuardedStringFunctionCalls(string mode, string expected)
     {
         IPredicate pred = mode == "starts"
             ? new StartsWithPredicate("description", "sec")
@@ -271,7 +273,7 @@ public sealed class SurfaceQueryCompilerTests
         var sql = Invoke("constraints", pred, pinnedId: null);
 
         Assert.Equal(
-            "SELECT * FROM constraints WHERE string::contains(description, $_p0);",
+            "SELECT * FROM constraints WHERE (description != NONE AND string::contains(description, $_p0));",
             sql);
     }
 
@@ -286,7 +288,7 @@ public sealed class SurfaceQueryCompilerTests
         var sql = Invoke("issues", pred, pinnedId: null);
 
         Assert.Equal(
-            "SELECT * FROM issues WHERE (priority > $_p0 AND status IN $_p1 AND string::contains(description, $_p2));",
+            "SELECT * FROM issues WHERE (priority > $_p0 AND status IN $_p1 AND (description != NONE AND string::contains(description, $_p2)));",
             sql);
     }
 
@@ -361,6 +363,169 @@ public sealed class SurfaceQueryCompilerTests
         Assert.Equal("sec", starts.Prefix);
         Assert.Equal("description", ends.Field);
         Assert.Equal("ity", ends.Suffix);
+    }
+
+    // ─────────────────────── NONE / null semantics ───────────────────────
+
+    [Fact]
+    public void Compile_EqNull_EmitsUnsetTest_AndAllocatesNoBinding()
+    {
+        // The write path omits keys for null values, so stored nulls are NONE (absent
+        // fields) — and NONE == NULL is false in SurrealDB. Eq(null) must compile to
+        // the unset test, not `field = $p` with $p = NULL (which never matches
+        // library-written data).
+        var (sql, bindings) = new SurfaceQuery<TestTable>("constraints")
+            .Where(new EqPredicate("notes", null))
+            .Compile();
+
+        Assert.Equal("SELECT * FROM constraints WHERE (notes IS NONE OR notes IS NULL);", sql);
+        Assert.Empty(bindings);
+    }
+
+    [Fact]
+    public void Compile_NotEqNull_NegatesTheWholeUnsetGroup()
+    {
+        // Not(Eq(null)) must be the exact complement: the `!` applies to the whole
+        // parenthesised (IS NONE OR IS NULL) group, i.e. "field has a value".
+        var pred = Predicate.Not(new EqPredicate("notes", null));
+
+        var sql = Invoke("constraints", pred, pinnedId: null);
+
+        Assert.Equal("SELECT * FROM constraints WHERE !((notes IS NONE OR notes IS NULL));", sql);
+    }
+
+    [Fact]
+    public void Compile_IsNonePredicate_EmitsUnsetTest()
+    {
+        var sql = Invoke("constraints", new IsNonePredicate("notes"), pinnedId: null);
+
+        Assert.Equal("SELECT * FROM constraints WHERE (notes IS NONE OR notes IS NULL);", sql);
+    }
+
+    [Fact]
+    public void Compile_IsNotNonePredicate_EmitsSetTest()
+    {
+        var sql = Invoke("constraints", new IsNotNonePredicate("notes"), pinnedId: null);
+
+        Assert.Equal("SELECT * FROM constraints WHERE (notes IS NOT NONE AND notes IS NOT NULL);", sql);
+    }
+
+    [Fact]
+    public void PropertyExpr_IsNone_And_IsNotNone_BuildExpectedNodes()
+    {
+        var expr = new PropertyExpr<string?>("notes");
+
+        var none = Assert.IsType<IsNonePredicate>(expr.IsNone());
+        var notNone = Assert.IsType<IsNotNonePredicate>(expr.IsNotNone());
+
+        Assert.Equal("notes", none.Field);
+        Assert.Equal("notes", notNone.Field);
+    }
+
+    [Fact]
+    public void Compile_IsNone_InvalidFieldName_Throws()
+    {
+        Assert.Throws<SurrealFormatException>(() =>
+            Invoke("constraints", new IsNonePredicate("has-dash"), pinnedId: null));
+    }
+
+    // ─────────────────────── Value binding coverage ───────────────────────
+
+    [Fact]
+    public void Compile_DefaultDateTime_DoesNotThrow_AndBindsMinInstant()
+    {
+        // default(DateTime) has Kind.Unspecified; the old machine-local cast threw
+        // ArgumentOutOfRangeException on any UTC+N machine. Unspecified is UTC now.
+        var (_, bindings) = new SurfaceQuery<TestTable>("symbols")
+            .Where(new EqPredicate("at", default(DateTime)))
+            .Compile();
+
+        var bound = Assert.IsType<SurrealDateTimeValue>(bindings["_p0"]);
+        Assert.Equal(DateTimeOffset.MinValue, bound.SurrealDateTime.ToDateTimeOffset());
+    }
+
+    [Theory]
+    [InlineData(DateTimeKind.Unspecified)]
+    [InlineData(DateTimeKind.Utc)]
+    public void Compile_UnspecifiedAndUtcDateTime_BindTheSameWallClockInstant(DateTimeKind kind)
+    {
+        // Invariant: the bound instant is deterministic regardless of host timezone —
+        // Unspecified is treated as UTC, so it binds the identical instant as Utc.
+        var value = new DateTime(2026, 7, 2, 10, 30, 15, kind);
+
+        var (_, bindings) = new SurfaceQuery<TestTable>("symbols")
+            .Where(new EqPredicate("at", value))
+            .Compile();
+
+        var bound = Assert.IsType<SurrealDateTimeValue>(bindings["_p0"]);
+        Assert.Equal(
+            new DateTimeOffset(2026, 7, 2, 10, 30, 15, TimeSpan.Zero),
+            bound.SurrealDateTime.ToDateTimeOffset());
+    }
+
+    [Fact]
+    public void Compile_LocalDateTime_BindsInstantPreservingConversion()
+    {
+        // Local is the one Kind that legitimately reads the host zone — and there the
+        // conversion preserves the instant (matches ToUniversalTime), whatever TZ the
+        // test host runs in.
+        var value = new DateTime(2026, 7, 2, 10, 30, 15, DateTimeKind.Local);
+
+        var (_, bindings) = new SurfaceQuery<TestTable>("symbols")
+            .Where(new EqPredicate("at", value))
+            .Compile();
+
+        var bound = Assert.IsType<SurrealDateTimeValue>(bindings["_p0"]);
+        Assert.Equal(value.ToUniversalTime(), bound.SurrealDateTime.ToDateTimeOffset().UtcDateTime);
+    }
+
+    [Fact]
+    public void Compile_Guid_BindsAsCanonicalDFormatString()
+    {
+        // The schema maps Guid to TYPE string — a CBOR uuid binding would never compare
+        // equal to the stored string, so the compiler binds the "D" format string.
+        var guid = Guid.Parse("8f7f9de2-3c5a-4b7e-9f24-0a1b2c3d4e5f");
+
+        var (_, bindings) = new SurfaceQuery<TestTable>("symbols")
+            .Where(new EqPredicate("external_id", guid))
+            .Compile();
+
+        Assert.Equal(new StringSurrealValue("8f7f9de2-3c5a-4b7e-9f24-0a1b2c3d4e5f"), bindings["_p0"]);
+    }
+
+    [Fact]
+    public void Compile_UlongAboveLongMax_ThrowsOverflow()
+    {
+        // SurrealDB integers are i64 — silently wrapping negative would match wrong rows.
+        var query = new SurfaceQuery<TestTable>("symbols")
+            .Where(new EqPredicate("hash", ulong.MaxValue));
+
+        Assert.Throws<OverflowException>(() => query.Compile());
+    }
+
+    [Fact]
+    public void Compile_UlongWithinLongRange_BindsAsInt64()
+    {
+        var (_, bindings) = new SurfaceQuery<TestTable>("symbols")
+            .Where(new EqPredicate("hash", (ulong)42))
+            .Compile();
+
+        Assert.Equal(new SurrealNumberValue(Surreal.Values.SurrealNumber.FromInt(42)), bindings["_p0"]);
+    }
+
+    [Fact]
+    public void Compile_ByteArray_BindsAsBytesValue_NotInt64List()
+    {
+        // byte[] is IEnumerable — without the explicit case it would decompose into a
+        // list of int64s and never compare equal to a stored bytes value.
+        var payload = new byte[] { 1, 2, 3 };
+
+        var (_, bindings) = new SurfaceQuery<TestTable>("symbols")
+            .Where(new EqPredicate("blob", payload))
+            .Compile();
+
+        var bound = Assert.IsType<SurrealBytesValue>(bindings["_p0"]);
+        Assert.Equal(payload, bound.Value.ToArray());
     }
 
     // ─────────────────────── Traversal coverage ───────────────────────
@@ -743,7 +908,7 @@ public sealed class SurfaceQueryCompilerTests
             .Compile();
 
         Assert.Equal(
-            "SELECT * FROM symbols WHERE string::contains(name, $_p0) ORDER BY name ASC LIMIT 5 START 10;",
+            "SELECT * FROM symbols WHERE (name != NONE AND string::contains(name, $_p0)) ORDER BY name ASC LIMIT 5 START 10;",
             sql);
         Assert.Equal(new Surreal.Values.StringSurrealValue("Foo"), bindings["_p0"]);
     }

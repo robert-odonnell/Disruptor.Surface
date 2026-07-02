@@ -43,6 +43,15 @@ internal static class SurfaceQueryCompiler
     /// Build the SurrealQL + bindings for a projection selection:
     /// <c>SELECT field1, field2 FROM table …</c>. Includes are not supported on this path —
     /// projections are flat by definition.
+    /// <para>
+    /// When <paramref name="orderClauses"/> reference fields outside
+    /// <paramref name="selectFields"/>, those field names are appended to the projection —
+    /// the SurrealDB 3.x parser rejects <c>ORDER BY x</c> when <c>x</c> isn't in the
+    /// selection with <c>Missing order idiom `x` in statement selection</c> (same
+    /// workaround as <see cref="CompileIdsOnly"/> and the edge compiler). The reader path
+    /// (<c>ValueProjectionRow</c>) looks fields up by name, so the extra columns are
+    /// wire-only and never surface in the materialised rows.
+    /// </para>
     /// </summary>
     public static (string Sql, SurrealObject Bindings) CompileProjection(
         string table,
@@ -61,6 +70,7 @@ internal static class SurfaceQueryCompiler
         var b = new Builder();
         var sb = new StringBuilder();
         sb.Append("SELECT ");
+        var projected = new HashSet<string>(StringComparer.Ordinal);
         for (var i = 0; i < selectFields.Count; i++)
         {
             if (i > 0)
@@ -69,6 +79,17 @@ internal static class SurfaceQueryCompiler
             }
 
             sb.Append(selectFields[i].Identifier());
+            projected.Add(selectFields[i]);
+        }
+        if (orderClauses is { Count: > 0 })
+        {
+            foreach (var clause in orderClauses)
+            {
+                if (projected.Add(clause.Field))
+                {
+                    sb.Append(", ").Append(clause.Field.Identifier());
+                }
+            }
         }
         sb.Append(" FROM ").Append(table.Identifier());
         b.AppendWhereOrderLimitStart(sb, filter, pinnedId, orderClauses, limit, start);
@@ -314,19 +335,45 @@ internal static class SurfaceQueryCompiler
 
         public string CompilePredicate(IPredicate p) => p switch
         {
+            // Eq(null) can't bind: the write path omits keys for null values, so the
+            // stored state is NONE (absent field) — and `field = $p` with $p = NULL is
+            // false against NONE in SurrealDB. Compile to the unset test instead so
+            // Eq(null) matches library-written data; Not(Eq(null)) negates the whole
+            // parenthesised group below, which is the correct complement.
+            EqPredicate { Value: null } eq => Unset(eq.Field),
             EqPredicate eq        => $"{eq.Field.Identifier()} = {Allocate(eq.Value)}",
+            IsNonePredicate np    => Unset(np.Field),
+            IsNotNonePredicate nn => NotUnset(nn.Field),
             RangePredicate rp     => $"{rp.Field.Identifier()} {RangeOpText(rp.Op)} {Allocate(rp.Value)}",
             InPredicate ip        => $"{ip.Field.Identifier()} IN {Allocate(ip.Values)}",
             NotInPredicate nip    => $"{nip.Field.Identifier()} NOT IN {Allocate(nip.Values)}",
             BetweenPredicate bp   => $"({bp.Field.Identifier()} >= {Allocate(bp.Lower)} AND {bp.Field.Identifier()} <= {Allocate(bp.Upper)})",
-            ContainsPredicate cp  => $"string::contains({cp.Field.Identifier()}, {Allocate(cp.Substring)})",
-            StartsWithPredicate sp => $"string::starts_with({sp.Field.Identifier()}, {Allocate(sp.Prefix)})",
-            EndsWithPredicate ep   => $"string::ends_with({ep.Field.Identifier()}, {Allocate(ep.Suffix)})",
+            // The string:: functions are guarded with `field != NONE` — SurrealDB's
+            // strict function typing fails the whole SELECT when a single row has the
+            // field unset (option<string> with no value), rather than skipping the row.
+            ContainsPredicate cp  => $"({cp.Field.Identifier()} != NONE AND string::contains({cp.Field.Identifier()}, {Allocate(cp.Substring)}))",
+            StartsWithPredicate sp => $"({sp.Field.Identifier()} != NONE AND string::starts_with({sp.Field.Identifier()}, {Allocate(sp.Prefix)}))",
+            EndsWithPredicate ep   => $"({ep.Field.Identifier()} != NONE AND string::ends_with({ep.Field.Identifier()}, {Allocate(ep.Suffix)}))",
             AndPredicate a        => $"({string.Join(" AND ", a.Operands.Select(CompilePredicate))})",
             OrPredicate  o        => $"({string.Join(" OR ", o.Operands.Select(CompilePredicate))})",
             NotPredicate n        => $"!({CompilePredicate(n.Operand)})",
             _ => throw new NotSupportedException($"Predicate type {p.GetType().FullName} is not supported by QueryCompiler.")
         };
+
+        /// <summary>
+        /// The "field is unset" test: <c>(field IS NONE OR field IS NULL)</c>. SurrealDB
+        /// parses <c>IS</c>/<c>IS NOT</c> as exact aliases of <c>=</c>/<c>!=</c>; the SDK
+        /// has no NONE-comparison precedent of its own, so the alias form is chosen for
+        /// readability of sentinel checks in transport logs. NONE and NULL are both
+        /// covered: the library's write path stores unset optionals as NONE (key omitted),
+        /// but rows written by other tools may hold an explicit NULL.
+        /// </summary>
+        private static string Unset(string field)
+            => $"({field.Identifier()} IS NONE OR {field.Identifier()} IS NULL)";
+
+        /// <summary>De Morgan complement of <see cref="Unset"/>: <c>(field IS NOT NONE AND field IS NOT NULL)</c>.</summary>
+        private static string NotUnset(string field)
+            => $"({field.Identifier()} IS NOT NONE AND {field.Identifier()} IS NOT NULL)";
     }
 
     private static string RangeOpText(RangeOp op) => op switch
@@ -356,21 +403,29 @@ internal static class SurfaceQueryCompiler
         int i => i,
         uint ui => (long)ui,
         long l => l,
-        ulong ul => (long)ul,
+        // checked: SurrealDB integers are i64 — a ulong above long.MaxValue must fail
+        // loudly (OverflowException) rather than wrap negative and match wrong rows.
+        ulong ul => checked((long)ul),
         float f => (double)f,
         double d => d,
         decimal m => m,
         // strings are IEnumerable<char>; the explicit case stops the IEnumerable arm
         // from decomposing them into character lists.
         string str => str,
-        Guid g => g,
+        // Guid binds as its canonical "D" string, mirroring ContentValue.Set — the
+        // schema maps Guid to TYPE string, so a CBOR uuid binding would never compare
+        // equal to the stored string.
+        Guid g => new StringSurrealValue(g.ToString("D")),
         Ulid u => new StringSurrealValue(u.ToString()),
-        DateTime dt => (DateTimeOffset)dt,
+        DateTime dt => ContentValue.ToInstant(dt),
         DateTimeOffset dto => dto,
         TimeSpan ts => ts,
         Enum e => new StringSurrealValue(e.ToString()),
         RecordId rid => new SurrealRecordIdValue(rid.ToSdk()),
         IRecordId irid => new SurrealRecordIdValue(RecordId.From(irid).ToSdk()),
+        // byte[] is IEnumerable too — the explicit case keeps binary data as a typed
+        // bytes value instead of decomposing into a list of int64s.
+        byte[] bytes => new SurrealBytesValue(bytes),
         IEnumerable e => new SurrealListValue(WrapEnumerable(e)),
         _ => throw new NotSupportedException(
             $"Cannot wrap value of type {value.GetType().FullName} as a SurrealValue. "
