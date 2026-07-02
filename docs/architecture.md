@@ -136,6 +136,9 @@ The fully-linked output of `RelationLinker.Build` is a `ModelGraph` record with 
 | `IndexIssues` | Entity-index validation failures reported as CG037–CG041. |
 | `NameCollisions` | Generated-name collisions (physical table name / edge name / aggregate-root simple name) reported as CG042–CG044. Participants are sorted; `IsCollisionLoser` gives emitters the deterministic "first wins" skip set. |
 | `NestedTypeIssues` | Nested `[Table]` / `[CompositionRoot]` declarations reported as CG045 (already filtered out of `Tables` / `CompositionRoots`). |
+| `RecordTypeIssues` | `[Table]` / `[CompositionRoot]` / on-class relation kind attributes applied to `record` declarations, reported as CG048 (filtered out of the graph). |
+| `GenericTableIssues` | Generic `[Table]` classes, reported as CG049 (filtered out of `Tables` — the physical table name ignores type arguments). |
+| `RelationVariantIssues` | Malformed relation variants (duplicate `[In]`/`[Out]`/`[Id]` roles → CG046; endpoints unresolved after the shared-shape lift → CG047), filtered out of `RelationVariants`. |
 | `Aggregates` | Per-`[AggregateRoot]` membership, computed by `[Children]` BFS from each root. |
 | `AggregateConflicts` | `"Member\|Root1,Root2,…"` strings for CG011 (member reachable from 2+ roots). |
 | `CascadeCycles` | Cycle path strings for CG014. |

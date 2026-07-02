@@ -21,7 +21,7 @@ The doc is organised top-down: packages → modeling attributes → what gets em
 | `[AggregateRoot]` | `[Table]` class | Marks the root of a loadable aggregate. Members are discovered through `[Children]`. |
 | `[CompositionRoot]` | partial class | Receives generated `Load{Root}Async`, `Schema`, `ApplySchemaAsync`, `ReferenceRegistry`, `Query`, and `Hydrate` members. Exactly one is allowed per compilation. |
 | `[Id]` | partial property | Optional public typed-id accessor. At most one per table. If omitted, the generator still emits an internal id anchor. |
-| `[Property]` | partial property | Persisted scalar field, or inline element collection (`IReadOnlyList<T>` / `IList<T>` / `List<T>` of records). |
+| `[Property]` | partial property | Persisted scalar field, or element collection (`IReadOnlyList<T>` / `IList<T>` / `List<T>` of scalars or records). |
 | `[Reference]` | partial property | Record reference. Non-nullable get-only references are mandatory; nullable settable references are optional. |
 | `[Inline]` | with `[Reference]` | Hydrates the referenced record inline with its owner. Without `[Inline]`, only the referenced id is hydrated. |
 | `[Parent]` | partial property | Parent link for aggregate hierarchy. |
@@ -547,18 +547,25 @@ The aliases exist because `WhereIn` / `WhereOut` are easy to misread as "incomin
 
 (`SurfaceEdgeQuery<TIn, TOut>` was called `EdgeQuery<TIn, TOut>` before the preview.43 `Surface*` prefix rename.)
 
-### Edge payload predicate factory — via the variant `{Variant}Q`
+### Edge payload predicates — `SurfaceEdgeQuery.Where` with a hand-built `PropertyExpr<T>`
 
-Variant classes are entities, so payload columns are addressable through the standard per-table `{Variant}Q` factory and the entity query API — no separate edge-specific factory. `EdgePredicateFactoryEmitter` and the legacy `{Kind}EdgeQ` static class were removed in preview.51; payload predicates now flow through `Workspace.Query.{Variant}.Where(...)` the same way every other entity query does. `Workspace.Query.Edges.{Kind}` (the flat `(Source, Target)` row terminal) keeps non-payload `WhereIn` / `WhereOut` filters; for payload-aware queries, query the variant table:
+There is **no generated predicate factory for edge payload fields** today. `Workspace.Query.{Table}` accessors and `{Name}Q` factories are emitted per `[Table]` only — relation variants are not tables, so neither `Workspace.Query.{Variant}` nor `{Variant}Q` exists (`EdgePredicateFactoryEmitter` and the legacy `{Kind}EdgeQ` static class were removed in preview.51 without a generated replacement).
+
+What does exist: `Workspace.Query.Edges.{Kind}` returns the flat `(Source, Target)` `SurfaceEdgeQuery`, whose `Where(IPredicate)` AND-merges an arbitrary predicate into the compiled `WHERE` alongside the `WhereIn` / `WhereOut` side filters, and whose `OrderBy` / `ThenBy` take any `PropertyExpr<T>`. To filter or order on an edge payload column, construct the `PropertyExpr<T>` yourself with the snake_cased SurrealDB field name (the same name the schema's `DEFINE FIELD` uses on the edge table):
 
 ```csharp
-var calls = await Workspace.Query.CodeSymbolUsesCodeSymbol
-    .Where(CodeSymbolUsesCodeSymbolQ.Kind.Eq("call"))
-    .Where(CodeSymbolUsesCodeSymbolQ.Source.Eq(symbolId))
-    .OrderBy(CodeSymbolUsesCodeSymbolQ.Line)
+var kind = new PropertyExpr<string>("kind");   // payload column `kind` on the edge table
+var line = new PropertyExpr<int>("line");
+
+var calls = await Workspace.Query.Edges.Uses
+    .OutgoingFrom([symbolId])
+    .Where(kind.Eq("call"))
+    .OrderBy(line)
     .Limit(50)
     .ExecuteAsync(db);
 ```
+
+The result rows are `(Source, Target)` id pairs — payload values are filterable/orderable but not returned; hydrate the variant entities via the session APIs when you need the payload itself.
 
 
 ### `LoadAsync`
@@ -1065,6 +1072,13 @@ The generator walks `Scenario`'s public scalar properties at codegen time (no `[
 
 Per-element schema lands as `array<object>` plus per-member `field.*.member` sub-field DDL.
 
+Element-type rules (enforced at build time):
+
+- **Primitive/scalar elements** (`IReadOnlyList<string>`, `List<int>`, any mappable scalar) are supported directly: schema is `array<{scalar}> DEFAULT []`, save writes the whole list (empty list round-trips as `[]`), hydrate repopulates the backing list.
+- **Record/POCO elements** must be reconstructible: either a public constructor matches the persistable members positionally by name + type (the positional-record shape above), or the type has a public parameterless constructor and every persistable member is settable (hydrate then uses an object initializer). Persistable members are public, instance, non-indexer, readable, schema-mappable properties; get-only computed members of unmappable types are ignored (derived, not stored).
+- Unsupported element types (unmappable scalars, nullable elements like `IReadOnlyList<int?>`, unconstructible shapes, or types with writable unmappable members that would silently drop data) are rejected with **CG050**.
+- Element collections are **get-only**: a declared setter is rejected with **CG051** — mutate through the generated `Add{Singular}` / `Remove{Singular}` / `Clear{Name}` helpers.
+
 ### `HydrationValue`
 
 Value-native helpers used by emitted `IEntity.Hydrate` and the runtime's load/query consumers. All inputs are `Disruptor.Surreal.Values.SurrealValue` — no JSON intermediary.
@@ -1170,3 +1184,9 @@ The generator emits diagnostics for invalid model shapes. Most are errors (compi
 | `CG043` | Two forward relation kinds map to the same SurrealDB edge table name (edge names derive from the attribute's simple class name minus the `Attribute` suffix). |
 | `CG044` | Two `[AggregateRoot]` tables share a simple name — the generated aggregate loader, `Load{Name}Async` entry points, and `LoadAsync` extensions are keyed on it. |
 | `CG045` | `[Table]` / `[CompositionRoot]` class is nested inside another type; model classes must be namespace-scoped. |
+| `CG046` | Relation variant declares more than one `[In]` / `[Out]` / `[Id]` member — the singular roles are ambiguous when duplicated. |
+| `CG047` | Relation variant declares or inherits no `[In]` / `[Out]` endpoints (nothing declared on the class and no annotated shared-shape interface supplies them). |
+| `CG048` | `[Table]` / `[CompositionRoot]` / an on-class relation kind attribute applied to a `record` declaration; the generated partial-class implementation halves don't compose with record synthesis — use a `partial class`. |
+| `CG049` | `[Table]` on a generic type; the physical table name ignores type arguments (closed constructions would share one table) and the generated accessors can't name an open generic — make the table non-generic. |
+| `CG050` | Element-collection `[Property]` element type is not supported (not a mappable scalar; nullable element; or not constructible from its public mappable properties). |
+| `CG051` | Element-collection `[Property]` declares a setter; element collections are get-only (the generator emits a read-only view plus `Add{Singular}`/`Remove{Singular}`/`Clear{Name}` mutators). |
