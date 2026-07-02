@@ -286,11 +286,15 @@ Conflicts at COMMIT surface as `Disruptor.Surreal.SurrealConflictException`. The
 
 ## Query API
 
-Five terminal verbs share one query AST. Every terminal accepts either `Surreal db` (read-only) or `Transaction tx` (in-txn read with full visibility into pending writes from the same transaction):
+The terminal verbs share one query AST. Every terminal accepts either `Surreal db` (read-only) or `Transaction tx` (in-txn read with full visibility into pending writes from the same transaction):
 
 - `IdsAsync(db | tx, ct)` — id-only selection. Returns `IReadOnlyList<{Table}Id>`; no entity hydration, no session. Generator-emitted per `[Table]`.
-- `Select(projection).ExecuteAsync(db | tx, ct)` — projection mode. Returns immutable `IReadOnlyList<TRow>`; no entity hydration, no session. The projection owns the SELECT list and the per-row materialiser.
+- `CountAsync(db | tx, ct)` — server-side count. Compiles to `SELECT count() AS count FROM table … GROUP ALL`; reports the number of rows matching the id pin and filters (ordering/paging ignored, Includes rejected).
+- `ExistsAsync(db | tx, ct)` — existence probe. Compiles to `SELECT id FROM table … LIMIT 1` — cheaper than count because the substrate can stop at the first hit. Like count, reports on the id pin and filters only (ordering/paging ignored, Includes rejected).
+- `Select(projection).ExecuteAsync(db | tx, ct)` — projection mode. Returns immutable `IReadOnlyList<TRow>`; no entity hydration, no session. The projection owns the SELECT list and the per-row materialiser. `FirstOrDefaultAsync` / `SingleAsync` / `SingleOrDefaultAsync` are mirrored on the projection chain with the same semantics as below (returning `TRow?` / `TRow`).
 - `ExecuteAsync(db | tx, ct)` — read mode. Returns hydrated entities; the supporting session is internal and never exposed.
+- `FirstOrDefaultAsync(db | tx, ct)` — read mode, first match or `null`. Same entity SELECT shape and hydration/tracking path as `ExecuteAsync`, with `LIMIT 1` overriding any user `Limit` (`OrderBy` / `Start` still apply, Includes work).
+- `SingleAsync(db | tx, ct)` / `SingleOrDefaultAsync(db | tx, ct)` — read mode, exactly-one match. Compile with `LIMIT 2` (enough to detect ambiguity without pulling the full result set); both throw `InvalidOperationException` on more than one match; on zero matches `SingleAsync` throws while `SingleOrDefaultAsync` returns `null`.
 - `LoadAsync(db | tx, ct)` — write-mode session. Returns a `SurrealSession` you mutate and dispatch via `SaveAsync`. Only emitted on `SurfaceQuery<TRoot>` where `TRoot.IsAggregateRoot`.
 - `Workspace.Hydrate.{Table}(ids).WithInclude(…).ExecuteAsync(db | tx, ct)` — hydration terminal. Takes a list of ids (typically from `IdsAsync`), materialises each into a tracked `SurrealSession` along with any included slices.
 
@@ -321,10 +325,22 @@ public static class ConstraintQ
 
 | Method | SurrealQL output |
 | --- | --- |
-| `Eq(T value)` | `field = $pN` |
+| `Eq(T value)` | `field = $pN` (`Eq(null)` compiles to the unset test `(field IS NONE OR field IS NULL)`) |
 | `Lt`/`Le`/`Gt`/`Ge(T value)` | `field {<,<=,>,>=} $pN` |
 | `In(params T[] values)` / `In(IEnumerable<T>)` | `field IN $pN` |
-| `Contains(string substring)` (extension on `PropertyExpr<string>`) | `string::contains(field, $pN)` |
+| `NotIn(params T[] values)` / `NotIn(IEnumerable<T>)` | `field NOT IN $pN` |
+| `Between(T lower, T upper)` | `(field >= $pN AND field <= $pM)` |
+| `IsNone()` / `IsNotNone()` | `(field IS NONE OR field IS NULL)` / `(field IS NOT NONE AND field IS NOT NULL)` |
+
+String extensions (on `PropertyExpr<string>`; the `string::` functions are guarded with `field != NONE` so one unset `option<string>` row can't fail the whole SELECT):
+
+| Method | SurrealQL output |
+| --- | --- |
+| `Contains(substring)` | `(field != NONE AND string::contains(field, $pN))` |
+| `StartsWith(prefix)` / `EndsWith(suffix)` | `(field != NONE AND string::starts_with/ends_with(field, $pN))` |
+| `ContainsIgnoreCase` / `StartsWithIgnoreCase` / `EndsWithIgnoreCase` | `(field != NONE AND string::contains/starts_with/ends_with(string::lowercase(field), $pN))` — operand lowercased invariantly in C# |
+| `Matches(pattern)` | `(field != NONE AND string::matches(field, $pN))` — regex via SurrealDB's `string::matches`; the `~`/`?~` operators are *fuzzy* match, not regex, and are not used |
+| `IsNullOrEmpty()` / `IsNotNullOrEmpty()` | `(field IS NONE OR field IS NULL OR field = '')` / `(field IS NOT NONE AND field IS NOT NULL AND field != '')` |
 
 Compose via `Predicate.And(...)`, `Predicate.Or(...)`, `Predicate.Not(...)`.
 
@@ -358,11 +374,22 @@ public sealed class SurfaceQuery<T> where T : class, IEntity, new()
     public Task<IReadOnlyList<T>> ExecuteAsync(Disruptor.Surreal.SurrealClient db, CancellationToken ct = default);
     public Task<IReadOnlyList<T>> ExecuteAsync(Disruptor.Surreal.SurrealTransaction tx, CancellationToken ct = default);
 
+    // Scalar / single-row terminals — db and tx overloads each. Count/Exists report on
+    // the id pin and filters only (ordering/paging ignored, Includes rejected);
+    // First/Single hydrate through the same tracking path as ExecuteAsync.
+    public Task<long> CountAsync(db | tx, CancellationToken ct = default);
+    public Task<bool> ExistsAsync(db | tx, CancellationToken ct = default);
+    public Task<T?> FirstOrDefaultAsync(db | tx, CancellationToken ct = default);   // LIMIT 1, overrides user Limit
+    public Task<T> SingleAsync(db | tx, CancellationToken ct = default);            // LIMIT 2; throws on 0 and on >1 matches
+    public Task<T?> SingleOrDefaultAsync(db | tx, CancellationToken ct = default);  // LIMIT 2; null on 0, throws on >1
+
     // Compile to SurrealQL + typed-CBOR bindings without executing. The library uses
     // these internally; consumers reach for them when they want to inspect or splice
     // the rendered query before sending.
     public (string Sql, SurrealObject Bindings) Compile();
     public (string Sql, SurrealObject Bindings) CompileIdsOnly();   // SELECT id FROM table …; throws if Includes present
+    public (string Sql, SurrealObject Bindings) CompileCount();    // SELECT count() AS count FROM table … GROUP ALL; throws if Includes present
+    public (string Sql, SurrealObject Bindings) CompileExists();   // SELECT id FROM table … LIMIT 1; throws if Includes present
 }
 ```
 
@@ -397,11 +424,13 @@ var results = await Workspace.Query.CodeSymbols
 
 The library does **not** generate projection types; the user owns the `TRow` shape and the materialise lambda. At construction time the lambda runs once with a probe row that captures each `Read(PropertyExpr<T>)` call into the SELECT field list (in first-read order). At query time the lambda runs once per row with a `Value`-backed row that decodes each value through `HydrationValue`.
 
+Besides `ExecuteAsync`, the projection chain carries the single-row terminals: `FirstOrDefaultAsync(db | tx, ct)` (`LIMIT 1`, returns `TRow?` — `default` when nothing matches), `SingleAsync` and `SingleOrDefaultAsync` (`LIMIT 2`; throw `InvalidOperationException` on more than one match; zero matches throws for `SingleAsync`, returns `default` for `SingleOrDefaultAsync`). `ExistsAsync`/`CountAsync` are not mirrored — existence and count don't depend on the projected shape; call them on the underlying `SurfaceQuery<T>` before `.Select(...)`.
+
 Constraints:
 - The lambda must call `row.Read(...)` at least once.
 - The target type's constructor must accept default values during the probe — typically a positional record with no inline validation.
 - `Include*` calls before `.Select(...)` are rejected — projections are flat by definition. Use `ExecuteAsync` directly if you need traversal.
-- Field reads must be unconditional (no branches that skip `row.Read(...)`); discovery captures only the fields the lambda touches on the probe pass.
+- Field reads **must be unconditional**: the discovery probe runs the lambda exactly once with default values, so a `row.Read(...)` behind a branch the default-valued probe doesn't take is silently never discovered — the column is missing from the wire SQL and every real row reads `default` for it. Read all fields up front, then branch on the values.
 - v1 supports primitive scalars + nullables. Typed ids and complex types defer until a real callsite needs them.
 
 ### Hydration — `Workspace.Hydrate.{Table}(ids)`
@@ -488,6 +517,8 @@ var rows = await Workspace.Query.Designs
 ```
 
 Forward and inverse relation traversals are exposed via `IncludeRelationNode` — see below. Plain (non-`Inline`) `[Reference]` traversals are not exposed; the loader pulls them as id-only and there's no v1 read shape for arbitrary record links beyond the inline form.
+
+Two includes at the same query level that would project under the same response alias (a children-include's child table / a relation-include's slice key) are rejected at compile time with `InvalidOperationException` naming the duplicate — SurrealDB keeps only one `AS alias` column per name, so one subselect would otherwise silently clobber the other in the response.
 
 ### Relation traversal — `IncludeRelationNode`
 
@@ -1089,7 +1120,7 @@ Value-native helpers used by emitted `IEntity.Hydrate` and the runtime's load/qu
 | `ReadRecordId(SurrealValue v)` | Read any of the wire forms (record-id value / string `"table:value"` / object with `id` field) into a `RecordId`; throws on unrecognised shape. |
 | `TryReadRecordId(SurrealObjectValue parent, string field, out RecordId)` | Try-variant on a named field of a row. |
 | `ReadString(SurrealObjectValue parent, string field, string fallback = "")` | Read a string field with a fallback when missing or not-a-string. |
-| `ReadOrDefault<T>(SurrealObjectValue parent, string field)` | Read a typed field with a default fallback. Handles primitives, nullable wrappers, and arrays / `List<T>` of primitives. Records / POCOs are no longer routed through here — generator-emitted Hydrate bodies build records typed-and-direct. |
+| `ReadOrDefault<T>(SurrealObjectValue parent, string field)` | Read a typed field with a default fallback. Handles primitives, nullable wrappers, `TimeSpan` (from a duration value), enums (from a member-name string, case-insensitive, or an int64 — enums aren't schema-mappable, so stored enum values only arrive from rows written outside the library), and arrays / `List<T>` of primitives. Records / POCOs are no longer routed through here — generator-emitted Hydrate bodies build records typed-and-direct. |
 | `TryReadReferenceId(SurrealObjectValue parent, string field)` | Read a non-Inline `[Reference]` or `[Parent]` id; returns `null` when the field is missing / null / unrecognisable. |
 | `HydrateInlineReference<T>(SurrealObjectValue parent, string field, IHydrationSink sink)` | Construct a `T` from an inline-expanded `[Reference, Inline]` payload and run its `Hydrate`; returns the entity (or null if the field is missing / id-only / already tracked). |
 

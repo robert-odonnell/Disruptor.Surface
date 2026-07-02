@@ -429,6 +429,219 @@ public sealed class SurfaceQueryCompilerTests
             Invoke("constraints", new IsNonePredicate("has-dash"), pinnedId: null));
     }
 
+    // ─────────────────────── String predicate extensions (NONE-aware / regex / case-folded) ───────────────────────
+
+    [Fact]
+    public void Compile_IsNullOrEmpty_EmitsUnsetOrEmptyTest_AndAllocatesNoBinding()
+    {
+        // string.IsNullOrEmpty semantics server-side: the NONE/NULL arms match the
+        // write path's key-omission for unset optionals; the = '' arm adds the empty
+        // string. No user value flows in, so no binding is allocated.
+        var (sql, bindings) = new SurfaceQuery<TestTable>("constraints")
+            .Where(new IsNullOrEmptyPredicate("notes"))
+            .Compile();
+
+        Assert.Equal(
+            "SELECT * FROM constraints WHERE (notes IS NONE OR notes IS NULL OR notes = '');",
+            sql);
+        Assert.Empty(bindings);
+    }
+
+    [Fact]
+    public void Compile_IsNotNullOrEmpty_EmitsExactComplement()
+    {
+        var sql = Invoke("constraints", new IsNotNullOrEmptyPredicate("notes"), pinnedId: null);
+
+        Assert.Equal(
+            "SELECT * FROM constraints WHERE (notes IS NOT NONE AND notes IS NOT NULL AND notes != '');",
+            sql);
+    }
+
+    [Fact]
+    public void Compile_MatchesPredicate_EmitsGuardedStringMatchesCall_AndBindsPattern()
+    {
+        // string::matches is SurrealDB's regex primitive (the ~ / ?~ operators are
+        // fuzzy match, not regex) and takes the pattern as a bindable string argument.
+        // NONE-guarded like the other string:: functions.
+        var (sql, bindings) = new SurfaceQuery<TestTable>("constraints")
+            .Where(new MatchesPredicate("description", "^sec.*ity$"))
+            .Compile();
+
+        Assert.Equal(
+            "SELECT * FROM constraints WHERE (description != NONE AND string::matches(description, $_p0));",
+            sql);
+        Assert.Equal(new StringSurrealValue("^sec.*ity$"), bindings["_p0"]);
+    }
+
+    [Fact]
+    public void Compile_ContainsIgnoreCase_FoldsFieldAndBindsInvariantLoweredOperand()
+    {
+        var (sql, bindings) = new SurfaceQuery<TestTable>("constraints")
+            .Where(new ContainsIgnoreCasePredicate("description", "SeCuRiTy"))
+            .Compile();
+
+        Assert.Equal(
+            "SELECT * FROM constraints WHERE (description != NONE AND string::contains(string::lowercase(description), $_p0));",
+            sql);
+        Assert.Equal(new StringSurrealValue("security"), bindings["_p0"]);
+    }
+
+    [Theory]
+    [InlineData("starts", "SELECT * FROM constraints WHERE (description != NONE AND string::starts_with(string::lowercase(description), $_p0));")]
+    [InlineData("ends", "SELECT * FROM constraints WHERE (description != NONE AND string::ends_with(string::lowercase(description), $_p0));")]
+    public void Compile_BoundaryIgnoreCasePredicates_FoldFieldAndOperand(string mode, string expected)
+    {
+        IPredicate pred = mode == "starts"
+            ? new StartsWithIgnoreCasePredicate("description", "SEC")
+            : new EndsWithIgnoreCasePredicate("description", "ITY");
+
+        var (sql, bindings) = new SurfaceQuery<TestTable>("constraints").Where(pred).Compile();
+
+        Assert.Equal(expected, sql);
+        Assert.Equal(new StringSurrealValue(mode == "starts" ? "sec" : "ity"), bindings["_p0"]);
+    }
+
+    [Fact]
+    public void PropertyExpr_String_NullOrEmpty_And_Matches_ExtensionsBuildExpectedNodes()
+    {
+        var expr = new PropertyExpr<string>("notes");
+
+        var empty = Assert.IsType<IsNullOrEmptyPredicate>(expr.IsNullOrEmpty());
+        var notEmpty = Assert.IsType<IsNotNullOrEmptyPredicate>(expr.IsNotNullOrEmpty());
+        var matches = Assert.IsType<MatchesPredicate>(expr.Matches("^a+$"));
+
+        Assert.Equal("notes", empty.Field);
+        Assert.Equal("notes", notEmpty.Field);
+        Assert.Equal("notes", matches.Field);
+        Assert.Equal("^a+$", matches.Pattern);
+    }
+
+    [Fact]
+    public void PropertyExpr_String_IgnoreCaseExtensionsBuildExpectedNodes_PreservingOriginalCasing()
+    {
+        // The AST keeps the user's original operand — lowering happens at compile time
+        // so the predicate tree stays faithful to what the call site wrote.
+        var expr = new PropertyExpr<string>("description");
+
+        var contains = Assert.IsType<ContainsIgnoreCasePredicate>(expr.ContainsIgnoreCase("SeC"));
+        var starts = Assert.IsType<StartsWithIgnoreCasePredicate>(expr.StartsWithIgnoreCase("SeC"));
+        var ends = Assert.IsType<EndsWithIgnoreCasePredicate>(expr.EndsWithIgnoreCase("ITY"));
+
+        Assert.Equal("SeC", contains.Substring);
+        Assert.Equal("SeC", starts.Prefix);
+        Assert.Equal("ITY", ends.Suffix);
+    }
+
+    [Fact]
+    public void Compile_IsNullOrEmpty_InvalidFieldName_Throws()
+    {
+        Assert.Throws<SurrealFormatException>(() =>
+            Invoke("constraints", new IsNullOrEmptyPredicate("has-dash"), pinnedId: null));
+    }
+
+    // ─────────────────────── Existence probe ───────────────────────
+
+    [Fact]
+    public void CompileExists_EmitsIdSelectWithLimitOne()
+    {
+        var (sql, bindings) = new SurfaceQuery<TestTable>("symbols")
+            .Where(new PropertyExpr<string>("kind").Eq("method"))
+            .CompileExists();
+
+        Assert.Equal("SELECT id FROM symbols WHERE kind = $_p0 LIMIT 1;", sql);
+        Assert.Equal(new StringSurrealValue("method"), bindings["_p0"]);
+    }
+
+    [Fact]
+    public void CompileExists_IgnoresOrderLimitStart_LikeCompileCount()
+    {
+        // Existence reports on the id pin and filters only — ordering can't change the
+        // answer and user paging would make the probe wrong (Start past the only match
+        // → false negative), so both are dropped and LIMIT is pinned to 1.
+        var (sql, _) = new SurfaceQuery<TestTable>("symbols")
+            .OrderBy(new PropertyExpr<string>("name"))
+            .Limit(50)
+            .Start(100)
+            .CompileExists();
+
+        Assert.Equal("SELECT id FROM symbols LIMIT 1;", sql);
+    }
+
+    [Fact]
+    public void CompileExists_WithIncludes_Throws()
+    {
+        var include = new IncludeChildrenNode(
+            ChildTable: "constraints",
+            ParentField: "design",
+            Filter: null,
+            Nested: []);
+        var query = new SurfaceQuery<TestTable>("designs").WithInclude(include);
+
+        Assert.Throws<InvalidOperationException>(() => query.CompileExists());
+    }
+
+    // ─────────────────────── Include-alias collision validation ───────────────────────
+
+    [Fact]
+    public void Compile_TwoChildrenIncludesWithSameAlias_ThrowsNamingTheAlias()
+    {
+        // Two subselects AS constraints — SurrealDB would keep only one column and the
+        // other slice would silently vanish from the response.
+        var includes = new IIncludeNode[]
+        {
+            new IncludeChildrenNode("constraints", "design", null, []),
+            new IncludeChildrenNode("constraints", "owner", null, []),
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            InvokeWithIncludes("designs", filter: null, pinnedId: null, includes: includes));
+
+        Assert.Contains("'constraints'", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Compile_ChildrenAndRelationIncludesSharingAlias_Throws()
+    {
+        var includes = new IIncludeNode[]
+        {
+            new IncludeChildrenNode("restrictions", "design", null, []),
+            new IncludeRelationNode(
+                EdgeName: "restricts",
+                IsOutgoing: true,
+                ParentSliceKey: "restrictions",
+                IdsOnly: false,
+                SingleTargetTable: null,
+                Filter: null,
+                Nested: []),
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            InvokeWithIncludes("designs", filter: null, pinnedId: null, includes: includes));
+
+        Assert.Contains("'restrictions'", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Compile_SameAliasAtDifferentNestingLevels_IsAllowed()
+    {
+        // Aliases only collide within one projection level — a child's subselect can
+        // legally reuse an alias its parent level also uses.
+        var nested = new IncludeChildrenNode("constraints", "story", null, []);
+        var includes = new IIncludeNode[]
+        {
+            new IncludeChildrenNode("constraints", "design", null, []),
+            new IncludeChildrenNode("user_stories", "design", null, [nested]),
+        };
+
+        var sql = InvokeWithIncludes("designs", filter: null, pinnedId: null, includes: includes);
+
+        Assert.Equal(
+            "SELECT *, (SELECT * FROM constraints WHERE design = $parent.id) AS constraints, "
+            + "(SELECT *, (SELECT * FROM constraints WHERE story = $parent.id) AS constraints "
+            + "FROM user_stories WHERE design = $parent.id) AS user_stories FROM designs;",
+            sql);
+    }
+
     // ─────────────────────── Value binding coverage ───────────────────────
 
     [Fact]

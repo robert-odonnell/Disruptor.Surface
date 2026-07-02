@@ -171,7 +171,8 @@ public static class HydrationValue
 
     /// <summary>
     /// Coerce a <see cref="SurrealValue"/> into the target CLR type. Supports primitives,
-    /// nullable wrappers, arrays / List&lt;T&gt; of primitives, and any
+    /// nullable wrappers, enums (from a member-name string or an int64), <see cref="TimeSpan"/>
+    /// (from a duration), arrays / List&lt;T&gt; of primitives, and any
     /// <see cref="IRecordId"/> target (canonical <see cref="RecordId"/> or a
     /// generator-emitted <c>{Name}Id</c> readonly record struct). Record / POCO
     /// hydration is no longer routed through here — generator-emitted Hydrate bodies
@@ -197,6 +198,22 @@ public static class HydrationValue
             }
 
             return Activator.CreateInstance(underlying, rid.Value)!;
+        }
+
+        // Enum targets. Enums aren't schema-mappable today, so a stored enum value can
+        // only come from rows written by other tools or hand-written statements — accept
+        // both wire shapes those produce: the member name as a string (matching what the
+        // query binder emits for enum operands, parsed case-insensitively for hand-written
+        // rows) and the numeric value as an int64.
+        if (underlying.IsEnum)
+        {
+            switch (v)
+            {
+                case StringSurrealValue es:
+                    return Enum.Parse(underlying, es.Value, ignoreCase: true);
+                case SurrealNumberValue en:
+                    return Enum.ToObject(underlying, en.SurrealNumber.AsInt());
+            }
         }
 
         switch (v)
@@ -247,6 +264,11 @@ public static class HydrationValue
                 }
 
                 break;
+
+            // Durations bind in Where clauses (TimeSpan → SurrealDurationValue) — the
+            // read side mirrors that so a duration column is also materialisable.
+            case SurrealDurationValue duv when underlying == typeof(TimeSpan):
+                return duv.SurrealDuration.ToTimeSpan();
 
             case SurrealUuidValue uv:
                 if (underlying == typeof(Guid))
