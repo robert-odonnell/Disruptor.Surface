@@ -778,7 +778,9 @@ DEFINE FIELD IF NOT EXISTS line ON uses TYPE int DEFAULT 0;
 DEFINE FIELD IF NOT EXISTS run_id ON uses TYPE string DEFAULT "";
 ```
 
-Every relation table gets `DEFINE INDEX … UNIQUE` on `(in, out)` and is declared `TYPE RELATION ENFORCED`. The variant's `SaveAsync` body uses `INSERT RELATION INTO {edge} $_content ON DUPLICATE KEY UPDATE field = $_p_field, …` so re-saving the same `(in, out)` pair refreshes payload (or no-ops when the variant has no `[Property]` members). The `RELATION` keyword satisfies `TYPE RELATION ENFORCED` (which `UPSERT` does not).
+Every relation table gets `DEFINE INDEX … UNIQUE` on `(in, out)` and is declared `TYPE RELATION ENFORCED`. The variant's `SaveAsync` body uses `INSERT RELATION INTO {edge} $_content ON DUPLICATE KEY UPDATE field = $_p_field, …` so re-saving the same `(in, out)` pair refreshes payload (or no-ops when the variant has no `[Property]` members). The `RELATION` keyword satisfies `TYPE RELATION ENFORCED` (which `UPSERT` does not). Nullable payloads set to `null` bind an explicit `NONE` for their `$_p_{field}` duplicate-update variable (the `$_content` insert path omits the field so the schema `DEFAULT` applies; the update path converges to the same NONE state — and a variable the SET clause always references must always be bound).
+
+**Edge ids are deterministic.** When a variant has no assigned id at save time, its id anchor derives one from the `(in, edge, out)` triple via `RecordId.ForEdge` — `HashText("{source}|{edge}|{target}")`, a hash-form value the per-kind `{Kind}Id` validation accepts. The same endpoint pair yields the same edge id on every save, so the `UNIQUE (in, out)` duplicate path updates exactly the row id the session records via `MarkSaved` — re-save is replay-replace, with no id drift between session and substrate. Precedence: a hydrated id or a user-assigned value wins; a variant may declare `[Id] public partial {Kind}Id Id { get; set; }` to assign one explicitly (mutation is refused once the variant is session-bound). Endpoints still unset when the id is first read fall back to a random Ulid mint — the save path fails before dispatch in that case, so the fallback id never lands.
 
 ### Runtime calls
 
@@ -1093,9 +1095,14 @@ var parsed  = RecordId.Parse("designs:01J...");                             // r
 var symbol  = RecordId.FromText("symbols", "Disruptor.Surface.Runtime.SurrealSession");
 var tagged  = RecordId.FromText("symbols", "ICodeSymbol", prefix: 'i');     // "symbols:i_<hash>"
 
-// Idempotent edge id sentinel — resolves to a deterministic hash of the linkage
-// triple at emit time. Used by Session.Relate<TKind> as the default edge id.
-var edge    = RecordId.Idempotent("uses");
+// Deterministic edge id — HashText("{src}|{edge}|{tgt}"). This is the derivation the
+// emitted variant SaveAsync path applies automatically when no id was assigned.
+var edge    = RecordId.ForEdge("uses", srcId, tgtId);
+
+// Idempotent edge id sentinel — for hand-minted content-addressed edge ids; collapse
+// via Resolve (same ForEdge scheme). Un-resolved sentinels dispatch with no explicit
+// id (the substrate mints a random one), so resolve before use.
+var deferred = RecordId.Idempotent("uses").Resolve(srcId, tgtId);
 ```
 
 Important members:
@@ -1107,7 +1114,8 @@ Important members:
 - `From(IRecordId id)` — collapse a typed id (or any `IRecordId`) to a canonical `RecordId`.
 - `New(table, value?)` — fresh ulid-backed id.
 - `FromText(table, text, prefix?)` — deterministic content-addressed id; convenience over `RecordIdFormat.HashText`.
-- `Idempotent(table)` — deferred sentinel that resolves to `HashText("{src}|{table}|{tgt}")` at emit time.
+- `ForEdge(edgeTable, source, target)` — deterministic edge id, `HashText("{src}|{edgeTable}|{tgt}")`; the variant save path's automatic derivation.
+- `Idempotent(table)` — deferred sentinel for hand-minted edge ids; collapse via `Resolve(source, target)` (delegates to `ForEdge`).
 - `TryParse(...)`
 - `IsForTable(table)`
 

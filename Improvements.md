@@ -18,10 +18,11 @@ and the CG042–CG056 fail-closed diagnostics family.
    render bare into queries and DDL (`none` parses as the NONE literal). Fix is
    backtick-quoting at the `SurrealFormatter` chokepoint + `SchemaEmitter`, but it
    changes every emitted statement shape — validate against a live substrate first.
-2. **Variant duplicate-edge id drift** — the `ON DUPLICATE KEY UPDATE` path records a
-   freshly-minted edge id in the session while the DB keeps the existing row's id.
-   Needs a decision: adopt the substrate's returned id, or pre-resolve deterministic
-   ids (see item 4).
+2. **Variant duplicate-edge id drift** — RESOLVED (2026-07-02) by deterministic edge
+   ids: the variant id anchor derives the edge row id from `(source, edge, target)`
+   via `RecordId.ForEdge` before dispatch, so the duplicate path updates the same row
+   id the session holds and `MarkSaved` stays truthful. A live-substrate smoke of the
+   duplicate path is still worthwhile before a release tag.
 3. **NONE-semantics smoke test** — the `Eq(null)`→`IS NONE` compile and the
    version-guarded `UPDATE … WHERE version = $v` shape were verified against SDK
    precedent and pinned tests, but deserve one pass against a live v3 before a
@@ -29,8 +30,10 @@ and the CG042–CG056 fail-closed diagnostics family.
 
 ## Still open — design/feature work
 
-4. **Content-addressed edge ids** — `RecordId.Resolve` exists but is not plumbed into
-   the variant save path; an opt-in attribute would give replay-replace semantics.
+4. **Content-addressed edge ids** — SHIPPED (2026-07-02) as the default: the variant
+   save path derives `RecordId.ForEdge("{src}|{edge}|{tgt}")` ids automatically (item
+   2's resolution), so the opt-in-attribute framing is obsolete. `RecordId.Idempotent`
+   + `Resolve` remain for hand-minted edge rows.
 5. **Delete-by-query / update-by-query** — `Query.X.Where(...).DeleteAsync(tx)`;
    update-by-query needs a typed setter design.
 6. **`[Assert]` value validators and PERMISSIONS clauses** in emitted DDL.
