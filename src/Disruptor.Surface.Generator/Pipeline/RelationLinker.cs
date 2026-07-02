@@ -60,10 +60,10 @@ internal static class RelationLinker
         // here; the emitters' partial-class fragments don't compose with record
         // synthesis. Same fail-closed pattern as nested types above.
         var recordTypeIssues = ImmutableArray.CreateBuilder<RecordTypeIssueModel>();
-        tables = FilterRecords(tables, recordTypeIssues, static t => t.IsRecord, static t => (t.FullName, "Table"));
-        compositionRoots = FilterRecords(compositionRoots, recordTypeIssues, static r => r.IsRecord, static r => (r.FullName, "CompositionRoot"));
+        tables = FilterRecords(tables, recordTypeIssues, static t => t.IsRecord, static t => (t.FullName, "Table", t.IssueLocation));
+        compositionRoots = FilterRecords(compositionRoots, recordTypeIssues, static r => r.IsRecord, static r => (r.FullName, "CompositionRoot", r.IssueLocation));
         relationVariants = FilterRecords(relationVariants, recordTypeIssues, static v => v.IsRecord,
-            static v => (v.FullName, SurrealNaming.StripAttributeSuffix(SurrealNaming.SimpleName(v.KindAttributeFqn))));
+            static v => (v.FullName, SurrealNaming.StripAttributeSuffix(SurrealNaming.SimpleName(v.KindAttributeFqn)), v.IssueLocation));
 
         // CG049 — generic [Table] classes, rejected fail-closed. Nothing downstream
         // supports them: the table name ignores type arguments (closed constructions
@@ -157,7 +157,7 @@ internal static class RelationLinker
         {
             if (t.IsNested)
             {
-                issues.Add(new NestedTypeIssueModel(t.FullName, "Table"));
+                issues.Add(new NestedTypeIssueModel(t.FullName, "Table", t.IssueLocation));
             }
             else
             {
@@ -189,7 +189,8 @@ internal static class RelationLinker
                 issues.Add(new GenericTableIssueModel(
                     t.FullName,
                     t.Name,
-                    string.Join(", ", t.TypeParameters)));
+                    string.Join(", ", t.TypeParameters),
+                    t.IssueLocation));
             }
             else
             {
@@ -209,7 +210,7 @@ internal static class RelationLinker
         ImmutableArray<T> models,
         ImmutableArray<RecordTypeIssueModel>.Builder issues,
         Func<T, bool> isRecord,
-        Func<T, (string FullName, string AttributeName)> describe)
+        Func<T, (string FullName, string AttributeName, LocationInfo? Location)> describe)
     {
         if (!models.Any(isRecord))
         {
@@ -221,8 +222,8 @@ internal static class RelationLinker
         {
             if (isRecord(model))
             {
-                var (fullName, attributeName) = describe(model);
-                issues.Add(new RecordTypeIssueModel(fullName, attributeName));
+                var (fullName, attributeName, location) = describe(model);
+                issues.Add(new RecordTypeIssueModel(fullName, attributeName, location));
             }
             else
             {
@@ -254,7 +255,7 @@ internal static class RelationLinker
             {
                 foreach (var role in v.DuplicateRoles)
                 {
-                    issues.Add(new RelationVariantIssueModel(v.FullName, RelationVariantIssueKind.DuplicateRole, role));
+                    issues.Add(new RelationVariantIssueModel(v.FullName, RelationVariantIssueKind.DuplicateRole, role.Role, role.Location));
                 }
             }
             else
@@ -280,7 +281,7 @@ internal static class RelationLinker
         {
             if (r.IsNested)
             {
-                issues.Add(new NestedTypeIssueModel(r.FullName, "CompositionRoot"));
+                issues.Add(new NestedTypeIssueModel(r.FullName, "CompositionRoot", r.IssueLocation));
             }
             else
             {
@@ -691,8 +692,11 @@ internal static class RelationLinker
                     (null, _)    => "[In] endpoint",
                     _            => "[Out] endpoint",
                 };
+                // No embedded location: healthy variants must stay position-independent,
+                // and CG047 is only decided here (after the lift). The diagnostics
+                // output resolves the variant declaration via the location map instead.
                 issues.Add(new RelationVariantIssueModel(
-                    variant.FullName, RelationVariantIssueKind.MissingEndpoints, missing));
+                    variant.FullName, RelationVariantIssueKind.MissingEndpoints, missing, Location: null));
                 continue;
             }
 

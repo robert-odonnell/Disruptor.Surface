@@ -21,7 +21,9 @@ public enum RelationVariantIssueKind
 /// <param name="FullName">The variant class's full name.</param>
 /// <param name="Kind">Which malformed shape was detected.</param>
 /// <param name="Detail">Kind-specific message fragment: the duplicated role name ("In"/"Out"/"Id") for <see cref="RelationVariantIssueKind.DuplicateRole"/>, the missing-endpoint description for <see cref="RelationVariantIssueKind.MissingEndpoints"/>.</param>
+/// <param name="Location">For <see cref="RelationVariantIssueKind.DuplicateRole"/>, the location of the duplicate role attribute (CG046 points at the extra [In]/[Out]/[Id], not the class). <c>null</c> for <see cref="RelationVariantIssueKind.MissingEndpoints"/> — CG047 is resolved to the variant declaration via the declaration-location map at report time. Issue models represent an already-failing build, so embedding a position-sensitive <see cref="LocationInfo"/> here cannot regress incremental caching.</param>
 public sealed record RelationVariantIssueModel(
     string FullName,
     RelationVariantIssueKind Kind,
-    string Detail);
+    string Detail,
+    LocationInfo? Location);
