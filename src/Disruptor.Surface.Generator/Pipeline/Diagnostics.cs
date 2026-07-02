@@ -345,7 +345,7 @@ internal static class Diagnostics
     public static readonly DiagnosticDescriptor AutoValueRequiresProperty = new(
         id: "CG052",
         title: "[CreatedAt]/[UpdatedAt]/[Version] must be combined with [Property]",
-        messageFormat: "'{0}.{1}' carries [{2}] but is not a scalar [Property] field; the marker overlays a persisted scalar column (schema DDL, hydrate and save all reuse the standard [Property] paths) — declare it as e.g. '[{2}, Property] public partial {3} {1} {{ get; }}'",
+        messageFormat: "'{0}.{1}' carries [{2}] but is not a scalar [Property] field; the marker overlays a persisted scalar column (schema DDL, hydrate and save all reuse the standard [Property] paths) — declare it as '[{2}, Property] public partial {3} {1} {{ get; }}'",
         category: Category,
         defaultSeverity: DiagnosticSeverity.Error,
         isEnabledByDefault: true);
