@@ -985,6 +985,7 @@ Lifecycle:
 - The session stays open across multiple Save/Delete/Relate dispatches — feel free to dispatch into one `tx`, commit it, dispatch into another `tx`, etc.
 - Any exception during a dispatch closes the session (`IsClosed` becomes `true`); subsequent operations throw `InvalidOperationException`.
 - `Abandon()` closes the session explicitly.
+- `CloseReason` (a `SessionCloseReason?` — `null` while open) records **why** the session closed: the closing operation (`SessionCloseKind`: `Abandoned`, `SaveFailed`, `DeleteFailed`, `RejectedDelete`, `UnrelateFailed`, `FetchFailed`, `QueryFailed`), the entity/edge id being operated on where one was available (`EntityId`), and the original exception (`Cause` — the failing call threw it unwrapped; this is the diagnostic echo). The first close wins: abandoning a session that already failed a Save keeps reporting the Save failure. The closed-session `InvalidOperationException` message embeds `CloseReason.Summary`, e.g. `This SurrealSession is closed (SaveAsync of designs:x failed: SurrealRpcException: …). Sessions are one-shot — load a new session for further work.`
 - The transaction lifecycle is the app's responsibility — the library never opens or commits transactions on your behalf.
 
 ### `RecordIdFormat`

@@ -222,20 +222,46 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     // One-shot lifecycle invariant: a session represents one loaded snapshot. Abandon
     // or any failed async dispatch closes it, after which every public method throws.
     // Hydrate-side helpers stay open because they only ever run during initial load —
-    // before the user gets a handle.
+    // before the user gets a handle. Every site that closes the session routes through
+    // Close(reason) so the WHY survives into subsequent ThrowIfClosed messages.
     private bool closed;
+
+    /// <summary>
+    /// Stamps the close reason and flips <see cref="closed"/>. First close wins: a
+    /// session that failed a Save and is then Abandoned keeps reporting the Save
+    /// failure — the first reason is the one that actually killed the snapshot.
+    /// </summary>
+    private void Close(SessionCloseReason reason)
+    {
+        if (closed)
+        {
+            return;
+        }
+
+        closed = true;
+        CloseReason = reason;
+    }
 
     private void ThrowIfClosed()
     {
         if (closed)
         {
+            var why = CloseReason is { } reason ? $" ({reason.Summary})" : "";
             throw new InvalidOperationException(
-                "This SurrealSession is closed. Load a new session for further work.");
+                $"This SurrealSession is closed{why}. Sessions are one-shot — load a new session for further work.");
         }
     }
 
     /// <summary>True after <see cref="Abandon"/> or a failed async dispatch; further reads or writes throw.</summary>
     public bool IsClosed => closed;
+
+    /// <summary>
+    /// Why the session is closed, or <c>null</c> while it is still open. Carries the
+    /// closing operation, the entity/edge id where one was available, and the original
+    /// exception as <see cref="SessionCloseReason.Cause"/> (the failing call threw it
+    /// unwrapped — this is the diagnostic echo, not a replacement). First close wins.
+    /// </summary>
+    public SessionCloseReason? CloseReason { get; private set; }
 
     // Filled by the loader's IHydrationSink.Track. ISaveContext.IsTracked checks
     // loadedAtStart to distinguish "in DB" from "constructed in this session" so the
@@ -532,12 +558,12 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
                 HydrateMergingRoot<T>(single, sink, query.Includes);
             }
         }
-        catch
+        catch (Exception ex)
         {
             // Fail-closed like every other async boundary: a mid-loop hydration failure
             // would otherwise leave an open session that is half old state, half new,
             // violating the one-shot invariant.
-            closed = true;
+            Close(new SessionCloseReason(SessionCloseKind.FetchFailed, Cause: ex));
             throw;
         }
     }
@@ -796,11 +822,11 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
         {
             await ctx.SaveAsync(entity, ct).ConfigureAwait(false);
         }
-        catch
+        catch (Exception ex)
         {
             // Fail-closed: any dispatch failure marks the session done. The app catches
             // and cancels the txn on its own.
-            closed = true;
+            Close(new SessionCloseReason(SessionCloseKind.SaveFailed, entity.Id, ex));
             throw;
         }
     }
@@ -973,9 +999,15 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
             response.EnsureSuccess();
             Record(Command.Unrelate(src, TKind.EdgeName, tgt));
         }
-        catch
+        catch (Exception ex)
         {
-            closed = true;
+            // Whichever endpoint was supplied names the operation in the close reason —
+            // there's no single edge id for the bulk form.
+            var endpoint = source ?? target;
+            Close(new SessionCloseReason(
+                SessionCloseKind.UnrelateFailed,
+                endpoint is null ? null : RecordId.From(endpoint),
+                ex));
             throw;
         }
     }
@@ -1053,9 +1085,15 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
                 CleanupLocalState(id);
             }
         }
-        catch
+        catch (Exception ex)
         {
-            closed = true;
+            // Distinguish the pre-flight Reject (no wire dispatch happened; the plan
+            // itself said no) from a genuine dispatch/planning failure — the follow-up
+            // "why is my session closed?" answer differs materially between the two.
+            var kind = ex is CascadeRejectException
+                ? SessionCloseKind.RejectedDelete
+                : SessionCloseKind.DeleteFailed;
+            Close(new SessionCloseReason(kind, entity.Id, ex));
             throw;
         }
     }
@@ -1386,10 +1424,10 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
             response.EnsureSuccess();
             return HydrateVariants<TVariant>(response, edgeName);
         }
-        catch
+        catch (Exception ex)
         {
             // Fail-closed: any dispatch failure marks the session done.
-            closed = true;
+            Close(new SessionCloseReason(SessionCloseKind.QueryFailed, RecordId.From(endpoint), ex));
             throw;
         }
     }
@@ -1410,9 +1448,10 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
             response.EnsureSuccess();
             return HydrateVariants<TVariant>(response, edgeName);
         }
-        catch
+        catch (Exception ex)
         {
-            closed = true;
+            // Raw-SQL escape hatch — no single entity/edge id to name.
+            Close(new SessionCloseReason(SessionCloseKind.QueryFailed, Cause: ex));
             throw;
         }
     }
@@ -1526,9 +1565,9 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
             response.EnsureSuccess();
             return HydrateTraversalTargets<TTarget>(response);
         }
-        catch
+        catch (Exception ex)
         {
-            closed = true;
+            Close(new SessionCloseReason(SessionCloseKind.QueryFailed, RecordId.From(endpoint), ex));
             throw;
         }
     }
@@ -1672,11 +1711,15 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
 
     private static string GetEdgeName<TKind>() where TKind : IRelationKind => TKind.EdgeName;
 
-    /// <summary>Closes the session — once abandoned, it's done.</summary>
+    /// <summary>
+    /// Closes the session — once abandoned, it's done. Idempotent; when the session
+    /// already closed for another reason (e.g. a failed dispatch), that first reason
+    /// is kept — <see cref="CloseReason"/> reports what actually killed the snapshot.
+    /// </summary>
     public void Abandon()
     {
         Log.Clear();
-        closed = true;
+        Close(new SessionCloseReason(SessionCloseKind.Abandoned));
     }
 
 
