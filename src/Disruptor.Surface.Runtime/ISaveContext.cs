@@ -20,6 +20,16 @@ public interface ISaveContext
     SurrealTransaction Transaction { get; }
 
     /// <summary>
+    /// The instant source for <c>[CreatedAt]</c> / <c>[UpdatedAt]</c> audit stamping.
+    /// Generator-emitted <see cref="IEntity.SaveAsync"/> bodies read this once per
+    /// dispatch, so CREATE stamps created + updated with the same instant. Default
+    /// interface member returns <see cref="DateTimeOffset.UtcNow"/> — the session's
+    /// private <see cref="ISaveContext"/> implementation picks it up unmodified; test
+    /// fakes override it for deterministic clocks.
+    /// </summary>
+    DateTimeOffset UtcNow => DateTimeOffset.UtcNow;
+
+    /// <summary>
     /// True iff <paramref name="id"/> is in the session's identity map — either because it
     /// was loaded from the DB, or because Save has already dispatched a CREATE for it in
     /// this pass. Forward-reference walks check this to decide whether to recurse.

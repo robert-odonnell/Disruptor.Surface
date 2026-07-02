@@ -606,6 +606,90 @@ public sealed class ModelGenerator : IIncrementalGenerator
                 valid = false;
             }
 
+            // CG052–CG055 — [CreatedAt]/[UpdatedAt]/[Version] marker validation. The
+            // markers overlay a scalar [Property] (the field reuses the standard schema/
+            // hydrate/save paths); the emitted SaveAsync additionally writes the backing
+            // field itself, so the shape is part of the contract: exactly one marker per
+            // property, combined with [Property], typed to what the library writes
+            // (datetime for the audit pair; a non-nullable integer counter for version).
+            foreach (var p in table.Properties)
+            {
+                if (p.AutoValue == AutoValueKind.None)
+                {
+                    continue;
+                }
+
+                // CG055 — mutually exclusive markers on one property. Each marker
+                // prescribes a different write behavior for the same field.
+                var markerNames = AutoValueLabels(p.AutoValue);
+                if (markerNames.Count > 1)
+                {
+                    spc.ReportDiagnostic(Diagnostic.Create(
+                        Diagnostics.AutoValueMarkersConflict,
+                        Location.None,
+                        table.FullName,
+                        p.Name,
+                        string.Join(" + ", markerNames)));
+                    valid = false;
+                    continue;
+                }
+
+                var marker = markerNames[0];
+                var expectedType = p.AutoValue == AutoValueKind.Version
+                    ? "a non-nullable int or long"
+                    : "a non-nullable System.DateTime or System.DateTimeOffset";
+
+                // CG052 — must be a scalar [Property] field (not [Reference]/[Parent]/…,
+                // not a relation read collection, not an element collection).
+                if (p.Kinds != PropertyKind.Property
+                    || p.RelationRole != RelationRole.None
+                    || IsElementCollection(p.Type))
+                {
+                    spc.ReportDiagnostic(Diagnostic.Create(
+                        Diagnostics.AutoValueRequiresProperty,
+                        Location.None,
+                        table.FullName,
+                        p.Name,
+                        marker,
+                        p.AutoValue == AutoValueKind.Version ? "int" : "System.DateTimeOffset"));
+                    valid = false;
+                    continue;
+                }
+
+                // CG053 — the library writes the field, so the type is fixed.
+                if (!IsValidAutoValueType(p))
+                {
+                    spc.ReportDiagnostic(Diagnostic.Create(
+                        Diagnostics.AutoValueTypeInvalid,
+                        Location.None,
+                        table.FullName,
+                        p.Name,
+                        marker,
+                        expectedType,
+                        p.Type.FullyQualifiedName));
+                    valid = false;
+                }
+            }
+
+            // CG054 — at most one property per marker per table: the emitted SaveAsync
+            // stamps exactly one created field, one updated field, one version counter.
+            foreach (var kind in new[] { AutoValueKind.CreatedAt, AutoValueKind.UpdatedAt, AutoValueKind.Version })
+            {
+                var count = table.Properties.Count(p => p.AutoValue.HasFlag(kind));
+                if (count <= 1)
+                {
+                    continue;
+                }
+
+                spc.ReportDiagnostic(Diagnostic.Create(
+                    Diagnostics.AutoValueDuplicatedOnTable,
+                    Location.None,
+                    table.FullName,
+                    kind.ToString(),
+                    count));
+                valid = false;
+            }
+
             // CG050/CG051 — element-collection [Property] shape validation. CG025 skips
             // these (they aren't scalars), so without their own checks unsupported
             // element types surfaced as raw CS errors inside the .g.cs: string elements
@@ -880,6 +964,52 @@ public sealed class ModelGenerator : IIncrementalGenerator
     /// </summary>
     private static IEnumerable<(string Name, TypeRef Type)> EnumerateReadSideTypes(TableModel table, PropertyKind kind) => table.Properties.Where(prop => prop.Kinds.HasFlag(kind))
         .Select(prop => (prop.Name, prop.Type));
+
+    /// <summary>
+    /// The attribute names behind each set flag in <paramref name="kinds"/>, for
+    /// diagnostic messages. Order matches declaration order of the enum.
+    /// </summary>
+    private static List<string> AutoValueLabels(AutoValueKind kinds)
+    {
+        var names = new List<string>(3);
+        if (kinds.HasFlag(AutoValueKind.CreatedAt))
+        {
+            names.Add("CreatedAt");
+        }
+
+        if (kinds.HasFlag(AutoValueKind.UpdatedAt))
+        {
+            names.Add("UpdatedAt");
+        }
+
+        if (kinds.HasFlag(AutoValueKind.Version))
+        {
+            names.Add("Version");
+        }
+
+        return names;
+    }
+
+    /// <summary>
+    /// True iff the property's declared type matches what the emitted SaveAsync writes
+    /// for its marker: non-nullable DateTime / DateTimeOffset for the audit pair
+    /// ([CreatedAt] / [UpdatedAt]); non-nullable int / long for [Version]. Nullability
+    /// is rejected for all three — the library always assigns a value, and the guarded
+    /// UPDATE's <c>version + 1</c> arithmetic and <c>WHERE version = $expected</c>
+    /// binding need a definite operand.
+    /// </summary>
+    private static bool IsValidAutoValueType(PropertyModel p)
+    {
+        if (p.Type.IsNullable)
+        {
+            return false;
+        }
+
+        var fqn = StripGlobalAndNullable(p.Type.FullyQualifiedName);
+        return p.AutoValue == AutoValueKind.Version
+            ? fqn is "int" or "System.Int32" or "long" or "System.Int64"
+            : fqn is "System.DateTime" or "System.DateTimeOffset";
+    }
 
     /// <summary>
     /// Best-fit attribute label for diagnostic messages — picks the role attribute the

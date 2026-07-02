@@ -1096,4 +1096,148 @@ public sealed class DiagnosticsTests
         var (_, _, runDiags, _) = GeneratorHarness.Run(src);
         Assert.DoesNotContain(runDiags, d => d.Id is "CG042" or "CG043" or "CG044" or "CG045");
     }
+
+    [Fact]
+    public void CG052_AuditMarkerWithoutProperty()
+    {
+        // [CreatedAt] without [Property] — the marker overlays a persisted scalar
+        // column, so a bare marker has no field to stamp.
+        const string src = """
+            using System;
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [CreatedAt] public partial DateTimeOffset CreatedAtUtc { get; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG052");
+    }
+
+    [Fact]
+    public void CG052_FiresWhenMarkerCombinedWithNonPropertyRole()
+    {
+        // [Version, Reference] — the marker only composes with a scalar [Property].
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Target {
+                [Id] public partial TargetId Id { get; set; }
+            }
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Version, Reference] public partial Target? Ref { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG052");
+    }
+
+    [Fact]
+    public void CG053_AuditMarkerOnNonDateTimeProperty()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [CreatedAt, Property] public partial string CreatedLabel { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG053");
+    }
+
+    [Fact]
+    public void CG053_VersionOnNonIntegerProperty()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Version, Property] public partial string Revision { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG053");
+    }
+
+    [Fact]
+    public void CG053_VersionOnNullableInt()
+    {
+        // Nullable is rejected: the guarded UPDATE's `version + 1` arithmetic and the
+        // `WHERE version = $expected` binding need a definite operand.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Version, Property] public partial int? Revision { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG053");
+    }
+
+    [Fact]
+    public void CG054_DuplicateMarkerOnTable()
+    {
+        const string src = """
+            using System;
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [CreatedAt, Property] public partial DateTimeOffset CreatedA { get; }
+                [CreatedAt, Property] public partial DateTimeOffset CreatedB { get; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG054");
+    }
+
+    [Fact]
+    public void CG055_MultipleMarkersOnOneProperty()
+    {
+        // [CreatedAt, UpdatedAt] on one field is contradictory: stamp-on-CREATE-only
+        // vs stamp-every-save can't both hold for the same column.
+        const string src = """
+            using System;
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [CreatedAt, UpdatedAt, Property] public partial DateTimeOffset Stamp { get; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG055");
+    }
+
+    [Fact]
+    public void CG052_CG053_CG054_CG055_DoNotFire_OnWellFormedAuditModel()
+    {
+        // The canonical shape: one [CreatedAt], one [UpdatedAt], one [Version], all
+        // combined with [Property], DateTimeOffset / DateTime / int / long typed,
+        // get-only. Long + DateTime variants covered too.
+        const string src = """
+            using System;
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Doc {
+                [Id] public partial DocId Id { get; set; }
+                [CreatedAt, Property] public partial DateTime Created { get; }
+                [UpdatedAt, Property] public partial DateTimeOffset Updated { get; }
+                [Version, Property] public partial long Version { get; }
+            }
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, compileDiags) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id is "CG052" or "CG053" or "CG054" or "CG055");
+        Assert.DoesNotContain(runDiags, d => d.Severity == DiagnosticSeverity.Error);
+        Assert.Empty(compileDiags);
+    }
+
 }

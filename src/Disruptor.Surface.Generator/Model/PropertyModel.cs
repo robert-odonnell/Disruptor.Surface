@@ -17,6 +17,23 @@ public enum PropertyKind
 }
 
 /// <summary>
+/// Library-managed value overlays on a scalar <c>[Property]</c> field. Flags so the
+/// validation pass can detect (and reject with CG055) a property carrying more than one
+/// marker; a valid property carries at most one.
+/// </summary>
+[Flags]
+public enum AutoValueKind
+{
+    None      = 0,
+    /// <summary>[CreatedAt] — stamped with the save instant on CREATE dispatch only.</summary>
+    CreatedAt = 1 << 0,
+    /// <summary>[UpdatedAt] — stamped with the save instant on every dispatch.</summary>
+    UpdatedAt = 1 << 1,
+    /// <summary>[Version] — optimistic-concurrency counter: 1 on CREATE, n+1 via a WHERE-guarded UPDATE.</summary>
+    Version   = 1 << 2,
+}
+
+/// <summary>
 /// What happens to a referencing record when the referenced record is deleted. Mirrors
 /// the runtime's <c>ReferenceDeleteBehavior</c> enum — names kept in lockstep so the
 /// generator can emit references to the runtime type directly.
@@ -83,4 +100,5 @@ public sealed record PropertyModel(
     EquatableArray<InlineMember> InlineMembers,
     InlineConstructionKind InlineConstruction,
     EquatableArray<IndexAnnotationModel> Indexes,
-    bool IsInline);
+    bool IsInline,
+    AutoValueKind AutoValue = AutoValueKind.None);
