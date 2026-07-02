@@ -10,8 +10,17 @@ public enum SessionCloseKind
     /// <summary>The user called <see cref="SurrealSession.Abandon"/>.</summary>
     Abandoned,
 
-    /// <summary><see cref="SurrealSession.SaveAsync"/> failed mid-dispatch.</summary>
+    /// <summary><see cref="SurrealSession.SaveAsync(IEntity, Disruptor.Surreal.SurrealTransaction, System.Threading.CancellationToken)"/> failed mid-dispatch.</summary>
     SaveFailed,
+
+    /// <summary>
+    /// The batch overload
+    /// <see cref="SurrealSession.SaveAsync(System.Collections.Generic.IEnumerable{IEntity}, Disruptor.Surreal.SurrealTransaction, System.Threading.CancellationToken)"/>
+    /// failed mid-batch. <see cref="SessionCloseReason.EntityId"/> carries the batch
+    /// entity being processed when the failure surfaced (for a failure in the final
+    /// buffered-create flush, the last entity of the batch).
+    /// </summary>
+    BatchSaveFailed,
 
     /// <summary><see cref="SurrealSession.DeleteAsync"/> failed mid-dispatch (wire or planning error other than a Reject blocker).</summary>
     DeleteFailed,
@@ -60,6 +69,7 @@ public sealed record SessionCloseReason(
             {
                 SessionCloseKind.Abandoned => "Abandon was called",
                 SessionCloseKind.SaveFailed => $"SaveAsync{of} failed",
+                SessionCloseKind.BatchSaveFailed => $"a batch SaveAsync{of} failed",
                 SessionCloseKind.DeleteFailed => $"DeleteAsync{of} failed",
                 SessionCloseKind.RejectedDelete => $"DeleteAsync{of} was rejected by the pre-flight cascade resolve",
                 SessionCloseKind.UnrelateFailed => $"UnrelateAsync{of} failed",
