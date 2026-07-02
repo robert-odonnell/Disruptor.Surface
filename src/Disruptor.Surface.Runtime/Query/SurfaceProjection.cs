@@ -34,6 +34,16 @@ public static class SurfaceProjection
     /// values the probe hands back), the failure surfaces as
     /// <see cref="ProjectionDiscoveryException"/> with hints on how to make the
     /// constructor probe-safe.
+    /// <para>
+    /// <b>Warning — every <c>row.Read</c> call must be unconditional.</b> The discovery
+    /// probe runs the lambda exactly once, handing back <c>default</c> for every read;
+    /// only the fields touched on that single pass make it into the SELECT list. A
+    /// <c>row.Read</c> behind a branch that the default-valued probe doesn't take (e.g.
+    /// <c>flag ? row.Read(Q.Extra) : fallback</c> where <c>flag</c> probes as
+    /// <c>false</c>) is silently never discovered — the column is missing from the wire
+    /// SQL and every real materialise pass reads <c>default</c> for it. Read all fields
+    /// up front, then branch on the values.
+    /// </para>
     /// </summary>
     public static ISurfaceProjection<TRow> For<TRow>(Func<IProjectionRow, TRow> materialize)
     {
