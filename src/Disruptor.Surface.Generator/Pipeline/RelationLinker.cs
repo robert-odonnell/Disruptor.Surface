@@ -31,6 +31,20 @@ internal static class RelationLinker
         ImmutableArray<UnionMembershipCandidate> unionMembershipCandidates,
         ImmutableArray<SharedShapeInterfaceCandidate> sharedShapeCandidates)
     {
+        // Multi-declaration dedupe. The CreateSyntaxProvider-based extractors (relation
+        // kinds, relation variants, shared shapes) run once per *declaration*, but
+        // GetDeclaredSymbol merges partials — a type split across two matching partial
+        // declarations yields N identical models, and the per-symbol emitters would then
+        // AddSource the same hint twice (ArgumentException → CS8785, generator contributes
+        // nothing). Models are value-equatable, so keep the first occurrence per full name.
+        // Union candidates are exempt on purpose: interface candidates are deduped by the
+        // per-interface accumulator in ComputeUnionEndpoints, and membership candidates are
+        // intentionally per-declaration (each partial contributes its own base list).
+        forwardKinds = DedupeByFullName(forwardKinds, static k => k.FullName);
+        inverseKinds = DedupeByFullName(inverseKinds, static k => k.FullName);
+        relationVariants = DedupeByFullName(relationVariants, static v => v.FullName);
+        sharedShapeCandidates = DedupeByFullName(sharedShapeCandidates, static c => c.InterfaceFullName);
+
         var tableFullNames = new HashSet<string>();
         foreach (var t in tables)
         {
@@ -85,6 +99,32 @@ internal static class RelationLinker
             AggregateConflicts: new EquatableArray<string>(conflicts),
             CascadeCycles: new EquatableArray<string>(cascadeCycles),
             CompositionRoots: new EquatableArray<CompositionRootModel>(compositionRoots));
+    }
+
+    /// <summary>
+    /// Keeps the first model per full name, dropping later duplicates. Duplicates are
+    /// identical by construction (the extractors snapshot the *merged* symbol once per
+    /// declaration), so "first wins" loses nothing; a genuine same-name redeclaration is
+    /// a CS0101 in the user's code and never reaches a healthy emit pass anyway.
+    /// </summary>
+    private static ImmutableArray<T> DedupeByFullName<T>(ImmutableArray<T> models, Func<T, string> fullName)
+    {
+        if (models.Length <= 1)
+        {
+            return models;
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var builder = ImmutableArray.CreateBuilder<T>(models.Length);
+        foreach (var model in models)
+        {
+            if (seen.Add(fullName(model)))
+            {
+                builder.Add(model);
+            }
+        }
+
+        return builder.Count == models.Length ? models : builder.ToImmutable();
     }
 
     private static (ImmutableArray<IndexModel> Indexes, ImmutableArray<IndexIssueModel> Issues) ComputeIndexes(
