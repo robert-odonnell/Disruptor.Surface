@@ -8,7 +8,11 @@ namespace Disruptor.Surface.Generator.Emit;
 /// <list type="number">
 ///   <item>An <c>internal sealed class GeneratedReferenceRegistry : IReferenceRegistry</c>
 ///         in the user's <c>[CompositionRoot]</c> namespace, populated with every
-///         <c>[Reference]</c> field bucketed by referenced-table name.</item>
+///         <c>[Reference]</c> and <c>[Parent]</c> field bucketed by referenced-table
+///         name. Parent links register with <c>Reject</c> — the invariant is that the
+///         registry mirrors exactly what <c>SchemaEmitter</c> put in the DDL
+///         (<c>REFERENCE ON DELETE REJECT</c> for every parent link), so
+///         <c>SurrealSession.PlanDelete</c> predicts what the substrate enforces.</item>
 ///   <item>A partial fragment of the <c>[CompositionRoot]</c> class adding a
 ///         <c>public static IReferenceRegistry ReferenceRegistry</c> property that
 ///         returns the singleton instance.</item>
@@ -47,7 +51,18 @@ internal static class ReferenceRegistryEmitter
             var referencerTable = SurrealNaming.ToTableName(table.Name);
             foreach (var p in table.Properties)
             {
-                if (!p.Kinds.HasFlag(PropertyKind.Reference))
+                // [Reference] carries the user-declared delete policy; [Parent] links are
+                // hard-coded REFERENCE ON DELETE REJECT in the emitted schema
+                // (SchemaEmitter.EmitParentField), so they register with Reject here.
+                // Without the parent entries PlanDelete's (ReferencerTable, FieldName)
+                // lookup silently skips parent links: DeleteAsync predicts zero blockers,
+                // dispatches, and the substrate rejects with a generic SurrealRpcException
+                // instead of the pre-flight CascadeRejectException naming the children.
+                // Reference wins when a property somehow carries both flags — same
+                // precedence as SchemaEmitter's field emission.
+                var isReference = p.Kinds.HasFlag(PropertyKind.Reference);
+                var isParent = !isReference && p.Kinds.HasFlag(PropertyKind.Parent);
+                if (!isReference && !isParent)
                 {
                     continue;
                 }
@@ -67,7 +82,8 @@ internal static class ReferenceRegistryEmitter
                     list = [];
                     byReferenced[referencedTable] = list;
                 }
-                list.Add((referencerTable, fieldName, p.ReferenceDelete, p.Type.IsNullable));
+                var behavior = isParent ? ReferenceDeletePolicy.Reject : p.ReferenceDelete;
+                list.Add((referencerTable, fieldName, behavior, p.Type.IsNullable));
             }
         }
 

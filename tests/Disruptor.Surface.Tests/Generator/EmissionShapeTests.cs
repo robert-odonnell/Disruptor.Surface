@@ -1,3 +1,5 @@
+using Disruptor.Surface.Runtime;
+using Disruptor.Surface.Tests.Runtime;
 using Microsoft.CodeAnalysis;
 using Xunit;
 
@@ -300,6 +302,87 @@ public sealed class EmissionShapeTests
 
         // Convenience ApplySchemaAsync sits next to Schema for the common boot path.
         Assert.Contains("public static async global::System.Threading.Tasks.Task ApplySchemaAsync", allSrc);
+    }
+
+    [Fact]
+    public void ReferenceRegistry_RegistersParentLinks_WithRejectBehavior()
+    {
+        // The emitted schema gives every [Parent] link REFERENCE ON DELETE REJECT
+        // (SchemaEmitter.EmitParentField); the registry must mirror that so
+        // SurrealSession.PlanDelete predicts what the substrate enforces. Pre-fix the
+        // registry held only PropertyKind.Reference entries — parent links were
+        // invisible to delete planning.
+        var (result, _, _, _) = GeneratorHarness.Run(MinimalModel);
+        var registry = GeneratorHarness.FindGeneratedFile(result, "ReferenceRegistry");
+        Assert.NotNull(registry);
+
+        var src = registry.ToString();
+        // Bucketed under the referenced table ("designs"), keyed by the referencer
+        // table + snake-cased field name PlanDelete's lookup matches on.
+        Assert.Contains("[\"designs\"]", src);
+        Assert.Contains(
+            "new(\"constraints\", \"design\", \"designs\", global::Disruptor.Surface.Runtime.ReferenceDeleteBehavior.Reject, false)",
+            src);
+    }
+
+    [Fact]
+    public async Task E2E_DeleteParent_WithTrackedChildren_ThrowsCascadeReject_PreDispatch()
+    {
+        // The headline PlanDelete fix, end-to-end through the REAL generated registry +
+        // entities: deleting a design whose constraint child is tracked in-session must
+        // throw the documented pre-flight CascadeRejectException naming the child —
+        // not dispatch and let the substrate reject with a generic SurrealRpcException.
+        var asm = GeneratorHarness.CompileAndLoad(MinimalModel);
+        var registry = (IReferenceRegistry)asm.GetType("M.Workspace", throwOnError: true)!
+            .GetProperty("ReferenceRegistry")!.GetValue(null)!;
+        var session = new SurrealSession(registry);
+
+        var design = (IEntity)Activator.CreateInstance(asm.GetType("M.Design", throwOnError: true)!)!;
+        session.Track(design);
+
+        var constraintT = asm.GetType("M.Constraint", throwOnError: true)!;
+        var constraint = (IEntity)Activator.CreateInstance(constraintT)!;
+        // The [Parent] setter cascade-tracks the child into the parent's session.
+        constraintT.GetProperty("Design")!.SetValue(constraint, design);
+        Assert.True(session.IsTracked(constraint.Id));
+
+        // Anything reaching the wire surfaces as IOException; we expect the pre-flight throw.
+        var db = FakeSurreal.Throwing(new IOException("should never reach the wire"));
+        await using var tx = await db.BeginTransactionAsync();
+
+        var ex = await Assert.ThrowsAsync<CascadeRejectException>(() => session.DeleteAsync(design, tx));
+        var blocker = Assert.Single(ex.Blockers);
+        Assert.Equal(constraint.Id, blocker.Referencer);
+        Assert.Equal("design", blocker.FieldName);
+        Assert.Equal(design.Id, blocker.BlockedTarget);
+    }
+
+    [Fact]
+    public async Task E2E_DeleteParent_AfterChildrenDeleted_PlansClean()
+    {
+        // The order the schema's REJECT enforces: children first, then the parent. Once
+        // the child is deleted (and purged from the snapshot by CleanupLocalState), the
+        // parent's delete plan finds no steady-state blockers and dispatches cleanly.
+        var asm = GeneratorHarness.CompileAndLoad(MinimalModel);
+        var registry = (IReferenceRegistry)asm.GetType("M.Workspace", throwOnError: true)!
+            .GetProperty("ReferenceRegistry")!.GetValue(null)!;
+        var session = new SurrealSession(registry);
+
+        var design = (IEntity)Activator.CreateInstance(asm.GetType("M.Design", throwOnError: true)!)!;
+        session.Track(design);
+
+        var constraintT = asm.GetType("M.Constraint", throwOnError: true)!;
+        var constraint = (IEntity)Activator.CreateInstance(constraintT)!;
+        constraintT.GetProperty("Design")!.SetValue(constraint, design);
+
+        var db = FakeSurreal.Null();
+        await using var tx = await db.BeginTransactionAsync();
+
+        await session.DeleteAsync(constraint, tx);
+        await session.DeleteAsync(design, tx);
+
+        Assert.False(session.IsTracked(design.Id));
+        Assert.False(session.IsClosed);
     }
 
     [Fact]
