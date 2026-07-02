@@ -1627,8 +1627,10 @@ public sealed class EmissionShapeTests
         Assert.Contains("[\"_content\"] = new global::Disruptor.Surreal.Values.SurrealObjectValue(__content),", src);
         Assert.Contains("global::Disruptor.Surface.Runtime.ContentValue.Set(__bindings, \"_p_severity\", _severity);", src);
 
-        // Dispatch + EnsureSuccess + MarkSaved are the post-dispatch contract.
-        Assert.Contains("await ctx.Transaction.QueryAsync(__sql, __bindings, ct).ConfigureAwait(false);", src);
+        // Dispatch (through the ISaveContext raw-query seam — single-save defaults to
+        // an immediate ctx.Transaction.QueryAsync) + EnsureSuccess + MarkSaved are the
+        // post-dispatch contract.
+        Assert.Contains("await ctx.DispatchQueryAsync(__sql, __bindings, ct).ConfigureAwait(false);", src);
         Assert.Contains("__response.EnsureSuccess();", src);
         Assert.Contains("ctx.MarkSaved(this);", src);
     }

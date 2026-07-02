@@ -963,12 +963,15 @@ internal static class PartialEmitter
                 }
             }
 
-            // Typed CBOR dispatch — SDK methods accept ISurrealRecordId + SurrealObject and
-            // CBOR-encode end-to-end. No SurrealQL string, no escape rules.
+            // Typed CBOR dispatch through the ISaveContext seam — the single-save
+            // context dispatches immediately via the SDK's typed methods (CBOR
+            // end-to-end, no SurrealQL string, no escape rules); the batch-save
+            // context buffers plain creates so contiguous same-table CREATEs coalesce
+            // into one INSERT statement.
             writer.Line("if (__isNew)");
             using (writer.Indent())
             {
-                writer.Line("await ctx.Transaction.CreateAsync(global::Disruptor.Surface.Runtime.RecordIdSdkBridge.ToSdk(__id), __content, ct);");
+                writer.Line("await ctx.DispatchCreateAsync(__id, __content, ct);");
             }
 
             if (versionProp is null)
@@ -976,14 +979,14 @@ internal static class PartialEmitter
                 writer.Line("else");
                 using (writer.Indent())
                 {
-                    writer.Line("await ctx.Transaction.UpsertAsync(global::Disruptor.Surface.Runtime.RecordIdSdkBridge.ToSdk(__id), __content, ct);");
+                    writer.Line("await ctx.DispatchUpsertAsync(__id, __content, ct);");
                 }
             }
             else
             {
-                // [Version]-guarded UPDATE. The plain path uses the SDK's typed
-                // UpsertAsync, but the guard needs a WHERE clause, so this goes through
-                // tx.QueryAsync with typed CBOR bindings (same "UPDATE $_record_id
+                // [Version]-guarded UPDATE. The plain path uses the typed upsert seam,
+                // but the guard needs a WHERE clause, so this goes through the raw-query
+                // seam with typed CBOR bindings (same "UPDATE $_record_id
                 // CONTENT $_content" shape the SDK's own UpdateAsync issues, plus the
                 // version guard). A non-matching WHERE returns an empty result set —
                 // no row carried the expected version, i.e. a competing writer bumped
@@ -1007,7 +1010,7 @@ internal static class PartialEmitter
                     writer.Line("};");
                     writer.Line("global::Disruptor.Surface.Runtime.ContentValue.Set(__versionBindings, \"_expected_version\", __expectedVersion);");
                     writer.Line($"const string __versionSql = \"UPDATE $_record_id CONTENT $_content WHERE {versionField} = $_expected_version;\";");
-                    writer.Line("var __versionResponse = await ctx.Transaction.QueryAsync(__versionSql, __versionBindings, ct);");
+                    writer.Line("var __versionResponse = await ctx.DispatchQueryAsync(__versionSql, __versionBindings, ct);");
                     writer.Line("__versionResponse.EnsureSuccess();");
                     writer.Line("var __versionResult = __versionResponse.Count > 0 ? __versionResponse.Take(0) : global::Disruptor.Surreal.Values.SurrealValue.None;");
                     writer.Line("var __versionMatched = __versionResult is global::Disruptor.Surreal.Values.SurrealObjectValue or global::Disruptor.Surreal.Values.SurrealListValue { List.Count: > 0 };");

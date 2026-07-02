@@ -915,7 +915,10 @@ internal static class RelationVariantEmitter
                 writer.Line($"const string __sql = \"INSERT RELATION IGNORE INTO {edgeName} $_content;\";");
             }
 
-            writer.Line("var __response = await ctx.Transaction.QueryAsync(__sql, __bindings, ct).ConfigureAwait(false);");
+            // Raw-query seam: single-save dispatches straight through ctx.Transaction;
+            // batch-save flushes buffered creates first so the edge's endpoints exist
+            // in the transaction before the ENFORCED relation insert lands.
+            writer.Line("var __response = await ctx.DispatchQueryAsync(__sql, __bindings, ct).ConfigureAwait(false);");
             writer.Line("__response.EnsureSuccess();");
             writer.Line("ctx.MarkSaved(this);");
         }
