@@ -47,7 +47,7 @@ Runtime types referenced throughout this doc (`IEntity`, `IRecordId`, `IRelation
 
 ## Generator Pipeline
 
-`ModelGenerator.Initialize` (in `src/Disruptor.Surface.Generator/ModelGenerator.cs`) wires eight `IncrementalValueProvider` streams into one `Combine` cascade, hands the combined input to `RelationLinker.Build` to produce a `ModelGraph`, and registers the emit pass against `RegisterSourceOutput`:
+`ModelGenerator.Initialize` (in `src/Disruptor.Surface.Generator/ModelGenerator.cs`) wires eight `IncrementalValueProvider` streams into one `Combine` cascade, hands the combined input to `RelationLinker.Build` to produce a `ModelGraph`, and registers **two** outputs against `RegisterSourceOutput`: the emit pass (fed by the graph alone) and a diagnostics-only pass (fed by the graph's validation verdict combined with a ninth, position-sensitive declaration-location stream — see [Diagnostic source locations](#diagnostic-source-locations) for why the split exists):
 
 | Stream | How it discovers | Discovered shape | Lives in |
 | --- | --- | --- | --- |
@@ -59,11 +59,13 @@ Runtime types referenced throughout this doc (`IEntity`, `IRecordId`, `IRelation
 | Union-interface candidates | `CreateSyntaxProvider` over interface-with-attribute-list | `UnionInterfaceCandidate` — interfaces attributed with anything deriving from `In<TKind>` / `Out<TKind>` | `UnionEndpointExtractor` |
 | Union-membership candidates | `CreateSyntaxProvider` over per-table marker interfaces with non-empty base lists | `UnionMembershipCandidate` — the user's `partial interface I{Name}RecordId : IFooTarget` opt-ins | `UnionEndpointExtractor` |
 | Shared-shape candidates | `CreateSyntaxProvider` over interface-with-base-list | `SharedShapeInterfaceCandidate` — partial interfaces deriving from `IRelationVariant`, plus `Lifted{In,Out,Id,Payload}` lifted from `[In]/[Out]/[Property]/[Id]` on the interface members and (preview.57) every reachable base interface | `SharedShapeExtractor` |
+| Declaration locations | `CreateSyntaxProvider` over every type declaration (syntax-only transform, no semantic model) | `TypeDeclarationLocations` — `NormaliseFullName`-format key → identifier `LocationInfo`, plus per-attributed-property member locations | `DeclarationLocationExtractor` |
 
 The streams' predicates are syntax-only so the incremental cache keys hash cheaply; the transforms then use the semantic model. Each transform is `static` (no captures) and returns either a value record or `null` (filtered out by `.Where`).
 
 `RelationLinker.Build` is the single point of fan-in. It:
 
+0. **Dedupes the `CreateSyntaxProvider`-collected sets and rejects nested model types.** Relation kinds, relation variants, and shared-shape candidates are collected once per *declaration* (partials merge at the symbol level, so a split type yields identical duplicate models — first per full name wins); nested `[Table]`/`[CompositionRoot]` declarations are pulled out of the graph and reported as CG045.
 1. **Rewrites `TypeRef`s** so `TypeRef.IsTableType` is true for every type that turned out to be a `[Table]` after the full table set is known. Per-symbol extractors can't see this; they seed `IsTableType` from immediately-visible attributes and the linker patches up forward references.
 2. **Computes per-kind union sets** (`Unions`) — the source-side and target-side `[Table]` members for each forward kind. 2+ members → a marker interface emitted by `UnionInterfaceEmitter` (with both an entity-side and an id-side variant).
 3. **Computes union endpoints** (`UnionEndpoints`) — stitches the union-interface candidates and per-table membership opt-ins into `UnionEndpointModel`s keyed by interface FQN.
@@ -72,16 +74,17 @@ The streams' predicates are syntax-only so the incremental cache keys hash cheap
 6. **Computes entity indexes** (`Indexes` / `IndexIssues`) — groups `IndexAttribute` / `UniqueIndexAttribute` derivatives by attribute type per table, validates supported fields, and preserves property declaration order for composites.
 7. **Computes aggregates and aggregate conflicts** (CG011) by walking `[Children]` from each `[AggregateRoot]`.
 8. **Detects cascade-only reference cycles** (CG014) on the `[Reference, Cascade]` subgraph.
+9. **Computes generated-name collisions** (`NameCollisions`, CG042–CG044) — physical table names, edge table names, and aggregate-root simple names must each be unique; emitters that key output on those names skip the non-first participants via `ModelGraph.IsCollisionLoser` so a collision fails the build with the CG error instead of a duplicate-hint crash.
 
 The output is a `ModelGraph` record (see [Model graph shape](#model-graph-shape) below).
 
-**Diagnostics fire from three layers.** The split matters when you're adding a new one:
+**Diagnostics are computed in three layers and reported from one.** The split matters when you're adding a new one:
 
 - **Inside an extractor.** Cheap structural checks that don't need cross-table information (e.g. "is this property partial?"). Rare; most extractors stay pure and let the linker decide.
-- **Inside `RelationLinker`.** Cross-table checks that need the full model — currently used for CG014 (cascade-only cycles), the aggregate-conflict computation feeding CG011, shared-shape lift conflicts feeding CG036, and entity-index validation feeding CG037–CG041.
-- **Inside `ModelGenerator.Emit`.** Everything else. The bulk of the per-table validation (CG001, CG008, CG022, CG024–CG028) lives here in long sequential loops; cross-aggregate reference checks (CG021), composition-root presence (CG018/CG019), and per-aggregate parent-reachability (CG020) also fire here. Shared-shape diagnostics (CG033, CG035, CG036) and entity-index diagnostics (CG037–CG041) are reported from linker output.
+- **Inside `RelationLinker`.** Cross-table checks that need the full model — currently used for CG014 (cascade-only cycles), the aggregate-conflict computation feeding CG011, shared-shape lift conflicts feeding CG036, entity-index validation feeding CG037–CG041, generated-name collision detection feeding CG042–CG044, and nested-type rejection feeding CG045. These produce *issue models* on the graph, not diagnostics.
+- **Inside `Pipeline/ModelValidation.Validate`.** Everything else, plus the rendering of every linker issue model into a `PendingDiagnostic`. The bulk of the per-table validation (CG001, CG008, CG022, CG024–CG028) lives here in long sequential loops; cross-aggregate reference checks (CG021), composition-root presence (CG018/CG019), and per-aggregate parent-reachability (CG020) also live here. `Validate` is a pure function of the `ModelGraph`: it returns the pending-diagnostics list (value-equatable, position-independent) plus the fail-closed emitter-skip flags. `ModelGenerator.Emit` calls it only for the flags; the *reporting* happens in the separate diagnostics output, which resolves each pending diagnostic's declaration key against the location map and calls `spc.ReportDiagnostic` with a real source location (see [Diagnostic source locations](#diagnostic-source-locations)). The one exception: CG029–CG031 are still reported (at `Location.None`) from inside `RelationVariantEmitter` on the emit path.
 
-Most contributors adding a diagnostic want the `ModelGenerator.Emit` layer — the model is fully linked, the source-production-context is in hand, and the convention is established. Add a descriptor in `Pipeline/Diagnostics.cs` and a `spc.ReportDiagnostic(...)` call at the appropriate loop body.
+Most contributors adding a diagnostic want the `ModelValidation.Validate` layer — the model is fully linked and the convention is established. Add a descriptor in `Pipeline/Diagnostics.cs` and an `Add(pending, ...)` call at the appropriate loop body, passing `typeKey:` (and `memberName:` where the check is per-property) so the diagnostic lands on the offending declaration.
 
 Main emitter responsibilities:
 
@@ -132,12 +135,49 @@ The fully-linked output of `RelationLinker.Build` is a `ModelGraph` record with 
 | `SharedShapeLiftConflicts` | Per-variant shared-shape merge conflicts reported as CG036. |
 | `Indexes` | Valid entity indexes grouped by user-defined index attribute type. Feeds `SchemaEmitter`. |
 | `IndexIssues` | Entity-index validation failures reported as CG037–CG041. |
+| `NameCollisions` | Generated-name collisions (physical table name / edge name / aggregate-root simple name) reported as CG042–CG044. Participants are sorted; `IsCollisionLoser` gives emitters the deterministic "first wins" skip set. |
+| `NestedTypeIssues` | Nested `[Table]` / `[CompositionRoot]` declarations reported as CG045 (already filtered out of `Tables` / `CompositionRoots`). |
+| `RecordTypeIssues` | `[Table]` / `[CompositionRoot]` / on-class relation kind attributes applied to `record` declarations, reported as CG048 (filtered out of the graph). |
+| `GenericTableIssues` | Generic `[Table]` classes, reported as CG049 (filtered out of `Tables` — the physical table name ignores type arguments). |
+| `RelationVariantIssues` | Malformed relation variants (duplicate `[In]`/`[Out]`/`[Id]` roles → CG046; endpoints unresolved after the shared-shape lift → CG047), filtered out of `RelationVariants`. |
 | `Aggregates` | Per-`[AggregateRoot]` membership, computed by `[Children]` BFS from each root. |
 | `AggregateConflicts` | `"Member\|Root1,Root2,…"` strings for CG011 (member reachable from 2+ roots). |
 | `CascadeCycles` | Cycle path strings for CG014. |
 | `CompositionRoots` | The user's `[CompositionRoot]` classes — usually 0 or 1; CG018 fires when >1. |
 
 `ModelGraph` also exposes helper methods (`FindUnionEndpoint`, `BuildTableIndex`, `BuildKindIndex`, `FindKind`, `PairedInverse`, `UnionsForTable`, `TargetTypeFor`) that emitters call. None of these mutate the graph; they all recompute on the fly.
+
+## Diagnostic source locations
+
+CG diagnostics point at the offending declaration (the `[Table]` class, the mis-annotated property, the duplicate `[In]` attribute) instead of `Location.None`. Doing this naively violates the incremental contract, so read this before touching anything location-related.
+
+**The core tension.** A source location is `(file path, text span, line span)` — all primitives, trivially equatable via `Model/LocationInfo.cs`. But *equatable* is not the same as *cache-safe*: a `LocationInfo` on a model record makes that model's equality **position-sensitive**. Any edit above the declaration (a comment, a using, a whitespace line) shifts the span, changes equality, recomputes the graph node, and re-fires every emitter — a silent full-rebuild regression on every keystroke. Tranche 2 (see the `IndexAnnotationModel` entry in `notes.md`) removed exactly this shape from the pipeline and pinned it with a `trackIncrementalGeneratorSteps` regression test; do not reintroduce it.
+
+Locations therefore live only where positions can't hurt caching, via two mechanisms:
+
+1. **Issue models embed exact locations.** `NestedTypeIssueModel` / `RecordTypeIssueModel` / `GenericTableIssueModel` / `RelationVariantIssueModel` (CG045–CG049) carry a `LocationInfo?` captured at extraction from the declaration's identifier token — or, where more precise, from the attribute's application syntax (CG046 points at the duplicate `[In]`, not the class). These models only exist when the build is already failing, so re-runs cost nothing on the healthy path. The carrier fields on the *healthy* models (`TableModel.IssueLocation`, `CompositionRootModel.IssueLocation`, `RelationVariantModel.IssueLocation`/`DuplicateRoles`) MUST stay `null`/empty unless the extractor already knows the declaration will be rejected — that invariant is what keeps healthy-model equality position-independent.
+2. **Healthy-model diagnostics resolve through a split output.** Diagnostics computed from healthy `TableModel`s (CG001, CG011, CG017/CG020/CG021, CG022–CG028, the CG037–CG044 linker families, CG050–CG056, …) never get embedded locations — that would put positions on models every emitter consumes. Instead:
+   - `ModelValidation.Validate(graph)` produces position-independent `PendingDiagnostic`s carrying a symbolic `TypeKey` (`NormaliseFullName` format) and optional `MemberName`.
+   - `DeclarationLocationExtractor` — a separate, syntax-only stream — maps every type declaration (and attributed property) to its identifier `LocationInfo`. This stream is position-sensitive by design.
+   - A `Locate` node combines the two into `LocatedDiagnostic`s, and a **dedicated `RegisterSourceOutput`** reports them. The emit output's input remains the `ModelGraph` alone.
+
+```text
+graph (position-independent) ──────────────► RegisterSourceOutput (emitters)
+  │
+  └─ Select(Validate → PendingDiagnostics)
+       │ Combine
+declaration-location map (position-SENSITIVE, syntax-only)
+       │
+       └─ Select(Locate → LocatedDiagnostics) ─► RegisterSourceOutput (diagnostics)
+```
+
+**Cache behavior, by case:**
+
+- *Position-only edit, no diagnostics:* graph value-equal → emitters cached. The location map changes and `Locate` re-runs, but resolves to an empty set that is value-equal to the previous run's → the diagnostics output is cached too. (This is why the trivia-edit regression test can keep asserting "every output cached".)
+- *Position-only edit, live diagnostics:* emitters still cached; only the diagnostics output re-runs, so the reported line tracks the edit. Pinned by `EmissionShapeTests.DiagnosticLocations_DoNotBustEmitOutput_OnPositionOnlyEdits`.
+- *Failing build with issue models:* the embedded `LocationInfo` makes the graph position-sensitive — acceptable by construction, since the build is failing anyway and emission is already suppressed for the offenders.
+
+**Rehydration.** At report time `LocationInfo.ToLocation()` calls `Location.Create(path, textSpan, lineSpan)` — an *external-file* location that carries no syntax tree, so the driver accepts it without the tree being part of the compilation and no Roslyn object is ever retained in a model. Never store `Location`, `ISymbol`, or `SyntaxNode` in anything under `Model/`.
 
 ## AnnotationsMetadata lockstep rule
 
@@ -463,8 +503,8 @@ Cookbook for the four most common contributor changes.
 ### Add a new diagnostic
 
 1. **`Pipeline/Diagnostics.cs`** — add a `public static readonly DiagnosticDescriptor` entry. Pick a stable `CGxxx` id (next free in sequence; see [`api.md`](api.md#diagnostics) for the current map). Severity is usually `Error`; `Warning` for "this works but probably isn't what you meant" cases.
-2. **The report site** — usually a `spc.ReportDiagnostic(Diagnostic.Create(Diagnostics.YourDescriptor, Location.None, ...))` call inside the appropriate loop in `ModelGenerator.Emit`. Earlier-stage reports (linker, extractor) are rarer; prefer Emit unless you genuinely need to short-circuit downstream work.
-3. **Both a positive and negative test** in `DiagnosticsTests.cs`.
+2. **The compute site** — an `Add(pending, Diagnostics.YourDescriptor, typeKey: ..., memberName: ..., args: [...])` call inside the appropriate loop in `Pipeline/ModelValidation.Validate`. Pass the declaration's full name as `typeKey` (plus `memberName` for per-property checks) so the diagnostics output can point it at the right declaration via the location map; only pass `exactLocation:` when the value comes from an issue model captured at extraction (see [Diagnostic source locations](#diagnostic-source-locations) — never put a `LocationInfo` on a healthy model to get one). If the diagnostic must also suppress emission, wire the skip into `ValidationResult` the way CG001/CG008/CG020 do.
+3. **Both a positive and negative test** in `DiagnosticsTests.cs` — and assert the reported location with `AssertLocationAt(...)` for at least the positive case.
 4. **Add the row to the diagnostics table in [`api.md`](api.md#diagnostics).** The api doc is the user-facing index; keep it in sync.
 
 ### Add a new emitter

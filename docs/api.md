@@ -21,11 +21,14 @@ The doc is organised top-down: packages → modeling attributes → what gets em
 | `[AggregateRoot]` | `[Table]` class | Marks the root of a loadable aggregate. Members are discovered through `[Children]`. |
 | `[CompositionRoot]` | partial class | Receives generated `Load{Root}Async`, `Schema`, `ApplySchemaAsync`, `ReferenceRegistry`, `Query`, and `Hydrate` members. Exactly one is allowed per compilation. |
 | `[Id]` | partial property | Optional public typed-id accessor. At most one per table. If omitted, the generator still emits an internal id anchor. |
-| `[Property]` | partial property | Persisted scalar field, or inline element collection (`IReadOnlyList<T>` / `IList<T>` / `List<T>` of records). |
+| `[Property]` | partial property | Persisted scalar field, or element collection (`IReadOnlyList<T>` / `IList<T>` / `List<T>` of scalars or records). |
 | `[Reference]` | partial property | Record reference. Non-nullable get-only references are mandatory; nullable settable references are optional. |
 | `[Inline]` | with `[Reference]` | Hydrates the referenced record inline with its owner. Without `[Inline]`, only the referenced id is hydrated. |
 | `[Parent]` | partial property | Parent link for aggregate hierarchy. |
 | `[Children]` | partial get-only collection | Reverse lookup over child records. |
+| `[CreatedAt]` | with `[Property]` | Audit column: the emitted `SaveAsync` stamps the field with the save instant on CREATE dispatch only; UPDATE keeps the loaded value. Non-nullable `DateTimeOffset` or `DateTime`; get-only recommended (the library writes the backing field). At most one per table. |
+| `[UpdatedAt]` | with `[Property]` | Audit column: stamped with the save instant on every dispatch — CREATE stamps it to the same instant as `[CreatedAt]`. Same shape rules as `[CreatedAt]`. Instant source is `ISaveContext.UtcNow` (injectable). |
+| `[Version]` | with `[Property]` | Optimistic-concurrency counter: CREATE dispatches `1`; UPDATE dispatches `n+1` guarded by `WHERE version = $expected` and throws `SurrealVersionConflictException` when the guard matches no row; on success the in-memory value bumps to `n+1`. Non-nullable `int` or `long`; get-only recommended. At most one per table. |
 | `IndexAttribute` | base class for user-defined property attributes | Standard entity index marker. Derive a parameterless attribute and apply it to one or more persisted fields. |
 | `UniqueIndexAttribute` | base class for user-defined property attributes | Unique entity index marker. Same grouping rules as `IndexAttribute`, but generated DDL includes `UNIQUE`. |
 | `[Reject]` | with `[Reference]` | Schema-level: SurrealDB blocks deletion of the target while this reference points at it. Default behavior. |
@@ -77,6 +80,32 @@ V1 rules:
 - Composite fields for one index must live in the same partial type declaration so that order is stable.
 - Unique indexes over nullable fields are rejected in this first cut.
 - Schema names are `idx_{table}_{attribute}` or `uq_{table}_{attribute}`, stripping the `Attribute` suffix and snake-casing both parts.
+
+### Audit columns and optimistic concurrency
+
+`[CreatedAt]` / `[UpdatedAt]` / `[Version]` are library-managed value overlays on ordinary scalar `[Property]` fields — the user picks the names; the emitted `SaveAsync` writes the backing fields, so get-only declarations are the natural shape:
+
+```csharp
+[Table]
+public partial class Document
+{
+    [Id] public partial DocumentId Id { get; set; }
+    [Property] public partial string Title { get; set; }
+
+    [CreatedAt, Property] public partial DateTimeOffset CreatedAtUtc { get; }
+    [UpdatedAt, Property] public partial DateTimeOffset UpdatedAtUtc { get; }
+    [Version, Property]   public partial int Version { get; }
+}
+```
+
+Semantics per dispatch of the emitted `SaveAsync`:
+
+- **CREATE** (entity not yet in the DB): created and updated are stamped with the *same* instant (one `ISaveContext.UtcNow` read per dispatch); version dispatches as `1`.
+- **UPDATE**: only updated refreshes — created keeps its loaded value. The whole-entity content dispatches as `UPDATE record:id CONTENT { …, version: n+1 } WHERE version = $expected`. If the guard matches no row, another writer bumped the version since this session loaded: the emitted body throws `SurrealVersionConflictException` (carrying `EntityId` + `ExpectedVersion`) before `MarkSaved`, the session fail-closes, and the caller reloads + retries. Only a confirmed match bumps the in-memory `Version` to `n+1`.
+
+The version guard complements the substrate's `SurrealConflictException` (MVCC, concurrent *in-flight* transactions at COMMIT): `[Version]` covers the human-scale lost-update window where the two writers' transactions never overlap.
+
+Rules (each backed by a diagnostic): must be combined with `[Property]` (CG052 — the field reuses the standard scalar schema/hydrate/save paths, unlike `[Id]` which is a standalone role); audit fields are non-nullable `DateTimeOffset`/`DateTime` and version is non-nullable `int`/`long` (CG053); at most one property per marker per table (CG054); the three markers are mutually exclusive on one property (CG055). `DateTime`-typed audit fields store `UtcDateTime` (Kind=Utc, host-independent). The instant source is `ISaveContext.UtcNow` — a default interface member returning `DateTimeOffset.UtcNow` that test fakes override for deterministic clocks.
 
 ## Generated Entity API
 
@@ -286,11 +315,15 @@ Conflicts at COMMIT surface as `Disruptor.Surreal.SurrealConflictException`. The
 
 ## Query API
 
-Five terminal verbs share one query AST. Every terminal accepts either `Surreal db` (read-only) or `Transaction tx` (in-txn read with full visibility into pending writes from the same transaction):
+The terminal verbs share one query AST. Every terminal accepts either `Surreal db` (read-only) or `Transaction tx` (in-txn read with full visibility into pending writes from the same transaction):
 
 - `IdsAsync(db | tx, ct)` — id-only selection. Returns `IReadOnlyList<{Table}Id>`; no entity hydration, no session. Generator-emitted per `[Table]`.
-- `Select(projection).ExecuteAsync(db | tx, ct)` — projection mode. Returns immutable `IReadOnlyList<TRow>`; no entity hydration, no session. The projection owns the SELECT list and the per-row materialiser.
+- `CountAsync(db | tx, ct)` — server-side count. Compiles to `SELECT count() AS count FROM table … GROUP ALL`; reports the number of rows matching the id pin and filters (ordering/paging ignored, Includes rejected).
+- `ExistsAsync(db | tx, ct)` — existence probe. Compiles to `SELECT id FROM table … LIMIT 1` — cheaper than count because the substrate can stop at the first hit. Like count, reports on the id pin and filters only (ordering/paging ignored, Includes rejected).
+- `Select(projection).ExecuteAsync(db | tx, ct)` — projection mode. Returns immutable `IReadOnlyList<TRow>`; no entity hydration, no session. The projection owns the SELECT list and the per-row materialiser. `FirstOrDefaultAsync` / `SingleAsync` / `SingleOrDefaultAsync` are mirrored on the projection chain with the same semantics as below (returning `TRow?` / `TRow`).
 - `ExecuteAsync(db | tx, ct)` — read mode. Returns hydrated entities; the supporting session is internal and never exposed.
+- `FirstOrDefaultAsync(db | tx, ct)` — read mode, first match or `null`. Same entity SELECT shape and hydration/tracking path as `ExecuteAsync`, with `LIMIT 1` overriding any user `Limit` (`OrderBy` / `Start` still apply, Includes work).
+- `SingleAsync(db | tx, ct)` / `SingleOrDefaultAsync(db | tx, ct)` — read mode, exactly-one match. Compile with `LIMIT 2` (enough to detect ambiguity without pulling the full result set); both throw `InvalidOperationException` on more than one match; on zero matches `SingleAsync` throws while `SingleOrDefaultAsync` returns `null`.
 - `LoadAsync(db | tx, ct)` — write-mode session. Returns a `SurrealSession` you mutate and dispatch via `SaveAsync`. Only emitted on `SurfaceQuery<TRoot>` where `TRoot.IsAggregateRoot`.
 - `Workspace.Hydrate.{Table}(ids).WithInclude(…).ExecuteAsync(db | tx, ct)` — hydration terminal. Takes a list of ids (typically from `IdsAsync`), materialises each into a tracked `SurrealSession` along with any included slices.
 
@@ -321,10 +354,22 @@ public static class ConstraintQ
 
 | Method | SurrealQL output |
 | --- | --- |
-| `Eq(T value)` | `field = $pN` |
+| `Eq(T value)` | `field = $pN` (`Eq(null)` compiles to the unset test `(field IS NONE OR field IS NULL)`) |
 | `Lt`/`Le`/`Gt`/`Ge(T value)` | `field {<,<=,>,>=} $pN` |
 | `In(params T[] values)` / `In(IEnumerable<T>)` | `field IN $pN` |
-| `Contains(string substring)` (extension on `PropertyExpr<string>`) | `string::contains(field, $pN)` |
+| `NotIn(params T[] values)` / `NotIn(IEnumerable<T>)` | `field NOT IN $pN` |
+| `Between(T lower, T upper)` | `(field >= $pN AND field <= $pM)` |
+| `IsNone()` / `IsNotNone()` | `(field IS NONE OR field IS NULL)` / `(field IS NOT NONE AND field IS NOT NULL)` |
+
+String extensions (on `PropertyExpr<string>`; the `string::` functions are guarded with `field != NONE` so one unset `option<string>` row can't fail the whole SELECT):
+
+| Method | SurrealQL output |
+| --- | --- |
+| `Contains(substring)` | `(field != NONE AND string::contains(field, $pN))` |
+| `StartsWith(prefix)` / `EndsWith(suffix)` | `(field != NONE AND string::starts_with/ends_with(field, $pN))` |
+| `ContainsIgnoreCase` / `StartsWithIgnoreCase` / `EndsWithIgnoreCase` | `(field != NONE AND string::contains/starts_with/ends_with(string::lowercase(field), $pN))` — operand lowercased invariantly in C# |
+| `Matches(pattern)` | `(field != NONE AND string::matches(field, $pN))` — regex via SurrealDB's `string::matches`; the `~`/`?~` operators are *fuzzy* match, not regex, and are not used |
+| `IsNullOrEmpty()` / `IsNotNullOrEmpty()` | `(field IS NONE OR field IS NULL OR field = '')` / `(field IS NOT NONE AND field IS NOT NULL AND field != '')` |
 
 Compose via `Predicate.And(...)`, `Predicate.Or(...)`, `Predicate.Not(...)`.
 
@@ -358,11 +403,22 @@ public sealed class SurfaceQuery<T> where T : class, IEntity, new()
     public Task<IReadOnlyList<T>> ExecuteAsync(Disruptor.Surreal.SurrealClient db, CancellationToken ct = default);
     public Task<IReadOnlyList<T>> ExecuteAsync(Disruptor.Surreal.SurrealTransaction tx, CancellationToken ct = default);
 
+    // Scalar / single-row terminals — db and tx overloads each. Count/Exists report on
+    // the id pin and filters only (ordering/paging ignored, Includes rejected);
+    // First/Single hydrate through the same tracking path as ExecuteAsync.
+    public Task<long> CountAsync(db | tx, CancellationToken ct = default);
+    public Task<bool> ExistsAsync(db | tx, CancellationToken ct = default);
+    public Task<T?> FirstOrDefaultAsync(db | tx, CancellationToken ct = default);   // LIMIT 1, overrides user Limit
+    public Task<T> SingleAsync(db | tx, CancellationToken ct = default);            // LIMIT 2; throws on 0 and on >1 matches
+    public Task<T?> SingleOrDefaultAsync(db | tx, CancellationToken ct = default);  // LIMIT 2; null on 0, throws on >1
+
     // Compile to SurrealQL + typed-CBOR bindings without executing. The library uses
     // these internally; consumers reach for them when they want to inspect or splice
     // the rendered query before sending.
     public (string Sql, SurrealObject Bindings) Compile();
     public (string Sql, SurrealObject Bindings) CompileIdsOnly();   // SELECT id FROM table …; throws if Includes present
+    public (string Sql, SurrealObject Bindings) CompileCount();    // SELECT count() AS count FROM table … GROUP ALL; throws if Includes present
+    public (string Sql, SurrealObject Bindings) CompileExists();   // SELECT id FROM table … LIMIT 1; throws if Includes present
 }
 ```
 
@@ -397,11 +453,13 @@ var results = await Workspace.Query.CodeSymbols
 
 The library does **not** generate projection types; the user owns the `TRow` shape and the materialise lambda. At construction time the lambda runs once with a probe row that captures each `Read(PropertyExpr<T>)` call into the SELECT field list (in first-read order). At query time the lambda runs once per row with a `Value`-backed row that decodes each value through `HydrationValue`.
 
+Besides `ExecuteAsync`, the projection chain carries the single-row terminals: `FirstOrDefaultAsync(db | tx, ct)` (`LIMIT 1`, returns `TRow?` — `default` when nothing matches), `SingleAsync` and `SingleOrDefaultAsync` (`LIMIT 2`; throw `InvalidOperationException` on more than one match; zero matches throws for `SingleAsync`, returns `default` for `SingleOrDefaultAsync`). `ExistsAsync`/`CountAsync` are not mirrored — existence and count don't depend on the projected shape; call them on the underlying `SurfaceQuery<T>` before `.Select(...)`.
+
 Constraints:
 - The lambda must call `row.Read(...)` at least once.
 - The target type's constructor must accept default values during the probe — typically a positional record with no inline validation.
 - `Include*` calls before `.Select(...)` are rejected — projections are flat by definition. Use `ExecuteAsync` directly if you need traversal.
-- Field reads must be unconditional (no branches that skip `row.Read(...)`); discovery captures only the fields the lambda touches on the probe pass.
+- Field reads **must be unconditional**: the discovery probe runs the lambda exactly once with default values, so a `row.Read(...)` behind a branch the default-valued probe doesn't take is silently never discovered — the column is missing from the wire SQL and every real row reads `default` for it. Read all fields up front, then branch on the values.
 - v1 supports primitive scalars + nullables. Typed ids and complex types defer until a real callsite needs them.
 
 ### Hydration — `Workspace.Hydrate.{Table}(ids)`
@@ -489,6 +547,8 @@ var rows = await Workspace.Query.Designs
 
 Forward and inverse relation traversals are exposed via `IncludeRelationNode` — see below. Plain (non-`Inline`) `[Reference]` traversals are not exposed; the loader pulls them as id-only and there's no v1 read shape for arbitrary record links beyond the inline form.
 
+Two includes at the same query level that would project under the same response alias (a children-include's child table / a relation-include's slice key) are rejected at compile time with `InvalidOperationException` naming the duplicate — SurrealDB keeps only one `AS alias` column per name, so one subselect would otherwise silently clobber the other in the response.
+
 ### Relation traversal — `IncludeRelationNode`
 
 Per relation property the generator emits one `Include{Name}` method on the entity's traversal builder and a matching extension on `SurfaceQuery<T>`. Three shapes:
@@ -547,18 +607,25 @@ The aliases exist because `WhereIn` / `WhereOut` are easy to misread as "incomin
 
 (`SurfaceEdgeQuery<TIn, TOut>` was called `EdgeQuery<TIn, TOut>` before the preview.43 `Surface*` prefix rename.)
 
-### Edge payload predicate factory — via the variant `{Variant}Q`
+### Edge payload predicates — `SurfaceEdgeQuery.Where` with a hand-built `PropertyExpr<T>`
 
-Variant classes are entities, so payload columns are addressable through the standard per-table `{Variant}Q` factory and the entity query API — no separate edge-specific factory. `EdgePredicateFactoryEmitter` and the legacy `{Kind}EdgeQ` static class were removed in preview.51; payload predicates now flow through `Workspace.Query.{Variant}.Where(...)` the same way every other entity query does. `Workspace.Query.Edges.{Kind}` (the flat `(Source, Target)` row terminal) keeps non-payload `WhereIn` / `WhereOut` filters; for payload-aware queries, query the variant table:
+There is **no generated predicate factory for edge payload fields** today. `Workspace.Query.{Table}` accessors and `{Name}Q` factories are emitted per `[Table]` only — relation variants are not tables, so neither `Workspace.Query.{Variant}` nor `{Variant}Q` exists (`EdgePredicateFactoryEmitter` and the legacy `{Kind}EdgeQ` static class were removed in preview.51 without a generated replacement).
+
+What does exist: `Workspace.Query.Edges.{Kind}` returns the flat `(Source, Target)` `SurfaceEdgeQuery`, whose `Where(IPredicate)` AND-merges an arbitrary predicate into the compiled `WHERE` alongside the `WhereIn` / `WhereOut` side filters, and whose `OrderBy` / `ThenBy` take any `PropertyExpr<T>`. To filter or order on an edge payload column, construct the `PropertyExpr<T>` yourself with the snake_cased SurrealDB field name (the same name the schema's `DEFINE FIELD` uses on the edge table):
 
 ```csharp
-var calls = await Workspace.Query.CodeSymbolUsesCodeSymbol
-    .Where(CodeSymbolUsesCodeSymbolQ.Kind.Eq("call"))
-    .Where(CodeSymbolUsesCodeSymbolQ.Source.Eq(symbolId))
-    .OrderBy(CodeSymbolUsesCodeSymbolQ.Line)
+var kind = new PropertyExpr<string>("kind");   // payload column `kind` on the edge table
+var line = new PropertyExpr<int>("line");
+
+var calls = await Workspace.Query.Edges.Uses
+    .OutgoingFrom([symbolId])
+    .Where(kind.Eq("call"))
+    .OrderBy(line)
     .Limit(50)
     .ExecuteAsync(db);
 ```
+
+The result rows are `(Source, Target)` id pairs — payload values are filterable/orderable but not returned; hydrate the variant entities via the session APIs when you need the payload itself.
 
 
 ### `LoadAsync`
@@ -614,7 +681,13 @@ catch (LoadShapeViolationException)
 }
 ```
 
-`FetchAsync` is a slice widener: existing entities re-Hydrate (overwriting scalar fields with the DB row); brand-new entities go through the include's full Hydrate. Slices listed in the extension query's `Includes` are marked loaded. **Caveat:** if you've mutated an entity in memory and Fetch re-hydrates it, your edits get clobbered — Save first or accept the clobber. Per-field "did the user touch this" tracking was deliberately removed under the explicit-Save model. Closed sessions throw `InvalidOperationException`.
+`FetchAsync` is a slice widener: the pinned root re-Hydrates over the tracked instance (overwriting scalar fields with the DB row); nested include rows hydrate new children / relation targets as needed. Slices listed in the extension query's `Includes` are marked loaded. **Caveat:** if you've mutated an entity in memory and Fetch re-hydrates it, your edits get clobbered — Save first or accept the clobber. Per-field "did the user touch this" tracking was deliberately removed under the explicit-Save model. Closed sessions throw `InvalidOperationException`.
+
+**Enforced contract** — Fetch never invents new aggregate roots:
+
+- The query **must** pin a root id via `WithId(...)`. A pin-less query (`.Where(...).Limit(n).Include*(...)`) throws `ArgumentException` before any wire dispatch; the session stays open (pure API misuse, same stance as `UnrelateAsync`'s both-null guard).
+- The pinned id **must already be tracked** in the session. An unknown pin throws `InvalidOperationException` before dispatch and closes the session with `SessionCloseKind.RejectedFetch` — a fetch rooted at an id the snapshot doesn't hold means the caller's view of the session is already wrong.
+- Any returned **root** row whose id differs from the pin is rejected before it hydrates: the session closes (`SessionCloseKind.FetchFailed`) and the foreign row is not tracked. Only the root is guarded — nested includes still hydrate freely.
 
 ```csharp
 public Task FetchAsync<T>(
@@ -711,7 +784,9 @@ DEFINE FIELD IF NOT EXISTS line ON uses TYPE int DEFAULT 0;
 DEFINE FIELD IF NOT EXISTS run_id ON uses TYPE string DEFAULT "";
 ```
 
-Every relation table gets `DEFINE INDEX … UNIQUE` on `(in, out)` and is declared `TYPE RELATION ENFORCED`. The variant's `SaveAsync` body uses `INSERT RELATION INTO {edge} $_content ON DUPLICATE KEY UPDATE field = $_p_field, …` so re-saving the same `(in, out)` pair refreshes payload (or no-ops when the variant has no `[Property]` members). The `RELATION` keyword satisfies `TYPE RELATION ENFORCED` (which `UPSERT` does not).
+Every relation table gets `DEFINE INDEX … UNIQUE` on `(in, out)` and is declared `TYPE RELATION ENFORCED`. The variant's `SaveAsync` body uses `INSERT RELATION INTO {edge} $_content ON DUPLICATE KEY UPDATE field = $_p_field, …` so re-saving the same `(in, out)` pair refreshes payload (or no-ops when the variant has no `[Property]` members). The `RELATION` keyword satisfies `TYPE RELATION ENFORCED` (which `UPSERT` does not). Nullable payloads set to `null` bind an explicit `NONE` for their `$_p_{field}` duplicate-update variable (the `$_content` insert path omits the field so the schema `DEFAULT` applies; the update path converges to the same NONE state — and a variable the SET clause always references must always be bound).
+
+**Edge ids are deterministic.** When a variant has no assigned id at save time, its id anchor derives one from the `(in, edge, out)` triple via `RecordId.ForEdge` — `HashText("{source}|{edge}|{target}")`, a hash-form value the per-kind `{Kind}Id` validation accepts. The same endpoint pair yields the same edge id on every save, so the `UNIQUE (in, out)` duplicate path updates exactly the row id the session records via `MarkSaved` — re-save is replay-replace, with no id drift between session and substrate. Precedence: a hydrated id or a user-assigned value wins; a variant may declare `[Id] public partial {Kind}Id Id { get; set; }` to assign one explicitly (mutation is refused once the variant is session-bound). Endpoints still unset when the id is first read fall back to a random Ulid mint — the save path fails before dispatch in that case, so the fallback id never lands.
 
 ### Runtime calls
 
@@ -842,8 +917,8 @@ public partial class CallsRelation : ICodeSymbolEdge
 }
 
 // Empty-body variant (preview.56+) — inherits the full shape from the interface.
-[References]
-public partial class ReferencesRelation : ICodeSymbolEdge;
+[RefersTo]
+public partial class RefersToRelation : ICodeSymbolEdge;
 ```
 
 #### Call site — `Create<TKind>` factory
@@ -867,7 +942,7 @@ public static partial I Create<TKind>(System.Action<I> init)
     where TKind : IRelationKind;
 ```
 
-The body is an if-chain dispatching on `typeof(TKind)` — `new CallsRelation()` for `Calls`, `new ReferencesRelation()` for `References`, etc. — runs the user's initialiser, then returns the instance. An unknown `TKind` throws `InvalidOperationException`.
+The body is an if-chain dispatching on `typeof(TKind)` — `new CallsRelation()` for `Calls`, `new RefersToRelation()` for `RefersTo`, etc. — runs the user's initialiser, then returns the instance. An unknown `TKind` throws `InvalidOperationException`.
 
 #### Composition — split contracts across the interface chain
 
@@ -966,18 +1041,20 @@ Async dispatch methods (talk to SurrealDB through an app-owned `Transaction`):
 | Method | Purpose |
 | --- | --- |
 | `SaveAsync(IEntity entity, Transaction tx, ct)` | Per-entity Save. Auto-binds the entity, walks forward dependencies (Reference / Parent), dispatches a whole-entity `CREATE/UPDATE record:id CONTENT { ... }`, walks new children. **Relation variants are entities too** — passing a variant instance (`new ConstraintRestrictsUserStory { Source = …, Target = … }`) routes through the variant's emitted `IEntity.SaveAsync` body, which dispatches `INSERT RELATION INTO {edge} $_content [ON DUPLICATE KEY UPDATE …]` and updates the in-memory edge index so subsequent `QueryOutgoing` / `QueryIncoming` reads see the new edge. The user picks what to save; the library does no change tracking. |
+| `SaveAsync(IEnumerable<IEntity> entities, Transaction tx, ct)` | Batch Save. Same semantics as one `SaveAsync(entity, tx)` call per element (forward-dependency walk, children walk, auto-bind + `Initialize`, `MarkSaved` promotion across elements — later elements see earlier ones as tracked), but batches the wire: contiguous plain CREATEs of new entities on the same table coalesce into one `INSERT INTO $_table $_records` statement (CBOR array binding, per-record `id` embedded — new `[Version]` entities batch too, seeded at `1`). Anything else — UPSERTs of tracked entities, `[Version]`-guarded UPDATEs (each needs its own empty-result conflict check), relation-variant `INSERT RELATION` — flushes the buffer and dispatches immediately in original order, so no statement is ever deferred past one that could depend on it. A run of one flushes as the single-save-identical `CREATE`. One logical operation: any failure closes the session with `SessionCloseKind.BatchSaveFailed` (stamped with the element in flight). Empty enumerable is a no-op. |
 | `DeleteAsync(IEntity entity, Transaction tx, ct)` | Run `OnDeleting`, dispatch a single `DELETE`, remove from the in-memory snapshot. |
 | `UnrelateAsync<TKind>(source?, target?, tx, ct)` | Direct `DELETE`-edge dispatch. At least one endpoint non-null; one-side-null is the bulk form (every matching edge of the kind, persisted-or-not). |
 | `QueryVariantsOutgoingAsync<TVariant>(srcId, tx \| db, ct)` / `QueryVariantsIncomingAsync<TVariant>(tgtId, tx \| db, ct)` | Async traversal returning hydrated variant entities. Tracked in the session, edges mirrored in `state.Edges`. `IEntity` convenience overloads accept a source/target entity directly. |
 | `QueryOutgoingAsync<TKind, TTarget>(srcId, tx \| db, ct)` / `QueryIncomingAsync<TKind, TTarget>(tgtId, tx \| db, ct)` | Async traversal returning target entities directly (skips variant materialisation); not auto-tracked. Same `IEntity` convenience overloads. |
 | `QueryVariantsAsync<TVariant>(sql, bindings, tx \| db, ct)` | Raw-SQL escape hatch for variant traversal that doesn't fit the canonical shape. |
-| `FetchAsync<T>(SurfaceQuery<T> query, db \| tx, ct)` | Top-up extension query — partial-merge hydrate into the existing session, mark Included slices loaded. Pending writes always win. |
+| `FetchAsync<T>(SurfaceQuery<T> query, db \| tx, ct)` | Top-up extension query — partial-merge hydrate into the existing session, mark Included slices loaded. Requires the query to pin an already-tracked root via `WithId(...)` (see "Strict-with-escape"); never invents new aggregate roots. Pending writes always win. |
 
 Lifecycle:
 
 - The session stays open across multiple Save/Delete/Relate dispatches — feel free to dispatch into one `tx`, commit it, dispatch into another `tx`, etc.
 - Any exception during a dispatch closes the session (`IsClosed` becomes `true`); subsequent operations throw `InvalidOperationException`.
 - `Abandon()` closes the session explicitly.
+- `CloseReason` (a `SessionCloseReason?` — `null` while open) records **why** the session closed: the closing operation (`SessionCloseKind`: `Abandoned`, `SaveFailed`, `BatchSaveFailed`, `DeleteFailed`, `RejectedDelete`, `UnrelateFailed`, `FetchFailed`, `QueryFailed`), the entity/edge id being operated on where one was available (`EntityId`), and the original exception (`Cause` — the failing call threw it unwrapped; this is the diagnostic echo). The first close wins: abandoning a session that already failed a Save keeps reporting the Save failure. The closed-session `InvalidOperationException` message embeds `CloseReason.Summary`, e.g. `This SurrealSession is closed (SaveAsync of designs:x failed: SurrealRpcException: …). Sessions are one-shot — load a new session for further work.`
 - The transaction lifecycle is the app's responsibility — the library never opens or commits transactions on your behalf.
 
 ### `RecordIdFormat`
@@ -1024,9 +1101,14 @@ var parsed  = RecordId.Parse("designs:01J...");                             // r
 var symbol  = RecordId.FromText("symbols", "Disruptor.Surface.Runtime.SurrealSession");
 var tagged  = RecordId.FromText("symbols", "ICodeSymbol", prefix: 'i');     // "symbols:i_<hash>"
 
-// Idempotent edge id sentinel — resolves to a deterministic hash of the linkage
-// triple at emit time. Used by Session.Relate<TKind> as the default edge id.
-var edge    = RecordId.Idempotent("uses");
+// Deterministic edge id — HashText("{src}|{edge}|{tgt}"). This is the derivation the
+// emitted variant SaveAsync path applies automatically when no id was assigned.
+var edge    = RecordId.ForEdge("uses", srcId, tgtId);
+
+// Idempotent edge id sentinel — for hand-minted content-addressed edge ids; collapse
+// via Resolve (same ForEdge scheme). Un-resolved sentinels dispatch with no explicit
+// id (the substrate mints a random one), so resolve before use.
+var deferred = RecordId.Idempotent("uses").Resolve(srcId, tgtId);
 ```
 
 Important members:
@@ -1038,7 +1120,8 @@ Important members:
 - `From(IRecordId id)` — collapse a typed id (or any `IRecordId`) to a canonical `RecordId`.
 - `New(table, value?)` — fresh ulid-backed id.
 - `FromText(table, text, prefix?)` — deterministic content-addressed id; convenience over `RecordIdFormat.HashText`.
-- `Idempotent(table)` — deferred sentinel that resolves to `HashText("{src}|{table}|{tgt}")` at emit time.
+- `ForEdge(edgeTable, source, target)` — deterministic edge id, `HashText("{src}|{edgeTable}|{tgt}")`; the variant save path's automatic derivation.
+- `Idempotent(table)` — deferred sentinel for hand-minted edge ids; collapse via `Resolve(source, target)` (delegates to `ForEdge`).
 - `TryParse(...)`
 - `IsForTable(table)`
 
@@ -1065,6 +1148,13 @@ The generator walks `Scenario`'s public scalar properties at codegen time (no `[
 
 Per-element schema lands as `array<object>` plus per-member `field.*.member` sub-field DDL.
 
+Element-type rules (enforced at build time):
+
+- **Primitive/scalar elements** (`IReadOnlyList<string>`, `List<int>`, any mappable scalar) are supported directly: schema is `array<{scalar}> DEFAULT []`, save writes the whole list (empty list round-trips as `[]`), hydrate repopulates the backing list.
+- **Record/POCO elements** must be reconstructible: either a public constructor matches the persistable members positionally by name + type (the positional-record shape above), or the type has a public parameterless constructor and every persistable member is settable (hydrate then uses an object initializer). Persistable members are public, instance, non-indexer, readable, schema-mappable properties; get-only computed members of unmappable types are ignored (derived, not stored).
+- Unsupported element types (unmappable scalars, nullable elements like `IReadOnlyList<int?>`, unconstructible shapes, or types with writable unmappable members that would silently drop data) are rejected with **CG050**.
+- Element collections are **get-only**: a declared setter is rejected with **CG051** — mutate through the generated `Add{Singular}` / `Remove{Singular}` / `Clear{Name}` helpers.
+
 ### `HydrationValue`
 
 Value-native helpers used by emitted `IEntity.Hydrate` and the runtime's load/query consumers. All inputs are `Disruptor.Surreal.Values.SurrealValue` — no JSON intermediary.
@@ -1074,7 +1164,7 @@ Value-native helpers used by emitted `IEntity.Hydrate` and the runtime's load/qu
 | `ReadRecordId(SurrealValue v)` | Read any of the wire forms (record-id value / string `"table:value"` / object with `id` field) into a `RecordId`; throws on unrecognised shape. |
 | `TryReadRecordId(SurrealObjectValue parent, string field, out RecordId)` | Try-variant on a named field of a row. |
 | `ReadString(SurrealObjectValue parent, string field, string fallback = "")` | Read a string field with a fallback when missing or not-a-string. |
-| `ReadOrDefault<T>(SurrealObjectValue parent, string field)` | Read a typed field with a default fallback. Handles primitives, nullable wrappers, and arrays / `List<T>` of primitives. Records / POCOs are no longer routed through here — generator-emitted Hydrate bodies build records typed-and-direct. |
+| `ReadOrDefault<T>(SurrealObjectValue parent, string field)` | Read a typed field with a default fallback. Handles primitives, nullable wrappers, `TimeSpan` (from a duration value), enums (from a member-name string, case-insensitive, or an int64 — enums aren't schema-mappable, so stored enum values only arrive from rows written outside the library), and arrays / `List<T>` of primitives. Records / POCOs are no longer routed through here — generator-emitted Hydrate bodies build records typed-and-direct. |
 | `TryReadReferenceId(SurrealObjectValue parent, string field)` | Read a non-Inline `[Reference]` or `[Parent]` id; returns `null` when the field is missing / null / unrecognisable. |
 | `HydrateInlineReference<T>(SurrealObjectValue parent, string field, IHydrationSink sink)` | Construct a `T` from an inline-expanded `[Reference, Inline]` payload and run its `Hydrate`; returns the entity (or null if the field is missing / id-only / already tracked). |
 
@@ -1086,6 +1176,11 @@ Per-entity Save orchestration interface. Passed to generator-emitted `IEntity.Sa
 public interface ISaveContext
 {
     Disruptor.Surreal.SurrealTransaction Transaction { get; }
+
+    // Instant source for [CreatedAt]/[UpdatedAt] stamping. Default interface member
+    // (DateTimeOffset.UtcNow) — the session's private implementation inherits it;
+    // test fakes override it to pin the clock.
+    DateTimeOffset UtcNow => DateTimeOffset.UtcNow;
 
     // True iff `id` is known to exist in the DB — either loaded from a prior Hydrate
     // (loadedAtStart) or already CREATEd in this Save pass. NOT a check on the
@@ -1102,6 +1197,20 @@ public interface ISaveContext
     // through. Adds the entity to the identity map and flips IsTracked for it to
     // true for subsequent calls in the same Save pass.
     void MarkSaved(IEntity entity);
+
+    // Dispatch seam — every wire send an emitted SaveAsync body performs routes
+    // through one of these. The defaults ARE the single-save behavior (immediate
+    // typed dispatch through Transaction); the session's batch SaveAsync overload
+    // substitutes a buffering context that coalesces contiguous same-table plain
+    // creates into one INSERT and flushes before any other dispatch. Only plain
+    // creates batch: DispatchUpsertAsync and DispatchQueryAsync (the [Version]-
+    // guarded UPDATE and the variant INSERT RELATION) always dispatch in order.
+    ValueTask DispatchCreateAsync(RecordId id, SurrealObject content, CancellationToken ct)
+        => new(Transaction.CreateAsync(id.ToSdk(), content, ct));
+    ValueTask DispatchUpsertAsync(RecordId id, SurrealObject content, CancellationToken ct)
+        => new(Transaction.UpsertAsync(id.ToSdk(), content, ct));
+    ValueTask<SurrealQueryResponse> DispatchQueryAsync(string sql, SurrealObject bindings, CancellationToken ct)
+        => new(Transaction.QueryAsync(sql, bindings, ct));
 }
 ```
 
@@ -1166,3 +1275,18 @@ The generator emits diagnostics for invalid model shapes. Most are errors (compi
 | `CG039` | Unique entity index includes a nullable field. |
 | `CG040` | Multiple entity indexes resolve to the same schema name. |
 | `CG041` | The same index attribute appears more than once on one field. |
+| `CG042` | Two `[Table]` classes map to the same physical SurrealDB table name (names are pluralised + snake-cased from the simple class name — covers both `A.Design` + `B.Design` and `Item` + `Items`). |
+| `CG043` | Two forward relation kinds map to the same SurrealDB edge table name (edge names derive from the attribute's simple class name minus the `Attribute` suffix). |
+| `CG044` | Two `[AggregateRoot]` tables share a simple name — the generated aggregate loader, `Load{Name}Async` entry points, and `LoadAsync` extensions are keyed on it. |
+| `CG045` | `[Table]` / `[CompositionRoot]` class is nested inside another type; model classes must be namespace-scoped. |
+| `CG046` | Relation variant declares more than one `[In]` / `[Out]` / `[Id]` member — the singular roles are ambiguous when duplicated. |
+| `CG047` | Relation variant declares or inherits no `[In]` / `[Out]` endpoints (nothing declared on the class and no annotated shared-shape interface supplies them). |
+| `CG048` | `[Table]` / `[CompositionRoot]` / an on-class relation kind attribute applied to a `record` declaration; the generated partial-class implementation halves don't compose with record synthesis — use a `partial class`. |
+| `CG049` | `[Table]` on a generic type; the physical table name ignores type arguments (closed constructions would share one table) and the generated accessors can't name an open generic — make the table non-generic. |
+| `CG050` | Element-collection `[Property]` element type is not supported (not a mappable scalar; nullable element; or not constructible from its public mappable properties). |
+| `CG051` | Element-collection `[Property]` declares a setter; element collections are get-only (the generator emits a read-only view plus `Add{Singular}`/`Remove{Singular}`/`Clear{Name}` mutators). |
+| `CG052` | `[CreatedAt]` / `[UpdatedAt]` / `[Version]` without a scalar `[Property]` role on the same member; the markers overlay a persisted scalar column. |
+| `CG053` | `[CreatedAt]` / `[UpdatedAt]` / `[Version]` property has an unsupported type — the audit pair needs a non-nullable `DateTime`/`DateTimeOffset`, version a non-nullable `int`/`long`. |
+| `CG054` | More than one `[CreatedAt]` (or `[UpdatedAt]`, or `[Version]`) property on one table. |
+| `CG055` | One property carries more than one of `[CreatedAt]`/`[UpdatedAt]`/`[Version]`; the markers prescribe contradictory write behaviors for the same field. |
+| `CG056` | Relation-variant payload `[Property]` type has no SurrealDB scalar mapping; the field is omitted from the emitted DDL and from the dispatched edge content (in-memory-only state). Warning — the entity-table equivalent is the CG025 error. |

@@ -48,7 +48,7 @@ internal static class PredicateFactoryEmitter
             {
                 foreach (var (propertyName, surrealField, csharpType) in members)
                 {
-                    writer.Line($"public static readonly {Namespaces.PropertyExprFqn}<{csharpType}> {propertyName} = new(\"{surrealField}\");");
+                    writer.Line($"public static readonly {Namespaces.PropertyExprFqn}<{csharpType}> {CSharpText.Identifier(propertyName)} = new(\"{surrealField}\");");
                 }
             }
         }

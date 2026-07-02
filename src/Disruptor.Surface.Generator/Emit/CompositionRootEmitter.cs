@@ -26,7 +26,9 @@ internal static class CompositionRootEmitter
         var aggregateRoots = new List<TableModel>();
         foreach (var t in graph.Tables)
         {
-            if (t.IsAggregateRoot)
+            // CG044 losers are skipped — Load{Name}Async members key on the root's
+            // simple name; emitting both would be CS0111 on top of the CG error.
+            if (t.IsAggregateRoot && !graph.IsCollisionLoser(NameCollisionKind.AggregateRootName, t.FullName))
             {
                 aggregateRoots.Add(t);
             }

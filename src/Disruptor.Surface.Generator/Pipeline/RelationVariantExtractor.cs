@@ -21,9 +21,11 @@ namespace Disruptor.Surface.Generator.Pipeline;
 /// semantic model to confirm the attribute's ancestry and walks the class's members.
 /// </para>
 /// <para>
-/// Malformed shapes with multiple <c>[In]</c> / <c>[Out]</c> / <c>[Id]</c> members return
-/// <c>null</c>. Missing endpoints are allowed through so the linker can lift them from
-/// annotated shared-shape interfaces.
+/// Malformed shapes with multiple <c>[In]</c> / <c>[Out]</c> / <c>[Id]</c> members are
+/// flagged via <see cref="RelationVariantModel.DuplicateRoles"/>; the linker filters them
+/// into an issue list and <c>ModelGenerator.Emit</c> reports CG046. Missing endpoints are
+/// allowed through so the linker can lift them from annotated shared-shape interfaces;
+/// variants whose endpoints stay unresolved after the lift are reported as CG047.
 /// </para>
 /// </summary>
 internal static class RelationVariantExtractor
@@ -35,10 +37,10 @@ internal static class RelationVariantExtractor
     /// attribute.
     /// </summary>
     public static bool IsClassWithAttributeList(SyntaxNode node, CancellationToken _)
-        => node is ClassDeclarationSyntax cls && cls.AttributeLists.Count > 0;
+        => node is (ClassDeclarationSyntax or RecordDeclarationSyntax) and TypeDeclarationSyntax { AttributeLists.Count: > 0 };
 
     public static RelationVariantModel? TryExtract(GeneratorSyntaxContext ctx, CancellationToken ct)
-        => ctx.Node is ClassDeclarationSyntax decl
+        => ctx.Node is TypeDeclarationSyntax decl and (ClassDeclarationSyntax or RecordDeclarationSyntax)
             ? ctx.SemanticModel.GetDeclaredSymbol(decl, ct) is INamedTypeSymbol cls
                 ? TryExtractFromSymbol(cls, ct)
                 : null
@@ -87,6 +89,13 @@ internal static class RelationVariantExtractor
         var inCount = 0;
         var outCount = 0;
         var idCount = 0;
+        // Location of the duplicate role attribute (the second [In]/[Out]/[Id] seen) so
+        // CG046 points at the extra annotation, not the class. Only ever populated on a
+        // malformed (already-failing) variant, so the position-sensitive LocationInfo
+        // cannot regress incremental caching for healthy models.
+        LocationInfo? duplicateInLocation = null;
+        LocationInfo? duplicateOutLocation = null;
+        LocationInfo? duplicateIdLocation = null;
         var payloadBuilder = ImmutableArray.CreateBuilder<RelationVariantPropertyModel>();
 
         foreach (var member in cls.GetMembers())
@@ -98,7 +107,7 @@ internal static class RelationVariantExtractor
                 continue;
             }
 
-            var role = ResolveRole(p.GetAttributes());
+            var role = ResolveRole(p.GetAttributes(), out var roleAttribute);
             if (role == RelationVariantPropertyRole.None)
             {
                 continue;
@@ -111,14 +120,26 @@ internal static class RelationVariantExtractor
                 case RelationVariantPropertyRole.In:
                     inProp = pm;
                     inCount++;
+                    if (inCount > 1)
+                    {
+                        duplicateInLocation ??= RoleAttributeLocation(roleAttribute, p, ct);
+                    }
                     break;
                 case RelationVariantPropertyRole.Out:
                     outProp = pm;
                     outCount++;
+                    if (outCount > 1)
+                    {
+                        duplicateOutLocation ??= RoleAttributeLocation(roleAttribute, p, ct);
+                    }
                     break;
                 case RelationVariantPropertyRole.Id:
                     idProp = pm;
                     idCount++;
+                    if (idCount > 1)
+                    {
+                        duplicateIdLocation ??= RoleAttributeLocation(roleAttribute, p, ct);
+                    }
                     break;
                 case RelationVariantPropertyRole.Property:
                     payloadBuilder.Add(pm);
@@ -126,11 +147,25 @@ internal static class RelationVariantExtractor
             }
         }
 
-        // Multiple endpoint/id roles are always ambiguous. Missing roles are allowed
-        // through; RelationLinker may fill them from annotated shared-shape interfaces.
-        if (inCount > 1 || outCount > 1 || idCount > 1)
+        // Multiple endpoint/id roles are always ambiguous. The model is flagged (not
+        // dropped): RelationLinker.Build filters flagged variants into an issue list and
+        // ModelGenerator.Emit reports CG046, so the user sees a real diagnostic instead
+        // of a CS9248 wall. Missing roles are allowed through; RelationLinker may fill
+        // them from annotated shared-shape interfaces.
+        var duplicateRolesBuilder = ImmutableArray.CreateBuilder<DuplicateRoleModel>();
+        if (inCount > 1)
         {
-            return null;
+            duplicateRolesBuilder.Add(new DuplicateRoleModel("In", duplicateInLocation));
+        }
+
+        if (outCount > 1)
+        {
+            duplicateRolesBuilder.Add(new DuplicateRoleModel("Out", duplicateOutLocation));
+        }
+
+        if (idCount > 1)
+        {
+            duplicateRolesBuilder.Add(new DuplicateRoleModel("Id", duplicateIdLocation));
         }
 
         var ns = cls.ContainingNamespace?.ToDisplayString() ?? string.Empty;
@@ -163,8 +198,22 @@ internal static class RelationVariantExtractor
             PayloadProperties: payloadBuilder.ToImmutable(),
             IsPartial: PartialDeclaration.IsDeclared(cls, ct),
             DeclaredAccessibility: cls.DeclaredAccessibility.ToString(),
-            ImplementedInterfaceFullNames: new EquatableArray<string>(implementedInterfacesBuilder.ToImmutable()));
+            ImplementedInterfaceFullNames: new EquatableArray<string>(implementedInterfacesBuilder.ToImmutable()),
+            DuplicateRoles: new EquatableArray<DuplicateRoleModel>(duplicateRolesBuilder.ToImmutable()),
+            IsRecord: cls.IsRecord,
+            // Only linker-rejected shapes (record → CG048) get a location; healthy
+            // variants keep null so model equality stays position-independent.
+            IssueLocation: cls.IsRecord ? LocationInfo.FromLocation(cls.Locations.FirstOrDefault()) : null);
     }
+
+    /// <summary>
+    /// Location of a role attribute's application syntax (<c>[In]</c> on the duplicated
+    /// member), falling back to the property declaration itself when the application
+    /// syntax is unavailable (e.g. symbols from metadata).
+    /// </summary>
+    private static LocationInfo? RoleAttributeLocation(AttributeData? roleAttribute, IPropertySymbol property, CancellationToken ct)
+        => LocationInfo.FromLocation(roleAttribute?.ApplicationSyntaxReference?.GetSyntax(ct).GetLocation())
+           ?? LocationInfo.FromLocation(property.Locations.FirstOrDefault());
 
     /// <summary>
     /// Builds the variant property model from a Roslyn property symbol. Shared with
@@ -203,8 +252,16 @@ internal static class RelationVariantExtractor
     /// members for preview.56's interface-driven lift.
     /// </summary>
     internal static RelationVariantPropertyRole ResolveRole(ImmutableArray<AttributeData> attrs)
+        => ResolveRole(attrs, out _);
+
+    /// <summary>
+    /// Role resolution that also surfaces the winning role attribute's
+    /// <see cref="AttributeData"/> so callers can point diagnostics (CG046) at the
+    /// attribute application syntax rather than the class.
+    /// </summary>
+    internal static RelationVariantPropertyRole ResolveRole(ImmutableArray<AttributeData> attrs, out AttributeData? roleAttribute)
     {
-        var sawProperty = false;
+        AttributeData? propertyAttribute = null;
         foreach (var attr in attrs)
         {
             var fqn = TableExtractor.AttributeFullName(attr);
@@ -216,17 +273,22 @@ internal static class RelationVariantExtractor
             switch (fqn)
             {
                 case AnnotationsMetadata.In:
+                    roleAttribute = attr;
                     return RelationVariantPropertyRole.In;
                 case AnnotationsMetadata.Out:
+                    roleAttribute = attr;
                     return RelationVariantPropertyRole.Out;
                 case AnnotationsMetadata.Id:
+                    roleAttribute = attr;
                     return RelationVariantPropertyRole.Id;
                 case AnnotationsMetadata.Property:
-                    sawProperty = true;
+                    propertyAttribute ??= attr;
                     break;
             }
         }
-        return sawProperty ? RelationVariantPropertyRole.Property : RelationVariantPropertyRole.None;
+
+        roleAttribute = propertyAttribute;
+        return propertyAttribute is not null ? RelationVariantPropertyRole.Property : RelationVariantPropertyRole.None;
     }
 
     private static ReferenceDeletePolicy ResolveDeletePolicy(ImmutableArray<AttributeData> attrs)

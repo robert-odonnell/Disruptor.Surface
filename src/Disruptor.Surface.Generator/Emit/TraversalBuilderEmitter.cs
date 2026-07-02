@@ -107,9 +107,7 @@ internal static class TraversalBuilderEmitter
         IReadOnlyList<ChildrenMember> children,
         IReadOnlyList<RelationMember> relations)
     {
-        var entityFqn = string.IsNullOrEmpty(table.Namespace)
-            ? $"global::{table.Name}"
-            : $"global::{table.Namespace}.{table.Name}";
+        var entityFqn = CSharpText.GlobalName(table.Namespace, table.Name);
         var queryFqn = $"global::Disruptor.Surface.Runtime.Query.SurfaceQuery<{entityFqn}>";
         var extName = $"{table.Name}QueryIncludes";
 
@@ -212,9 +210,7 @@ internal static class TraversalBuilderEmitter
                 continue;
             }
 
-            var childEntityFqn = string.IsNullOrEmpty(childTable.Namespace)
-                ? $"global::{childTable.Name}"
-                : $"global::{childTable.Namespace}.{childTable.Name}";
+            var childEntityFqn = CSharpText.GlobalName(childTable.Namespace, childTable.Name);
             // Static lambda — no captures, gets cached as a delegate field once per
             // include node. The cast threads the entity through IEntity so we hit the
             // explicit-impl Hydrate emitted by PartialEmitter.
@@ -377,9 +373,7 @@ internal static class TraversalBuilderEmitter
                 continue; // No participants; skip silently.
             }
 
-            var entityFqn = string.IsNullOrEmpty(single.Namespace)
-                ? $"global::{single.Name}"
-                : $"global::{single.Namespace}.{single.Name}";
+            var entityFqn = CSharpText.GlobalName(single.Namespace, single.Name);
             var builderFqn = string.IsNullOrEmpty(single.Namespace)
                 ? $"global::{single.Name}TraversalBuilder"
                 : $"global::{single.Namespace}.{single.Name}TraversalBuilder";
@@ -456,9 +450,7 @@ internal static class TraversalBuilderEmitter
                 continue;
             }
 
-            var entityFqn = string.IsNullOrEmpty(member.Namespace)
-                ? $"global::{member.Name}"
-                : $"global::{member.Namespace}.{member.Name}";
+            var entityFqn = CSharpText.GlobalName(member.Namespace, member.Name);
             var tableName = SurrealNaming.ToTableName(member.Name);
             cases.Add($"case \"{tableName}\": {{ var __e = new {entityFqn}(); ((global::Disruptor.Surface.Runtime.IEntity)__e).Hydrate(row, sink); break; }}");
         }

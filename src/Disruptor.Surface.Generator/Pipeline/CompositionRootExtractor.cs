@@ -17,7 +17,10 @@ internal static class CompositionRootExtractor
             return null;
         }
 
-        if (type.TypeKind != TypeKind.Class)
+        // Records are admitted so the linker can reject them with CG048 (mirrors
+        // TableExtractor) — a [CompositionRoot] record would otherwise be silently
+        // ignored by the class-only predicate.
+        if (type.TypeKind != TypeKind.Class && !type.IsRecord)
         {
             return null;
         }
@@ -25,13 +28,29 @@ internal static class CompositionRootExtractor
         ct.ThrowIfCancellationRequested();
 
         var ns = type.ContainingNamespace?.ToDisplayString() ?? string.Empty;
-        var fullName = string.IsNullOrEmpty(ns) ? type.MetadataName : $"{ns}.{type.MetadataName}";
+        // NormaliseFullName keeps containing types in the name so a nested
+        // [CompositionRoot] — rejected with CG045 by the linker — is reported under
+        // its real name. Identical to {ns}.{MetadataName} for namespace-scoped types.
+        var fullName = TableExtractor.NormaliseFullName(type);
+
+        // Captured ONLY for linker-rejected shapes (nested → CG045, record → CG048);
+        // healthy roots keep null so model equality stays position-independent.
+        LocationInfo? issueLocation = null;
+        if (type.ContainingType is not null || type.IsRecord)
+        {
+            issueLocation = ctx.TargetNode is Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax decl
+                ? LocationInfo.FromToken(decl.Identifier)
+                : LocationInfo.FromLocation(type.Locations.FirstOrDefault());
+        }
 
         return new CompositionRootModel(
             FullName: fullName,
             Namespace: ns,
             Name: type.Name,
             DeclaredAccessibility: type.DeclaredAccessibility.ToString(),
-            IsPartial: PartialDeclaration.IsDeclared(type, ct));
+            IsPartial: PartialDeclaration.IsDeclared(type, ct),
+            IsNested: type.ContainingType is not null,
+            IsRecord: type.IsRecord,
+            IssueLocation: issueLocation);
     }
 }

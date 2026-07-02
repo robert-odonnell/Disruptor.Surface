@@ -1,3 +1,5 @@
+using Disruptor.Surface.Runtime;
+using Disruptor.Surface.Tests.Runtime;
 using Microsoft.CodeAnalysis;
 using Xunit;
 
@@ -183,6 +185,358 @@ public sealed class EmissionShapeTests
     }
 
     [Fact]
+    public void PrimitiveElementCollection_EmitsArraySchema_And_CompilableRoundTrip()
+    {
+        // `IReadOnlyList<string>` used to walk string's members and emit
+        // `new string(this[]: …, Length: …)` (CS0443); `List<int>` fell to the scalar
+        // save path with no matching ContentValue.Set overload (CS1503). Primitive
+        // element collections are now first-class: array<T> schema, list-typed
+        // ContentValue.Set on save, HydrationValue list read on hydrate.
+        var src = """
+            using Disruptor.Surface.Annotations;
+            using System.Collections.Generic;
+            namespace M;
+
+            [Table] public partial class Root {
+                [Id] public partial RootId Id { get; set; }
+                [Property] public partial IReadOnlyList<string> Tags { get; }
+                [Property] public partial List<int> Weights { get; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (result, _, _, compileDiags) = GeneratorHarness.Run(src);
+        Assert.Empty(compileDiags);
+
+        var schema = GeneratorHarness.FindGeneratedFile(result, "Schema.g.cs");
+        Assert.NotNull(schema);
+        var schemaSrc = schema!.ToString();
+        Assert.Contains("DEFINE FIELD IF NOT EXISTS tags ON roots TYPE array<string> DEFAULT [];", schemaSrc);
+        Assert.Contains("DEFINE FIELD IF NOT EXISTS weights ON roots TYPE array<int> DEFAULT [];", schemaSrc);
+
+        var rootFile = GeneratorHarness.FindGeneratedFile(result, "M.Root.g.cs");
+        Assert.NotNull(rootFile);
+        var rootSrc = rootFile!.ToString();
+        // Save: list overloads of ContentValue.Set take the backing List<T> directly.
+        Assert.Contains("global::Disruptor.Surface.Runtime.ContentValue.Set(__content, \"tags\", _tags);", rootSrc);
+        // Hydrate: typed list read + repopulate of the readonly backing list.
+        Assert.Contains("HydrationValue.ReadOrDefault<global::System.Collections.Generic.List<string>>(__obj, \"tags\")", rootSrc);
+        Assert.Contains("_weights.AddRange(", rootSrc);
+    }
+
+    [Fact]
+    public void PocoElementCollection_HydratesViaObjectInitializer()
+    {
+        // A parameterless-ctor POCO with settable mappable properties has no positional
+        // constructor to name — hydrate uses an object initializer instead (previously
+        // the ctor named-argument form produced CS1739 for this shape).
+        var src = """
+            using Disruptor.Surface.Annotations;
+            using System.Collections.Generic;
+            namespace M;
+
+            public sealed class Step {
+                public string Label { get; set; } = "";
+                public int Order { get; set; }
+            }
+
+            [Table] public partial class Root {
+                [Id] public partial RootId Id { get; set; }
+                [Property] public partial IReadOnlyList<Step> Steps { get; }
+            }
+            """;
+
+        var (result, _, runDiags, compileDiags) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id == "CG050");
+        Assert.Empty(compileDiags);
+
+        var rootFile = GeneratorHarness.FindGeneratedFile(result, "M.Root.g.cs");
+        Assert.NotNull(rootFile);
+        var rootSrc = rootFile!.ToString();
+        Assert.Contains("Label = global::Disruptor.Surface.Runtime.HydrationValue.ReadString(", rootSrc);
+        Assert.Contains("Order = global::Disruptor.Surface.Runtime.HydrationValue.ReadOrDefault<int>(", rootSrc);
+    }
+
+    [Fact]
+    public void RecordElementCollection_IgnoresComputedUnmappableMembers()
+    {
+        // A get-only computed member of an unmappable type is derived state — it is
+        // excluded from persistence rather than failing the element type.
+        var src = """
+            using Disruptor.Surface.Annotations;
+            using System;
+            using System.Collections.Generic;
+            namespace M;
+
+            public sealed record Scenario(string Kind, string Description)
+            {
+                public TimeSpan Budget => TimeSpan.Zero;
+            }
+
+            [Table] public partial class Root {
+                [Id] public partial RootId Id { get; set; }
+                [Property] public partial IReadOnlyList<Scenario> Scenarios { get; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (result, _, runDiags, compileDiags) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id == "CG050");
+        Assert.Empty(compileDiags);
+
+        var schema = GeneratorHarness.FindGeneratedFile(result, "Schema.g.cs");
+        Assert.NotNull(schema);
+        var schemaSrc = schema!.ToString();
+        Assert.Contains("scenarios.*.kind", schemaSrc);
+        Assert.DoesNotContain("scenarios.*.budget", schemaSrc);
+    }
+
+    [Fact]
+    public void KeywordPropertyNames_AreEscapedInEmittedIdentifiers()
+    {
+        // Roslyn strips the `@` from ISymbol.Name, so `[Property] partial string @class`
+        // used to interpolate a bare `class` into the emitted property declaration —
+        // a CS1519 cascade inside the .g.cs. Emitters now @-escape at the boundary.
+        // The SurrealDB field name (snake_case) is unaffected: still `class` / `event`.
+        var src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [Table] public partial class Symbol {
+                [Id] public partial SymbolId Id { get; set; }
+                [Property] public partial string @class { get; set; }
+                [Property] public partial string @event { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (result, _, _, compileDiags) = GeneratorHarness.Run(src);
+        Assert.Empty(compileDiags);
+
+        var symbolFile = GeneratorHarness.FindGeneratedFile(result, "M.Symbol.g.cs");
+        Assert.NotNull(symbolFile);
+        var symbolSrc = symbolFile!.ToString();
+        Assert.Contains("partial string @class", symbolSrc);
+        Assert.Contains("partial string @event", symbolSrc);
+        // Wire field names are the raw snake_case names, not the escaped identifiers.
+        Assert.Contains("\"class\"", symbolSrc);
+        Assert.DoesNotContain("\"@class\"", symbolSrc);
+    }
+
+    [Fact]
+    public void IndexAnnotations_DoNotBustIncrementalCache_OnTriviaEdits()
+    {
+        // IndexAnnotationModel used to embed "{filePath}:{typeDeclSpanStart}" and the
+        // property's SpanStart — absolute positions, so adding a comment ABOVE an
+        // index-annotated property changed model equality and re-ran the single
+        // monolithic RegisterSourceOutput for every file (the exact regression the
+        // architecture doc's incremental contract warns about). The identity is now
+        // (partial-declaration ordinal, member ordinal), both stable under trivia edits.
+        var src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public sealed class LookupAttribute : IndexAttribute;
+
+            [Table]
+            public partial class Story {
+                [Id] public partial StoryId Id { get; set; }
+                [Lookup, Property] public partial string ExternalKey { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var compilation = GeneratorHarness.CreateCompilation(src);
+        var parseOpts = new Microsoft.CodeAnalysis.CSharp.CSharpParseOptions(Microsoft.CodeAnalysis.CSharp.LanguageVersion.Preview);
+        var driver = Microsoft.CodeAnalysis.CSharp.CSharpGeneratorDriver.Create(
+            generators: [new Disruptor.Surface.Generator.ModelGenerator().AsSourceGenerator()],
+            parseOptions: parseOpts,
+            driverOptions: new GeneratorDriverOptions(IncrementalGeneratorOutputKind.None, trackIncrementalGeneratorSteps: true));
+
+        var afterFirst = driver.RunGenerators(compilation);
+
+        // Same file, one comment line added above the annotated property — a pure
+        // trivia edit that shifts every span below it.
+        var edited = src.Replace(
+            "    [Lookup, Property] public partial string ExternalKey { get; set; }",
+            "    // a comment above the index-annotated property\n    [Lookup, Property] public partial string ExternalKey { get; set; }");
+        var editedCompilation = compilation.ReplaceSyntaxTree(
+            compilation.SyntaxTrees.Single(),
+            Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(edited, parseOpts));
+
+        var afterSecond = afterFirst.RunGenerators(editedCompilation);
+        var result = afterSecond.GetRunResult().Results.Single();
+
+        // Every source output must come from the cache — the linked ModelGraph is
+        // value-equal, so RegisterSourceOutput is skipped entirely. (This includes the
+        // diagnostics-only output: its located-diagnostics input re-resolves against the
+        // shifted location map, but resolves to an EMPTY set that is value-equal to the
+        // previous run's, so the output stays cached too.)
+        var outputSteps = result.TrackedOutputSteps.SelectMany(kv => kv.Value).SelectMany(step => step.Outputs);
+        Assert.NotEmpty(outputSteps);
+        Assert.All(outputSteps, output =>
+            Assert.True(output.Reason is IncrementalStepRunReason.Cached or IncrementalStepRunReason.Unchanged,
+                $"Expected cached output, got {output.Reason}"));
+    }
+
+    [Fact]
+    public void DiagnosticLocations_DoNotBustEmitOutput_OnPositionOnlyEdits()
+    {
+        // The split-output contract behind diagnostic source locations: diagnostics are
+        // located via a position-sensitive declaration map that feeds ONLY the
+        // diagnostics RegisterSourceOutput. With a live diagnostic in the compilation
+        // (CG017 below — a warning, so emission still happens), an edit that only MOVES
+        // the declarations must (a) leave the ModelGraph value-equal so the emit output
+        // is fully cached, while (b) re-running the diagnostics output — that re-run is
+        // the point of the split: the diagnostic's reported line has to move with the
+        // declaration, and paying for it must not re-fire the emitters.
+        var src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [Table] public partial class Doc {
+                [Id] public partial DocId Id { get; set; }
+                [Reference, Ignore] public partial Meta? Extra { get; set; }
+            }
+
+            [Table] public partial class Meta {
+                [Id] public partial MetaId Id { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var parseOpts = new Microsoft.CodeAnalysis.CSharp.CSharpParseOptions(Microsoft.CodeAnalysis.CSharp.LanguageVersion.Preview);
+        var compilation = GeneratorHarness.CreateCompilation(src);
+        var driver = Microsoft.CodeAnalysis.CSharp.CSharpGeneratorDriver.Create(
+            generators: [new Disruptor.Surface.Generator.ModelGenerator().AsSourceGenerator()],
+            parseOptions: parseOpts,
+            driverOptions: new GeneratorDriverOptions(IncrementalGeneratorOutputKind.None, trackIncrementalGeneratorSteps: true));
+
+        var afterFirst = driver.RunGenerators(compilation);
+        Assert.Contains(afterFirst.GetRunResult().Diagnostics, d => d.Id == "CG017");
+
+        // Position-only edit: a comment above the diagnostic-carrying table shifts every
+        // declaration below it without changing any model-relevant content.
+        var edited = src.Replace(
+            "[Table] public partial class Doc {",
+            "// moved: everything below shifts one line\n[Table] public partial class Doc {");
+        var editedCompilation = compilation.ReplaceSyntaxTree(
+            compilation.SyntaxTrees.Single(),
+            Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(edited, parseOpts));
+
+        var afterSecond = afterFirst.RunGenerators(editedCompilation);
+        var result = afterSecond.GetRunResult().Results.Single();
+
+        // (a) The graph node is value-equal (positions are not part of any healthy
+        // model), so the emit output — the RegisterSourceOutput fed by "ModelGraph" —
+        // comes entirely from the cache.
+        var graphOutputs = result.TrackedSteps["ModelGraph"].SelectMany(step => step.Outputs);
+        Assert.All(graphOutputs, output =>
+            Assert.True(output.Reason is IncrementalStepRunReason.Cached or IncrementalStepRunReason.Unchanged,
+                $"Expected cached ModelGraph, got {output.Reason}"));
+
+        var outputSteps = result.TrackedOutputSteps.SelectMany(kv => kv.Value).ToList();
+        var emitOutput = outputSteps.Where(step => step.Inputs.Any(i => i.Source.Name == "ModelGraph")).ToList();
+        Assert.NotEmpty(emitOutput);
+        Assert.All(emitOutput.SelectMany(step => step.Outputs), output =>
+            Assert.True(output.Reason is IncrementalStepRunReason.Cached or IncrementalStepRunReason.Unchanged,
+                $"Expected cached emit output, got {output.Reason}"));
+
+        // Pending diagnostics are position-independent — cached even with CG017 live.
+        var pendingOutputs = result.TrackedSteps["PendingDiagnostics"].SelectMany(step => step.Outputs);
+        Assert.All(pendingOutputs, output =>
+            Assert.True(output.Reason is IncrementalStepRunReason.Cached or IncrementalStepRunReason.Unchanged,
+                $"Expected cached pending diagnostics, got {output.Reason}"));
+
+        // (b) The located-diagnostics node re-resolves (the CG017 location moved), so
+        // the diagnostics output re-runs — and the reported line tracks the edit.
+        var locatedOutputs = result.TrackedSteps["LocatedDiagnostics"].SelectMany(step => step.Outputs);
+        Assert.Contains(locatedOutputs, output =>
+            output.Reason is IncrementalStepRunReason.Modified or IncrementalStepRunReason.New);
+
+        var movedDiagnostic = afterSecond.GetRunResult().Diagnostics.First(d => d.Id == "CG017");
+        var expectedLine = edited.Substring(0, edited.IndexOf("Meta? Extra", StringComparison.Ordinal))
+            .Count(c => c == '\n');
+        Assert.Equal(expectedLine, movedDiagnostic.Location.GetLineSpan().StartLinePosition.Line);
+    }
+
+    [Fact]
+    public void KeywordClassNames_AreEscapedInEmittedTypeReferences()
+    {
+        // A [Table] named with a keyword (`@event`) flows through hand-built type
+        // references in many emitters (query root, hydrate root, traversal builders,
+        // aggregate loader). Every `global::{ns}.{name}` construction now escapes via
+        // CSharpText.GlobalName/GlobalType.
+        var src = """
+            using Disruptor.Surface.Annotations;
+            using System.Collections.Generic;
+            namespace M;
+
+            [Table, AggregateRoot] public partial class @event {
+                [Id] public partial eventId Id { get; set; }
+                [Property] public partial string Name { get; set; }
+                [Children] public partial IReadOnlyCollection<@case> Cases { get; }
+            }
+
+            [Table] public partial class @case {
+                [Id] public partial caseId Id { get; set; }
+                [Parent] public partial @event Owner { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (_, _, _, compileDiags) = GeneratorHarness.Run(src);
+        Assert.Empty(compileDiags);
+    }
+
+    [Fact]
+    public void NullableTypedIdEndpoint_GuardsEnumerateReferences()
+    {
+        // `(RecordId?)(RecordId)_source` on a nullable typed-id endpoint lifts the
+        // user-defined conversion over Nullable<T> — InvalidOperationException when the
+        // endpoint is unset, instead of yielding (field, null). The emitted form now
+        // guards with `is { }` like the union branch.
+        var src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+
+            [Table] public partial class Constraint {
+                [Id] public partial ConstraintId Id { get; set; }
+            }
+
+            [Table] public partial class UserStory {
+                [Id] public partial UserStoryId Id { get; set; }
+            }
+
+            [Restricts]
+            public partial class OptionalSource {
+                [In, Unset] public partial ConstraintId? Source { get; set; }
+                [Out] public partial UserStoryId Target { get; set; }
+            }
+            """;
+
+        var (result, _, _, compileDiags) = GeneratorHarness.Run(src);
+        Assert.Empty(compileDiags);
+
+        var variantFile = GeneratorHarness.FindGeneratedFile(result, "OptionalSource.RelationVariant");
+        Assert.NotNull(variantFile);
+        var variantSrc = variantFile!.ToString();
+        // Nullable endpoint: guarded yield.
+        Assert.Contains("_source is { } __v_source ? (global::Disruptor.Surface.Runtime.RecordId?)(global::Disruptor.Surface.Runtime.RecordId)__v_source : null", variantSrc);
+        // Non-nullable endpoint keeps the direct cast.
+        Assert.Contains("(global::Disruptor.Surface.Runtime.RecordId?)(global::Disruptor.Surface.Runtime.RecordId)_target", variantSrc);
+    }
+
+    [Fact]
     public void Loader_EmitsEdgeSubselect_ForMultiSourceRelationKind()
     {
         // Bug regression: BuildEdgeWhere previously delegated to a FindSingleSourceTable
@@ -300,6 +654,87 @@ public sealed class EmissionShapeTests
 
         // Convenience ApplySchemaAsync sits next to Schema for the common boot path.
         Assert.Contains("public static async global::System.Threading.Tasks.Task ApplySchemaAsync", allSrc);
+    }
+
+    [Fact]
+    public void ReferenceRegistry_RegistersParentLinks_WithRejectBehavior()
+    {
+        // The emitted schema gives every [Parent] link REFERENCE ON DELETE REJECT
+        // (SchemaEmitter.EmitParentField); the registry must mirror that so
+        // SurrealSession.PlanDelete predicts what the substrate enforces. Pre-fix the
+        // registry held only PropertyKind.Reference entries — parent links were
+        // invisible to delete planning.
+        var (result, _, _, _) = GeneratorHarness.Run(MinimalModel);
+        var registry = GeneratorHarness.FindGeneratedFile(result, "ReferenceRegistry");
+        Assert.NotNull(registry);
+
+        var src = registry.ToString();
+        // Bucketed under the referenced table ("designs"), keyed by the referencer
+        // table + snake-cased field name PlanDelete's lookup matches on.
+        Assert.Contains("[\"designs\"]", src);
+        Assert.Contains(
+            "new(\"constraints\", \"design\", \"designs\", global::Disruptor.Surface.Runtime.ReferenceDeleteBehavior.Reject, false)",
+            src);
+    }
+
+    [Fact]
+    public async Task E2E_DeleteParent_WithTrackedChildren_ThrowsCascadeReject_PreDispatch()
+    {
+        // The headline PlanDelete fix, end-to-end through the REAL generated registry +
+        // entities: deleting a design whose constraint child is tracked in-session must
+        // throw the documented pre-flight CascadeRejectException naming the child —
+        // not dispatch and let the substrate reject with a generic SurrealRpcException.
+        var asm = GeneratorHarness.CompileAndLoad(MinimalModel);
+        var registry = (IReferenceRegistry)asm.GetType("M.Workspace", throwOnError: true)!
+            .GetProperty("ReferenceRegistry")!.GetValue(null)!;
+        var session = new SurrealSession(registry);
+
+        var design = (IEntity)Activator.CreateInstance(asm.GetType("M.Design", throwOnError: true)!)!;
+        session.Track(design);
+
+        var constraintT = asm.GetType("M.Constraint", throwOnError: true)!;
+        var constraint = (IEntity)Activator.CreateInstance(constraintT)!;
+        // The [Parent] setter cascade-tracks the child into the parent's session.
+        constraintT.GetProperty("Design")!.SetValue(constraint, design);
+        Assert.True(session.IsTracked(constraint.Id));
+
+        // Anything reaching the wire surfaces as IOException; we expect the pre-flight throw.
+        var db = FakeSurreal.Throwing(new IOException("should never reach the wire"));
+        await using var tx = await db.BeginTransactionAsync();
+
+        var ex = await Assert.ThrowsAsync<CascadeRejectException>(() => session.DeleteAsync(design, tx));
+        var blocker = Assert.Single(ex.Blockers);
+        Assert.Equal(constraint.Id, blocker.Referencer);
+        Assert.Equal("design", blocker.FieldName);
+        Assert.Equal(design.Id, blocker.BlockedTarget);
+    }
+
+    [Fact]
+    public async Task E2E_DeleteParent_AfterChildrenDeleted_PlansClean()
+    {
+        // The order the schema's REJECT enforces: children first, then the parent. Once
+        // the child is deleted (and purged from the snapshot by CleanupLocalState), the
+        // parent's delete plan finds no steady-state blockers and dispatches cleanly.
+        var asm = GeneratorHarness.CompileAndLoad(MinimalModel);
+        var registry = (IReferenceRegistry)asm.GetType("M.Workspace", throwOnError: true)!
+            .GetProperty("ReferenceRegistry")!.GetValue(null)!;
+        var session = new SurrealSession(registry);
+
+        var design = (IEntity)Activator.CreateInstance(asm.GetType("M.Design", throwOnError: true)!)!;
+        session.Track(design);
+
+        var constraintT = asm.GetType("M.Constraint", throwOnError: true)!;
+        var constraint = (IEntity)Activator.CreateInstance(constraintT)!;
+        constraintT.GetProperty("Design")!.SetValue(constraint, design);
+
+        var db = FakeSurreal.Null();
+        await using var tx = await db.BeginTransactionAsync();
+
+        await session.DeleteAsync(constraint, tx);
+        await session.DeleteAsync(design, tx);
+
+        Assert.False(session.IsTracked(design.Id));
+        Assert.False(session.IsClosed);
     }
 
     [Fact]
@@ -1038,9 +1473,11 @@ public sealed class EmissionShapeTests
             [CompositionRoot] public partial class Workspace { }
             """;
 
-        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
 
-        Assert.Contains(runDiags, d => d.Id == "CG029");
+        // Reported from the located-diagnostics path (ModelValidation.Validate) since
+        // 2026-07-02 — points at the variant class declaration, not Location.None.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG029"), src, "public class EpicRestriction");
     }
 
     [Fact]
@@ -1058,7 +1495,17 @@ public sealed class EmissionShapeTests
         Assert.Contains("global::Disruptor.Surface.Runtime.IEntity", src);
         // Per-kind id type — RestrictsId, not EpicRestrictionId.
         Assert.Contains("private global::M.RestrictsId? _id;", src);
-        Assert.Contains("global::M.RestrictsId.New()", src);
+        // Deterministic edge ids (2026-07-02): the lazy mint goes through __MintId,
+        // which derives the id from (in, edge, out) via RecordId.ForEdge when both
+        // endpoints are resolvable — so the id the session holds matches the row the
+        // UNIQUE(in,out) duplicate path updates. Random New() remains only as the
+        // unset-endpoint fallback (the save path still fails before dispatch then).
+        Assert.Contains("_id ??= __MintId();", src);
+        Assert.Contains("global::Disruptor.Surface.Runtime.RecordId.ForEdge(\"restricts\", __inId, __outId).Value", src);
+        Assert.Contains(": global::M.RestrictsId.New();", src);
+        // Entity-typed endpoints try-resolve via the cached id backing field, falling
+        // back to the entity ref's Id — never throwing (unset endpoints yield null).
+        Assert.Contains("var __in = _sourceId ?? (_source is { } __v_source ? ((global::Disruptor.Surface.Runtime.IEntity)__v_source).Id : (global::Disruptor.Surface.Runtime.RecordId?)null);", src);
     }
 
     [Fact]
@@ -1277,8 +1724,10 @@ public sealed class EmissionShapeTests
         Assert.Contains("[\"_content\"] = new global::Disruptor.Surreal.Values.SurrealObjectValue(__content),", src);
         Assert.Contains("global::Disruptor.Surface.Runtime.ContentValue.Set(__bindings, \"_p_severity\", _severity);", src);
 
-        // Dispatch + EnsureSuccess + MarkSaved are the post-dispatch contract.
-        Assert.Contains("await ctx.Transaction.QueryAsync(__sql, __bindings, ct).ConfigureAwait(false);", src);
+        // Dispatch (through the ISaveContext raw-query seam — single-save defaults to
+        // an immediate ctx.Transaction.QueryAsync) + EnsureSuccess + MarkSaved are the
+        // post-dispatch contract.
+        Assert.Contains("await ctx.DispatchQueryAsync(__sql, __bindings, ct).ConfigureAwait(false);", src);
         Assert.Contains("__response.EnsureSuccess();", src);
         Assert.Contains("ctx.MarkSaved(this);", src);
     }
@@ -1355,6 +1804,58 @@ public sealed class EmissionShapeTests
         var variant = GeneratorHarness.FindGeneratedFile(result, "EpicRestriction.RelationVariant.g.cs");
         Assert.NotNull(variant);
         Assert.Contains(": global::Disruptor.Surface.Runtime.IEntity, global::Disruptor.Surface.Runtime.IRelationVariant", variant.ToString());
+    }
+
+    [Fact]
+    public void Variant_SplitAcrossPartialDeclarations_GeneratesCleanly_Once()
+    {
+        // The CreateSyntaxProvider-based extractors run once per *declaration* but
+        // GetDeclaredSymbol merges partials — before RelationLinker.Build deduped the
+        // collected sets, a variant split across two matching partial declarations
+        // (the second carrying any attribute list) produced two identical models and
+        // RelationVariantEmitter crashed AddSource with a duplicate hint (CS8785).
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+
+            [Table, AggregateRoot] public partial class Epic {
+                [Id] public partial EpicId Id { get; set; }
+            }
+
+            [Table, AggregateRoot] public partial class Feature {
+                [Id] public partial FeatureId Id { get; set; }
+            }
+
+            [Restricts]
+            public partial class EpicRestriction {
+                [In]  public partial EpicId Source { get; set; }
+                [Out] public partial FeatureId Target { get; set; }
+            }
+
+            // Second declaration of the same variant — the attribute list makes it match
+            // the extractor predicate, so the transform runs once per declaration.
+            [System.Obsolete("split declaration")]
+            public partial class EpicRestriction {
+                [Property] public partial string Note { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+
+        // No duplicate-hint ArgumentException swallowed by the driver, no CG errors.
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+        Assert.DoesNotContain(runDiags, d => d.Severity == DiagnosticSeverity.Error);
+
+        // Exactly one emitted file for the variant.
+        var variantTrees = result.GeneratedTrees
+            .Where(t => t.FilePath.Contains("EpicRestriction.RelationVariant", StringComparison.Ordinal))
+            .ToList();
+        Assert.Single(variantTrees);
+        Assert.Contains("public partial class EpicRestriction", variantTrees[0].ToString());
     }
 
     [Fact]
@@ -1599,9 +2100,11 @@ public sealed class EmissionShapeTests
             [CompositionRoot] public partial class Workspace { }
             """;
 
-        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
 
-        Assert.Contains(runDiags, d => d.Id == "CG030");
+        // Reported from the located-diagnostics path since 2026-07-02 — points at the
+        // first colliding variant's declaration; the message names every participant.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG030"), src, "public partial class FirstVariant");
         // Dispatcher is suppressed when the collision fires.
         Assert.Null(GeneratorHarness.FindGeneratedFile(result, "RestrictsHydration.g.cs"));
     }
@@ -1756,8 +2259,11 @@ public sealed class EmissionShapeTests
             [CompositionRoot] public partial class Workspace { }
             """;
 
-        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
-        Assert.Contains(runDiags, d => d.Id == "CG031");
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
+
+        // Reported from the located-diagnostics path since 2026-07-02 — resolves to
+        // the mismatched endpoint property via the member-location map.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG031"), src, "[Out] public partial IForRestricts Target");
     }
 
     // ─── shared-shape relation interface (preview.55): user-declared interface +
@@ -2379,5 +2885,37 @@ public sealed class EmissionShapeTests
 
         var (_, _, runDiags, _) = GeneratorHarness.Run(src);
         Assert.Contains(runDiags, d => d.Id == "CG032");
+    }
+
+    // ─────────────────────────── location assertion helpers ─────────────────────
+    //
+    // Mirrors DiagnosticsTests: fixtures compiled under FixturePath so the reported
+    // path is observable; line assertions anchor to a unique snippet of the fixture
+    // source rather than hard-coded numbers.
+
+    private const string FixturePath = "Fixture.cs";
+
+    private static void AssertLocationAt(Diagnostic diagnostic, string src, string snippet)
+    {
+        var lineSpan = diagnostic.Location.GetLineSpan();
+        Assert.Equal(FixturePath, lineSpan.Path);
+        Assert.Equal(LineOf(src, snippet), lineSpan.StartLinePosition.Line);
+    }
+
+    /// <summary>Zero-based line index of the first line containing <paramref name="snippet"/>.</summary>
+    private static int LineOf(string src, string snippet)
+    {
+        var index = src.IndexOf(snippet, StringComparison.Ordinal);
+        Assert.True(index >= 0, $"Snippet not found in fixture: {snippet}");
+        var line = 0;
+        for (var i = 0; i < index; i++)
+        {
+            if (src[i] == '\n')
+            {
+                line++;
+            }
+        }
+
+        return line;
     }
 }

@@ -250,6 +250,120 @@ public sealed class SurfaceQuery<T>
     }
 
     /// <summary>
+    /// Compile this query as an existence probe: <c>SELECT id FROM table … LIMIT 1</c>.
+    /// Cheaper than <see cref="CompileCount"/>'s <c>count() … GROUP ALL</c> (which folds
+    /// every matching row) — the id-only <c>LIMIT 1</c> shape lets the substrate stop at
+    /// the first hit. Like count, existence reports on the id pin and filters only:
+    /// ordering and paging are ignored, and Includes are not supported.
+    /// </summary>
+    public (string Sql, SurrealObject Bindings) CompileExists()
+    {
+        if (Includes.Count > 0)
+        {
+            throw new InvalidOperationException(
+                "CompileExists does not support Include* calls. Drop the includes before testing existence.");
+        }
+        return SurfaceQueryCompiler.CompileIdsOnly(Table, Filter, PinnedId, orderClauses: null, limit: 1, start: null);
+    }
+
+    /// <summary>
+    /// Execute this query as a server-side existence probe — <c>true</c> when at least
+    /// one row matches the id pin and filters. Compiles via <see cref="CompileExists"/>;
+    /// no entity hydration, no session.
+    /// </summary>
+    public Task<bool> ExistsAsync(SurrealClient db, CancellationToken ct = default)
+        => ExistsAsync(db.QueryAsync, ct);
+
+    /// <inheritdoc cref="ExistsAsync(Disruptor.Surreal.SurrealClient, CancellationToken)"/>
+    public Task<bool> ExistsAsync(SurrealTransaction tx, CancellationToken ct = default)
+        => ExistsAsync(tx.QueryAsync, ct);
+
+    private async Task<bool> ExistsAsync(
+        Func<string, SurrealObject?, CancellationToken, Task<SurrealQueryResponse>> queryFn,
+        CancellationToken ct)
+    {
+        var (sql, bindings) = CompileExists();
+        var response = await queryFn(sql, bindings, ct);
+        return ExtractRows(response) switch
+        {
+            SurrealListValue list => list.List.Count > 0,
+            SurrealObjectValue => true,
+            _ => false,
+        };
+    }
+
+    /// <summary>
+    /// Execute the query capped at one row and return the first match, or <c>null</c>
+    /// when nothing matches. Compiles the same entity SELECT shape as
+    /// <see cref="ExecuteAsync(Disruptor.Surreal.SurrealClient, CancellationToken)"/>
+    /// with <c>LIMIT 1</c> (overriding any user <see cref="Limit"/>; <see cref="Start"/>
+    /// and <see cref="OrderBy"/> still apply) and hydrates through the same
+    /// tracking path — Includes work, and the entity's navigation properties resolve
+    /// against the internal session exactly as they do for <c>ExecuteAsync</c>.
+    /// </summary>
+    public Task<T?> FirstOrDefaultAsync(SurrealClient db, CancellationToken ct = default)
+        => FirstOrDefaultAsync(db.QueryAsync, ct);
+
+    /// <inheritdoc cref="FirstOrDefaultAsync(Disruptor.Surreal.SurrealClient, CancellationToken)"/>
+    public Task<T?> FirstOrDefaultAsync(SurrealTransaction tx, CancellationToken ct = default)
+        => FirstOrDefaultAsync(tx.QueryAsync, ct);
+
+    private async Task<T?> FirstOrDefaultAsync(
+        Func<string, SurrealObject?, CancellationToken, Task<SurrealQueryResponse>> queryFn,
+        CancellationToken ct)
+    {
+        var entities = await Limit(1).ExecuteIntoSessionAsync(new SurrealSession(), queryFn, ct);
+        return entities.Count > 0 ? entities[0] : null;
+    }
+
+    /// <summary>
+    /// Execute the query expecting exactly one match and return it. Compiles with
+    /// <c>LIMIT 2</c> (enough to detect ambiguity without pulling the full result set;
+    /// overrides any user <see cref="Limit"/>) and hydrates through the same tracking
+    /// path as <see cref="ExecuteAsync(Disruptor.Surreal.SurrealClient, CancellationToken)"/>.
+    /// Throws <see cref="InvalidOperationException"/> when the query matches no rows or
+    /// more than one row.
+    /// </summary>
+    public Task<T> SingleAsync(SurrealClient db, CancellationToken ct = default)
+        => SingleAsync(db.QueryAsync, ct);
+
+    /// <inheritdoc cref="SingleAsync(Disruptor.Surreal.SurrealClient, CancellationToken)"/>
+    public Task<T> SingleAsync(SurrealTransaction tx, CancellationToken ct = default)
+        => SingleAsync(tx.QueryAsync, ct);
+
+    private async Task<T> SingleAsync(
+        Func<string, SurrealObject?, CancellationToken, Task<SurrealQueryResponse>> queryFn,
+        CancellationToken ct)
+        => await SingleCoreAsync(queryFn, ct)
+            ?? throw new InvalidOperationException(
+                $"Single query on '{Table}' matched no rows. Use SingleOrDefaultAsync if an empty result is a legal state.");
+
+    /// <summary>
+    /// As <see cref="SingleAsync(Disruptor.Surreal.SurrealClient, CancellationToken)"/>
+    /// but returns <c>null</c> when the query matches no rows. Still throws
+    /// <see cref="InvalidOperationException"/> on more than one match.
+    /// </summary>
+    public Task<T?> SingleOrDefaultAsync(SurrealClient db, CancellationToken ct = default)
+        => SingleCoreAsync(db.QueryAsync, ct);
+
+    /// <inheritdoc cref="SingleOrDefaultAsync(Disruptor.Surreal.SurrealClient, CancellationToken)"/>
+    public Task<T?> SingleOrDefaultAsync(SurrealTransaction tx, CancellationToken ct = default)
+        => SingleCoreAsync(tx.QueryAsync, ct);
+
+    private async Task<T?> SingleCoreAsync(
+        Func<string, SurrealObject?, CancellationToken, Task<SurrealQueryResponse>> queryFn,
+        CancellationToken ct)
+    {
+        var entities = await Limit(2).ExecuteIntoSessionAsync(new SurrealSession(), queryFn, ct);
+        if (entities.Count > 1)
+        {
+            throw new InvalidOperationException(
+                $"Single query on '{Table}' matched more than one row. Narrow the predicate, or use FirstOrDefaultAsync if any match will do.");
+        }
+        return entities.Count > 0 ? entities[0] : null;
+    }
+
+    /// <summary>
     /// Compile, execute, and hydrate the query against a caller-supplied
     /// <see cref="SurrealSession"/>. The session receives every traversed slice
     /// (root rows, inline-ref expansions, nested children) through
@@ -261,6 +375,13 @@ public sealed class SurfaceQuery<T>
     /// with a throw-away session. Direct callers can hydrate multiple queries into one
     /// session — useful for batched read-then-mutate flows — though the typical path is
     /// the generated <c>LoadAsync</c> extension.
+    /// </para>
+    /// <para>
+    /// Fail-closed: any dispatch or mid-loop hydration failure closes
+    /// <paramref name="session"/> with <see cref="SessionCloseKind.HydrationFailed"/>
+    /// (original exception preserved as <see cref="SessionCloseReason.Cause"/> and
+    /// rethrown unwrapped) — a caller-supplied session must not survive half old state,
+    /// half new, same boundary contract as <see cref="SurrealSession.FetchAsync{T}(SurfaceQuery{T}, SurrealClient, CancellationToken)"/>.
     /// </para>
     /// </summary>
     public Task<IReadOnlyList<T>> ExecuteIntoSessionAsync(
@@ -281,41 +402,61 @@ public sealed class SurfaceQuery<T>
         Func<string, SurrealObject?, CancellationToken, Task<SurrealQueryResponse>> queryFn,
         CancellationToken ct)
     {
-        var (sql, bindings) = SurfaceQueryCompiler.Compile(Table, Filter, PinnedId, Includes, OrderClauses, LimitCount, StartAt);
-        var response = await queryFn(sql, bindings, ct);
-        var rows = ExtractRows(response);
-
-        IHydrationSink sink = session;
-
-        var list = new List<T>();
-        if (rows is SurrealListValue arr)
+        try
         {
-            foreach (var row in arr.List)
+            var (sql, bindings) = SurfaceQueryCompiler.Compile(Table, Filter, PinnedId, Includes, OrderClauses, LimitCount, StartAt);
+            var response = await queryFn(sql, bindings, ct);
+            var rows = ExtractRows(response);
+
+            IHydrationSink sink = session;
+
+            // Collect the object rows first so entity k always pairs with rowObjs[k] in the
+            // nested-hydration pass below. Filtering inline while indexing the raw row array
+            // desyncs the pairing: one non-object row (e.g. a NONE element) would shift every
+            // subsequent entity onto its neighbour's nested slices.
+            var rowObjs = new List<SurrealObjectValue>();
+            if (rows is SurrealListValue arr)
             {
-                if (row is SurrealObjectValue obj)
+                foreach (var row in arr.List)
                 {
-                    list.Add(HydrateOne(obj, sink));
+                    if (row is SurrealObjectValue obj)
+                    {
+                        rowObjs.Add(obj);
+                    }
                 }
             }
-        }
-        else if (rows is SurrealObjectValue single)
-        {
-            list.Add(HydrateOne(single, sink));
-        }
+            else if (rows is SurrealObjectValue single)
+            {
+                rowObjs.Add(single);
+            }
 
-        // Walk each root row's nested arrays and feed them through Hydrate as well —
-        // children / inline-ref records emitted by the compiler land in the same session
-        // and reads of [Children] / [Reference] resolve correctly.
-        for (var i = 0; i < list.Count; i++)
-        {
-            var rowVal = rows is SurrealListValue rowArr ? rowArr.List[i] : rows!;
-            if (rowVal is SurrealObjectValue rowObj)
+            var list = new List<T>(rowObjs.Count);
+            foreach (var rowObj in rowObjs)
+            {
+                list.Add(HydrateOne(rowObj, sink));
+            }
+
+            // Walk each root row's nested arrays and feed them through Hydrate as well —
+            // children / inline-ref records emitted by the compiler land in the same session
+            // and reads of [Children] / [Reference] resolve correctly.
+            foreach (var rowObj in rowObjs)
             {
                 HydrateNested(rowObj, Includes, sink);
             }
-        }
 
-        return list;
+            return list;
+        }
+        catch (Exception ex)
+        {
+            // Fail-closed, same wrap as SurrealSession.FetchAsync: this method mutates
+            // the supplied session, so a mid-loop dispatch/hydration failure would
+            // otherwise leave the CALLER's session open and half old state, half new.
+            // For the fresh internal sessions the other terminals (ExecuteAsync,
+            // FirstOrDefaultAsync, Single*, generated LoadAsync) new up, closing is
+            // harmless — the throw discards them anyway.
+            session.CloseAsFailed(SessionCloseKind.HydrationFailed, ex);
+            throw;
+        }
 
         static T HydrateOne(SurrealObjectValue row, IHydrationSink sink)
         {

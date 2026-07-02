@@ -43,6 +43,14 @@ internal static class AggregateLoaderEmitter
                 continue;
             }
 
+            // CG044 losers are skipped — the loader class name and its AddSource hint
+            // key on the root's simple name, so a second same-named root would crash
+            // the whole generator (CS8785) instead of failing with the CG error.
+            if (graph.IsCollisionLoser(NameCollisionKind.AggregateRootName, root.FullName))
+            {
+                continue;
+            }
+
             EmitForAggregate(spc, graph, root, agg);
         }
     }
@@ -100,7 +108,7 @@ internal static class AggregateLoaderEmitter
                 
                 writer.Line("global::Disruptor.Surface.Runtime.IHydrationSink sink = ws;");
                 
-                writer.Line($"var __root = new global::{root.FullName}();");
+                writer.Line($"var __root = new {CSharpText.GlobalType(root.FullName)}();");
                 writer.Line("((global::Disruptor.Surface.Runtime.IEntity)__root).Hydrate(rootRow, sink);");
                 writer.Line("((global::Disruptor.Surface.Runtime.IEntity)__root).MarkAllSlicesLoaded(sink);");
                 
@@ -113,7 +121,7 @@ internal static class AggregateLoaderEmitter
                     }
 
                     var tableName = SurrealNaming.ToTableName(member.Name);
-                    writer.Line($"HydrateChildren<global::{member.FullName}>(rootRow, \"{tableName}\", sink);");
+                    writer.Line($"HydrateChildren<{CSharpText.GlobalType(member.FullName)}>(rootRow, \"{tableName}\", sink);");
                 }
 
                 foreach (var fwdKind in graph.RelationKinds.Where(k => k.Direction == RelationDirection.Forward).OrderBy(k => k.Name, StringComparer.Ordinal))
@@ -470,12 +478,12 @@ internal static class AggregateLoaderEmitter
     private static string StripGlobalAndNullable(string fqn)
     {
         const string prefix = "global::";
-        if (fqn.StartsWith(prefix))
+        if (fqn.StartsWith(prefix, StringComparison.Ordinal))
         {
             fqn = fqn[prefix.Length..];
         }
 
-        if (fqn.EndsWith("?"))
+        if (fqn.EndsWith("?", StringComparison.Ordinal))
         {
             fqn = fqn[..^1];
         }

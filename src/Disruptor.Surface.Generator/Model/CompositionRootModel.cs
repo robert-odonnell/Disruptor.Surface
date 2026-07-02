@@ -6,10 +6,16 @@ namespace Disruptor.Surface.Generator.Model;
 /// methods onto it. The class itself is the user's domain — accessibility, ctors,
 /// dependencies are entirely their concern; the generator only contributes the load
 /// methods.
+/// <para><paramref name="IssueLocation"/> is captured ONLY for declarations the linker
+/// will reject (nested — CG045, record — CG048) and MUST stay <c>null</c> otherwise;
+/// see <see cref="TableModel.IssueLocation"/> for the caching rationale.</para>
 /// </summary>
 public sealed record CompositionRootModel(
     string FullName,
     string Namespace,
     string Name,
     string DeclaredAccessibility,
-    bool IsPartial);
+    bool IsPartial,
+    bool IsNested,
+    bool IsRecord,
+    LocationInfo? IssueLocation);

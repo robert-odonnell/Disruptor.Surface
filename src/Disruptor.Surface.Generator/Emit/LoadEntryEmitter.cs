@@ -11,10 +11,11 @@ namespace Disruptor.Surface.Generator.Emit;
 /// to the same <c>{Root}AggregateLoader.PopulateAsync</c> the legacy path uses, so a
 /// caller can switch between the two without behavioural drift.
 /// <para>
-/// Filtered loads (queries with <c>Include*</c> calls present) throw
-/// <see cref="NotImplementedException"/> — the compiler-driven traversal-into-session
-/// pipeline lands in PR6. Until then, traversal results flow only through
-/// <c>Query&lt;T&gt;.ExecuteAsync</c>.
+/// Filtered loads (queries with <c>Include*</c> calls present) are supported: they
+/// route through <c>Query&lt;T&gt;.ExecuteIntoSessionAsync</c>, which compiles the
+/// include tree and tracks the hydrated rows into the fresh session. Unfiltered
+/// pinned-id loads take the aggregate-loader fast path
+/// (<c>{Root}AggregateLoader.PopulateAsync</c>).
 /// </para>
 /// <para>
 /// Skipped when no <c>[CompositionRoot]</c> is declared (the emitted body needs
@@ -36,7 +37,12 @@ internal static class LoadEntryEmitter
             return;
         }
 
-        var aggregateRoots = graph.Tables.Where(t => t.IsAggregateRoot).ToList();
+        // CG044 losers are skipped — the {Name}QueryLoad class and its AddSource hint
+        // key on the root's simple name (duplicate hint would be CS8785).
+        var aggregateRoots = graph.Tables
+            .Where(t => t.IsAggregateRoot)
+            .Where(t => !graph.IsCollisionLoser(NameCollisionKind.AggregateRootName, t.FullName))
+            .ToList();
         if (aggregateRoots.Count == 0)
         {
             return;
@@ -50,14 +56,10 @@ internal static class LoadEntryEmitter
 
     private static void EmitOne(SourceProductionContext spc, CompositionRootModel root, TableModel aggRoot)
     {
-        var entityFqn = string.IsNullOrEmpty(aggRoot.Namespace)
-            ? $"global::{aggRoot.Name}"
-            : $"global::{aggRoot.Namespace}.{aggRoot.Name}";
+        var entityFqn = CSharpText.GlobalName(aggRoot.Namespace, aggRoot.Name);
         var idFqn = $"{entityFqn}Id";
         var loaderFqn = $"global::Disruptor.Surface.Runtime.{aggRoot.Name}AggregateLoader";
-        var refRegistryFqn = string.IsNullOrEmpty(root.Namespace)
-            ? $"global::{root.Name}.ReferenceRegistry"
-            : $"global::{root.Namespace}.{root.Name}.ReferenceRegistry";
+        var refRegistryFqn = $"{CSharpText.GlobalName(root.Namespace, root.Name)}.ReferenceRegistry";
 
         var writer = new CodeWriter().Header();
         using (writer.Namespace(root.Namespace))

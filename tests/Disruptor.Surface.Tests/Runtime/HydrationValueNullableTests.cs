@@ -75,4 +75,40 @@ public sealed class HydrationValueNullableTests
         var obj = new SurrealObjectValue(new SurrealObject { ["title"] = SurrealValue.Null });
         Assert.Equal("", HydrationValue.ReadString(obj, "title"));
     }
+
+    [Fact]
+    public void ReadOrDefault_IntNarrowing_OutOfRange_ThrowsNamingFieldAndType()
+    {
+        // SurrealDB stores int64; a DB value outside the CLR target's range used to
+        // truncate silently under the unchecked cast. Post-fix: checked narrowing with
+        // the field and target type in the message.
+        var obj = new SurrealObjectValue(new SurrealObject { ["count"] = long.MaxValue });
+        var ex = Assert.Throws<OverflowException>(() => HydrationValue.ReadOrDefault<int>(obj, "count"));
+        Assert.Contains("count", ex.Message);
+        Assert.Contains("Int32", ex.Message);
+    }
+
+    [Fact]
+    public void ReadOrDefault_ShortNarrowing_OutOfRange_Throws()
+    {
+        // 70_000 used to truncate to 4_464 silently.
+        var obj = new SurrealObjectValue(new SurrealObject { ["count"] = 70_000L });
+        var ex = Assert.Throws<OverflowException>(() => HydrationValue.ReadOrDefault<short>(obj, "count"));
+        Assert.Contains("Int16", ex.Message);
+    }
+
+    [Fact]
+    public void ReadOrDefault_ByteNarrowing_Negative_Throws()
+    {
+        var obj = new SurrealObjectValue(new SurrealObject { ["count"] = -1L });
+        var ex = Assert.Throws<OverflowException>(() => HydrationValue.ReadOrDefault<byte>(obj, "count"));
+        Assert.Contains("Byte", ex.Message);
+    }
+
+    [Fact]
+    public void ReadOrDefault_IntNarrowing_InRange_StillConverts()
+    {
+        var obj = new SurrealObjectValue(new SurrealObject { ["count"] = (long)int.MaxValue });
+        Assert.Equal(int.MaxValue, HydrationValue.ReadOrDefault<int>(obj, "count"));
+    }
 }

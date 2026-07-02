@@ -98,4 +98,63 @@ public sealed class RecordIdTests
         Assert.StartsWith("m_", id.Value);
         Assert.Equal(RecordIdFormat.PrefixedHashLength, id.Value.Length);
     }
+
+    [Fact]
+    public void IsIdempotent_OnDefaultRecordId_IsFalse_NotNre()
+    {
+        // default(RecordId) has both components null — it's the in-band "no endpoint"
+        // sentinel the library itself logs for bulk Unrelate (Command.Unrelate). Reading
+        // IsIdempotent on it used to NRE on Value.Length; it must simply be false.
+        Assert.False(default(RecordId).IsIdempotent);
+    }
+
+    [Fact]
+    public void IsIdempotent_TrueForSentinel_FalseForRegularIds()
+    {
+        Assert.True(RecordId.Idempotent("restricts").IsIdempotent);
+        Assert.False(RecordId.New("designs").IsIdempotent);
+    }
+
+    [Fact]
+    public void ForEdge_IsDeterministic_AndProducesValidHashFormValue()
+    {
+        // The derivation the emitted variant id anchor uses (2026-07-02): same
+        // (source, edge, target) triple always yields the same edge id, and the value
+        // is the hash form the {Kind}Id ctor's RecordIdFormat validation accepts.
+        var src = new RecordId("constraints", "01H0000000000000000000000A");
+        var tgt = new RecordId("epics", "01H0000000000000000000000B");
+
+        var a = RecordId.ForEdge("restricts", src, tgt);
+        var b = RecordId.ForEdge("restricts", src, tgt);
+
+        Assert.Equal(a, b);
+        Assert.Equal("restricts", a.Table);
+        Assert.True(RecordIdFormat.IsValid(a.Value));
+        Assert.Equal(RecordIdFormat.HashLength, a.Value.Length);
+    }
+
+    [Fact]
+    public void ForEdge_DiffersByAnyTripleComponent()
+    {
+        var src = new RecordId("constraints", "01H0000000000000000000000A");
+        var tgt = new RecordId("epics", "01H0000000000000000000000B");
+        var baseline = RecordId.ForEdge("restricts", src, tgt);
+
+        Assert.NotEqual(baseline.Value, RecordId.ForEdge("validates", src, tgt).Value);
+        Assert.NotEqual(baseline, RecordId.ForEdge("restricts", tgt, src));
+        Assert.NotEqual(baseline, RecordId.ForEdge("restricts", src, new RecordId("epics", "01H0000000000000000000000C")));
+    }
+
+    [Fact]
+    public void ForEdge_MatchesResolveOnTheIdempotentSentinel()
+    {
+        // Resolve delegates to ForEdge — one derivation scheme, whether the caller
+        // goes through the sentinel by hand or the variant save path derives directly.
+        var src = new RecordId("constraints", "01H0000000000000000000000A");
+        var tgt = new RecordId("epics", "01H0000000000000000000000B");
+
+        Assert.Equal(
+            RecordId.Idempotent("restricts").Resolve(src, tgt),
+            RecordId.ForEdge("restricts", src, tgt));
+    }
 }

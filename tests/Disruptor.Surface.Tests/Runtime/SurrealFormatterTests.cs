@@ -28,6 +28,8 @@ public sealed class SurrealFormatterTests
     [InlineData("has space")]
     [InlineData("has;semicolon")]
     [InlineData("has\"quote")]
+    [InlineData("trailing_newline\n")]
+    [InlineData("\nleading_newline")]
     public void Identifier_Throws_OnUnsafeNames(string input)
         => Assert.Throws<SurrealFormatException>(input.Identifier);
 }

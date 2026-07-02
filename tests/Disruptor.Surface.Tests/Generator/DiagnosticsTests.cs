@@ -20,11 +20,11 @@ public sealed class DiagnosticsTests
                                [Id] public partial NotPartialId Id { get; set; }
                            }
                            """;
-        _ = GeneratorHarness.Run(src);
-        // CG001 reports against `compileDiags` (Errors), not run-time diagnostics.
-        // Actually wait — CG001 fires from ModelGenerator.Emit, so it shows up in run diagnostics.
-        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG001");
+        // Healthy-model diagnostic: located via the declaration-location map, pointing
+        // at the offending [Table] class declaration.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG001"), src, "[Table] public class NotPartial");
     }
 
     [Fact]
@@ -107,8 +107,11 @@ public sealed class DiagnosticsTests
                                [Property] public string Description { get; set; }
                            }
                            """;
-        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG022");
+        // Member-level precision: the map carries attributed property identifiers, so
+        // the diagnostic points at the non-partial property, not the class.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG022"), src, "[Property] public string Description");
     }
 
     [Fact]
@@ -135,8 +138,10 @@ public sealed class DiagnosticsTests
                 [Parent] public partial B ParentB { get; set; }
             }
             """;
-        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG011");
+        // Points at the entity that is claimed by both aggregates.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG011"), src, "[Table] public partial class Shared");
     }
 
     [Fact]
@@ -389,8 +394,11 @@ public sealed class DiagnosticsTests
             [CompositionRoot] public partial class Workspace { }
             """;
 
-        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG037");
+        // Index issues carry the property name, so the map resolves member-level
+        // precision: the diagnostic points at the mis-indexed property.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG037"), src, "[Lookup] public partial string ExternalKey");
     }
 
     [Fact]
@@ -490,5 +498,885 @@ public sealed class DiagnosticsTests
 
         var (_, _, runDiags, _) = GeneratorHarness.Run(src);
         Assert.Contains(runDiags, d => d.Id == "CG041");
+    }
+
+    [Fact]
+    public void CG042_TwoTables_SameSimpleName_AcrossNamespaces_CollideOnTableName()
+    {
+        // A.Design and B.Design both map to physical table `designs`. Before CG042 the
+        // schema silently interleaved both field sets onto one table and the generated
+        // query/hydration roots collided with CS0102/CS0111.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+
+            namespace A {
+                [Table] public partial class Design {
+                    [Property] public partial string Name { get; set; }
+                }
+            }
+
+            namespace B {
+                [Table] public partial class Design {
+                    [Property] public partial string Title { get; set; }
+                }
+            }
+
+            namespace M {
+                [CompositionRoot] public partial class Workspace { }
+            }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
+        Assert.Contains(runDiags, d => d.Id == "CG042");
+
+        // Message names both fully-qualified classes and the colliding table name.
+        var message = runDiags.First(d => d.Id == "CG042").GetMessage();
+        Assert.Contains("A.Design", message);
+        Assert.Contains("B.Design", message);
+        Assert.Contains("'designs'", message);
+
+        // Points at the first (ordinal-sorted) participant's declaration — A.Design,
+        // whose class declaration is also the first `class Design` in the fixture.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG042"), src, "[Table] public partial class Design");
+
+        // Fail-closed: no generator crash, and the colliding duplicate is not emitted —
+        // the schema defines `designs` exactly once.
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+        var schema = GeneratorHarness.FindGeneratedFile(result, "Schema.g.cs");
+        Assert.NotNull(schema);
+        var defines = schema.ToString().Split("DEFINE TABLE IF NOT EXISTS designs").Length - 1;
+        Assert.Equal(1, defines);
+    }
+
+    [Fact]
+    public void CG042_TwoTables_DistinctNames_PluralizeToSameTableName()
+    {
+        // Item and Items both pluralise to `items` — distinct simple names, same
+        // physical table name.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [Table] public partial class Item {
+                [Property] public partial string Name { get; set; }
+            }
+
+            [Table] public partial class Items {
+                [Property] public partial string Name { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG042");
+
+        var message = runDiags.First(d => d.Id == "CG042").GetMessage();
+        Assert.Contains("M.Item", message);
+        Assert.Contains("M.Items", message);
+        Assert.Contains("'items'", message);
+    }
+
+    [Fact]
+    public void CG043_TwoForwardKinds_SameSimpleName_CollideOnEdgeName()
+    {
+        // Two ReferencesAttribute kinds in different namespaces both derive edge table
+        // `references` — the exact shape the shipped sample used to have. Before CG043
+        // the generated schema defined the edge table twice with disagreeing FROM/TO.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+
+            namespace A {
+                public sealed class ReferencesAttribute : ForwardRelation;
+            }
+
+            namespace B {
+                public sealed class ReferencesAttribute : ForwardRelation;
+            }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG043");
+
+        var message = runDiags.First(d => d.Id == "CG043").GetMessage();
+        Assert.Contains("A.ReferencesAttribute", message);
+        Assert.Contains("B.ReferencesAttribute", message);
+        Assert.Contains("'references'", message);
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+    }
+
+    [Fact]
+    public void CG044_TwoAggregateRoots_SameSimpleName_CollideOnLoaderNames()
+    {
+        // Aggregate loader classes, Load{Name}Async members, and their AddSource hints
+        // all key on the root's simple name. Before CG044 this crashed the whole
+        // generator with a duplicate-hint ArgumentException (CS8785) and zero CG
+        // diagnostics.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+
+            namespace A {
+                [Table, AggregateRoot] public partial class Design {
+                    [Id] public partial DesignId Id { get; set; }
+                }
+            }
+
+            namespace B {
+                [Table, AggregateRoot] public partial class Design {
+                    [Id] public partial DesignId Id { get; set; }
+                }
+            }
+
+            namespace M {
+                [CompositionRoot] public partial class Workspace { }
+            }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG044");
+
+        var message = runDiags.First(d => d.Id == "CG044").GetMessage();
+        Assert.Contains("A.Design", message);
+        Assert.Contains("B.Design", message);
+        Assert.Contains("'Design'", message);
+
+        // The duplicate simple name also collides on the physical table name.
+        Assert.Contains(runDiags, d => d.Id == "CG042");
+
+        // Fail-closed: no duplicate-hint crash — exactly one aggregate loader emitted.
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+        var loaders = result.GeneratedTrees
+            .Where(t => t.FilePath.Contains("DesignAggregateLoader", StringComparison.Ordinal))
+            .ToList();
+        Assert.Single(loaders);
+    }
+
+    [Fact]
+    public void CG045_NestedTable_IsRejected()
+    {
+        // TableExtractor used to build FullName as {namespace}.{MetadataName}, dropping
+        // containing types — a nested [Table] emitted an orphan namespace-scoped partial
+        // (CS9248/CS9249 storm). CG045 rejects the shape and skips emission.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public partial class Outer {
+                [Table] public partial class Inner {
+                    [Property] public partial string Name { get; set; }
+                }
+            }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
+        Assert.Contains(runDiags, d => d.Id == "CG045");
+
+        var message = runDiags.First(d => d.Id == "CG045").GetMessage();
+        Assert.Contains("M.Outer.Inner", message);
+        Assert.Contains("[Table]", message);
+
+        // Issue-model location, captured at extraction: points at the nested class.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG045"), src, "[Table] public partial class Inner");
+
+        // Skipped emission: no partial fragment for the nested table.
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+        Assert.DoesNotContain(result.GeneratedTrees,
+            t => t.FilePath.Contains("Outer.Inner", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void CG045_NestedCompositionRoot_IsRejected()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public partial class Outer {
+                [CompositionRoot] public partial class Workspace { }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG045");
+        var message = runDiags.First(d => d.Id == "CG045").GetMessage();
+        Assert.Contains("M.Outer.Workspace", message);
+        Assert.Contains("[CompositionRoot]", message);
+    }
+
+    [Fact]
+    public void CG046_VariantWithDuplicateInRole_IsRejected()
+    {
+        // Two [In] members on one variant used to return null from the extractor with a
+        // comment promising a diagnostic "in a later phase" that could never fire — the
+        // user got a CS9248 wall (their partial props had no implementation half) and
+        // zero CG errors. Now the variant is filtered and CG046 names variant + role.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+
+            [Table] public partial class Constraint {
+                [Id] public partial ConstraintId Id { get; set; }
+            }
+
+            [Table] public partial class UserStory {
+                [Id] public partial UserStoryId Id { get; set; }
+            }
+
+            [Restricts]
+            public partial class TwoIns {
+                [In] public partial Constraint SourceA { get; set; }
+                [In] public partial Constraint SourceB { get; set; }
+                [Out] public partial UserStory Target { get; set; }
+            }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
+        Assert.Contains(runDiags, d => d.Id == "CG046");
+
+        var message = runDiags.First(d => d.Id == "CG046").GetMessage();
+        Assert.Contains("M.TwoIns", message);
+        Assert.Contains("[In]", message);
+
+        // Attribute-level precision: points at the SECOND (duplicate) [In] attribute,
+        // not the variant class — the location was captured from the attribute's
+        // application syntax at extraction time.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG046"), src, "[In] public partial Constraint SourceB");
+
+        // Fail-closed: no generator crash and no emission for the malformed variant.
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+        Assert.DoesNotContain(result.GeneratedTrees,
+            t => t.FilePath.Contains("TwoIns", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void CG046_VariantWithDuplicateIdRole_IsRejected()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+
+            [Table] public partial class Constraint {
+                [Id] public partial ConstraintId Id { get; set; }
+            }
+
+            [Restricts]
+            public partial class TwoIds {
+                [Id] public partial RestrictsId IdA { get; set; }
+                [Id] public partial RestrictsId IdB { get; set; }
+                [In] public partial Constraint Source { get; set; }
+                [Out] public partial Constraint Target { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG046");
+        Assert.NotNull(diag);
+        Assert.Contains("M.TwoIds", diag!.GetMessage());
+        Assert.Contains("[Id]", diag.GetMessage());
+    }
+
+    [Fact]
+    public void CG047_VariantWithNoResolvableEndpoints_IsRejected()
+    {
+        // A variant with a missing [In] is allowed through extraction (the linker may
+        // lift endpoints from an annotated shared-shape interface), but when no such
+        // interface exists the lift resolves nothing — previously the variant was
+        // dropped silently at RelationLinker.LiftVariantsFromSharedShape.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+
+            [Table] public partial class UserStory {
+                [Id] public partial UserStoryId Id { get; set; }
+            }
+
+            [Restricts]
+            public partial class NoSource {
+                [Out] public partial UserStory Target { get; set; }
+            }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
+        Assert.Contains(runDiags, d => d.Id == "CG047");
+
+        var message = runDiags.First(d => d.Id == "CG047").GetMessage();
+        Assert.Contains("M.NoSource", message);
+        Assert.Contains("[In]", message);
+
+        // CG047 is only decided after the shared-shape lift (no extraction-time
+        // location), so it resolves the variant declaration via the location map.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG047"), src, "public partial class NoSource");
+
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+    }
+
+    [Fact]
+    public void CG046_CG047_DoNotFire_OnWellFormedVariant()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+
+            [Table] public partial class Constraint {
+                [Id] public partial ConstraintId Id { get; set; }
+            }
+
+            [Table] public partial class UserStory {
+                [Id] public partial UserStoryId Id { get; set; }
+            }
+
+            [Restricts]
+            public partial class ConstraintRestrictsUserStory {
+                [In] public partial Constraint Source { get; set; }
+                [Out] public partial UserStory Target { get; set; }
+                [Property] public partial string Reason { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id is "CG046" or "CG047");
+    }
+
+    [Fact]
+    public void CG048_TableOnRecord_IsRejected()
+    {
+        // AttributeTargets.Class admits records, but the old FAWMN predicate only
+        // matched ClassDeclarationSyntax — `[Table] partial record X` compiled clean
+        // and generated nothing. The predicate now admits records and CG048 rejects.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [Table] public partial record Snapshot {
+                [Property] public partial string Name { get; set; }
+            }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
+        Assert.Contains(runDiags, d => d.Id == "CG048");
+
+        var message = runDiags.First(d => d.Id == "CG048").GetMessage();
+        Assert.Contains("M.Snapshot", message);
+        Assert.Contains("[Table]", message);
+
+        // Issue-model location, captured at extraction: points at the record declaration.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG048"), src, "[Table] public partial record Snapshot");
+
+        // Fail-closed: nothing emitted for the record.
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+        Assert.DoesNotContain(result.GeneratedTrees,
+            t => t.FilePath.Contains("Snapshot", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void CG048_CompositionRootOnRecord_IsRejected()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [CompositionRoot] public partial record Workspace { }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG048");
+        Assert.NotNull(diag);
+        Assert.Contains("M.Workspace", diag!.GetMessage());
+        Assert.Contains("[CompositionRoot]", diag.GetMessage());
+    }
+
+    [Fact]
+    public void CG048_RelationKindOnRecordVariant_IsRejected()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+
+            [Table] public partial class Constraint {
+                [Id] public partial ConstraintId Id { get; set; }
+            }
+
+            [Restricts]
+            public partial record RecordVariant {
+                [In] public partial Constraint Source { get; set; }
+                [Out] public partial Constraint Target { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG048");
+        Assert.NotNull(diag);
+        Assert.Contains("M.RecordVariant", diag!.GetMessage());
+        Assert.Contains("[Restricts]", diag.GetMessage());
+    }
+
+    [Fact]
+    public void CG049_GenericTable_IsRejected()
+    {
+        // Generic [Table] was half-supported: the partial declaration compiled but the
+        // physical table name ignored type arguments (Foo<int> and Foo<string> would
+        // share one table), FullName (Ns.Foo`1) never matched any use-site lookup, and
+        // the generated query/hydration roots referenced the open generic (CS0305).
+        // Rejected fail-closed with CG049.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [Table] public partial class Box<T> {
+                [Property] public partial string Label { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
+        Assert.Contains(runDiags, d => d.Id == "CG049");
+
+        var message = runDiags.First(d => d.Id == "CG049").GetMessage();
+        Assert.Contains("M.Box`1", message);
+        Assert.Contains("<T>", message);
+
+        // Issue-model location, captured at extraction: points at the generic declaration.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG049"), src, "[Table] public partial class Box<T>");
+
+        // Fail-closed: no partial fragment, no query-root accessor for the generic.
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+        Assert.DoesNotContain(result.GeneratedTrees,
+            t => t.FilePath.Contains("Box", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void CG049_DoesNotFire_OnNonGenericTable()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [Table] public partial class Plain {
+                [Property] public partial string Name { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id == "CG049");
+    }
+
+    [Fact]
+    public void CG050_ElementCollectionOfUnmappableElement_IsRejected()
+    {
+        // List<Uri> used to fall to the scalar save path (no ContentValue.Set overload
+        // → CS1503 in the .g.cs) with no diagnostic. CG050 rejects at the model boundary.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using System;
+            using System.Collections.Generic;
+            namespace M;
+
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Property] public partial IReadOnlyList<Uri> Links { get; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG050");
+        Assert.NotNull(diag);
+        Assert.Contains("M.Bad", diag!.GetMessage());
+        Assert.Contains("Links", diag.GetMessage());
+        Assert.Contains("Uri", diag.GetMessage());
+    }
+
+    [Fact]
+    public void CG050_NullableElementCollection_IsRejected()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using System.Collections.Generic;
+            namespace M;
+
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Property] public partial IReadOnlyList<int?> Counts { get; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG050");
+        Assert.NotNull(diag);
+        Assert.Contains("nullable element types", diag!.GetMessage());
+    }
+
+    [Fact]
+    public void CG050_UnconstructibleElementType_IsRejected()
+    {
+        // The element type has a writable member the schema can't persist (Uri) —
+        // saving would silently drop data on round-trip, so extraction refuses to
+        // resolve inline members and CG050 fires (previously: broken construction
+        // code in the .g.cs).
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using System;
+            using System.Collections.Generic;
+            namespace M;
+
+            public sealed class Attachment {
+                public string Name { get; set; } = "";
+                public Uri? Target { get; set; }
+            }
+
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Property] public partial IReadOnlyList<Attachment> Attachments { get; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG050");
+    }
+
+    [Fact]
+    public void CG050_DoesNotFire_OnSupportedElementShapes()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using System.Collections.Generic;
+            namespace M;
+
+            public sealed record Scenario(string Kind, string Description);
+
+            [Table] public partial class Holder {
+                [Id] public partial HolderId Id { get; set; }
+                [Property] public partial IReadOnlyList<Scenario> Scenarios { get; }
+                [Property] public partial IReadOnlyList<string> Tags { get; }
+                [Property] public partial List<int> Weights { get; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id is "CG050" or "CG051");
+    }
+
+    [Fact]
+    public void CG051_ElementCollectionWithSetter_IsRejected()
+    {
+        // The emitted impl is a getter-only view over a generated backing list, so a
+        // user-declared setter used to surface as a bare CS9252 in the .g.cs.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using System.Collections.Generic;
+            namespace M;
+
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Property] public partial IReadOnlyList<string> Tags { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG051");
+        Assert.NotNull(diag);
+        Assert.Contains("M.Bad", diag!.GetMessage());
+        Assert.Contains("Tags", diag.GetMessage());
+        Assert.Contains("AddTag", diag.GetMessage());
+    }
+
+    [Fact]
+    public void CG048_DoesNotFire_OnClassDeclarations()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [Table] public partial class Plain {
+                [Property] public partial string Name { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id == "CG048");
+    }
+
+    [Fact]
+    public void CG042_CG043_CG044_CG045_DoNotFire_OnNormalShapes()
+    {
+        // Distinct table names, one relation kind pair, one aggregate root, everything
+        // namespace-scoped — none of the uniqueness diagnostics may fire.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            using System.Collections.Generic;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+            public sealed class RestrictedByAttribute : InverseRelation<RestrictsAttribute>;
+
+            [Table, AggregateRoot] public partial class Design {
+                [Id] public partial DesignId Id { get; set; }
+                [Children] public partial IReadOnlyCollection<Constraint> Constraints { get; }
+                [RestrictedBy] public partial IReadOnlyCollection<IRecordId> Restrictions { get; }
+            }
+
+            [Table] public partial class Constraint {
+                [Id] public partial ConstraintId Id { get; set; }
+                [Parent] public partial Design Design { get; set; }
+                [Restricts] public partial IReadOnlyCollection<IRecordId> Restrictions { get; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id is "CG042" or "CG043" or "CG044" or "CG045");
+    }
+
+    [Fact]
+    public void CG052_AuditMarkerWithoutProperty()
+    {
+        // [CreatedAt] without [Property] — the marker overlays a persisted scalar
+        // column, so a bare marker has no field to stamp.
+        const string src = """
+            using System;
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [CreatedAt] public partial DateTimeOffset CreatedAtUtc { get; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
+        Assert.Contains(runDiags, d => d.Id == "CG052");
+        // Member-level precision via the declaration-location map.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG052"), src, "[CreatedAt] public partial DateTimeOffset CreatedAtUtc");
+    }
+
+    [Fact]
+    public void CG052_FiresWhenMarkerCombinedWithNonPropertyRole()
+    {
+        // [Version, Reference] — the marker only composes with a scalar [Property].
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Target {
+                [Id] public partial TargetId Id { get; set; }
+            }
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Version, Reference] public partial Target? Ref { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG052");
+    }
+
+    [Fact]
+    public void CG053_AuditMarkerOnNonDateTimeProperty()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [CreatedAt, Property] public partial string CreatedLabel { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG053");
+    }
+
+    [Fact]
+    public void CG053_VersionOnNonIntegerProperty()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Version, Property] public partial string Revision { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG053");
+    }
+
+    [Fact]
+    public void CG053_VersionOnNullableInt()
+    {
+        // Nullable is rejected: the guarded UPDATE's `version + 1` arithmetic and the
+        // `WHERE version = $expected` binding need a definite operand.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Version, Property] public partial int? Revision { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG053");
+    }
+
+    [Fact]
+    public void CG054_DuplicateMarkerOnTable()
+    {
+        const string src = """
+            using System;
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [CreatedAt, Property] public partial DateTimeOffset CreatedA { get; }
+                [CreatedAt, Property] public partial DateTimeOffset CreatedB { get; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG054");
+    }
+
+    [Fact]
+    public void CG055_MultipleMarkersOnOneProperty()
+    {
+        // [CreatedAt, UpdatedAt] on one field is contradictory: stamp-on-CREATE-only
+        // vs stamp-every-save can't both hold for the same column.
+        const string src = """
+            using System;
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [CreatedAt, UpdatedAt, Property] public partial DateTimeOffset Stamp { get; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG055");
+    }
+
+    [Fact]
+    public void CG052_CG053_CG054_CG055_DoNotFire_OnWellFormedAuditModel()
+    {
+        // The canonical shape: one [CreatedAt], one [UpdatedAt], one [Version], all
+        // combined with [Property], DateTimeOffset / DateTime / int / long typed,
+        // get-only. Long + DateTime variants covered too.
+        const string src = """
+            using System;
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Doc {
+                [Id] public partial DocId Id { get; set; }
+                [CreatedAt, Property] public partial DateTime Created { get; }
+                [UpdatedAt, Property] public partial DateTimeOffset Updated { get; }
+                [Version, Property] public partial long Version { get; }
+            }
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, compileDiags) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id is "CG052" or "CG053" or "CG054" or "CG055");
+        Assert.DoesNotContain(runDiags, d => d.Severity == DiagnosticSeverity.Error);
+        Assert.Empty(compileDiags);
+    }
+
+    [Fact]
+    public void CG056_VariantPayloadTypeNotMappable_WarnsAndCompiles()
+    {
+        // TimeSpan payload on a relation variant: no schema mapping. Previously the
+        // save path emitted a ContentValue.Set call with no matching overload (raw
+        // CS1503 wall in the .g.cs); now the field is omitted from DDL + wire and the
+        // user gets a warning naming the property.
+        const string src = """
+            using System;
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public sealed class LinksAttribute : ForwardRelation;
+
+            [Table] public partial class Node {
+                [Id] public partial NodeId Id { get; set; }
+            }
+
+            [Links] public partial class NodeLinksNode {
+                [In]  public partial Node Source { get; set; }
+                [Out] public partial Node Target { get; set; }
+                [Property] public partial TimeSpan Duration { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (result, _, runDiags, compileDiags) = GeneratorHarness.Run(src, FixturePath);
+
+        var warning = Assert.Single(runDiags, d => d.Id == "CG056");
+        Assert.Equal(DiagnosticSeverity.Warning, warning.Severity);
+        Assert.Contains("Duration", warning.GetMessage());
+        Assert.Contains("System.TimeSpan", warning.GetMessage());
+        // Member-level precision: points at the unmappable payload property.
+        AssertLocationAt(warning, src, "[Property] public partial TimeSpan Duration");
+
+        // Fail-soft: the fixture still compiles; the field is omitted from the DDL and
+        // from the dispatched edge content (the property stays as in-memory state).
+        Assert.Empty(compileDiags);
+        var schema = GeneratorHarness.FindGeneratedFile(result, "Workspace.Schema.g.cs");
+        Assert.NotNull(schema);
+        Assert.DoesNotContain("DEFINE FIELD IF NOT EXISTS duration", schema!.ToString());
+        var variant = GeneratorHarness.FindGeneratedFile(result, "NodeLinksNode");
+        Assert.NotNull(variant);
+        Assert.DoesNotContain("\"duration\"", variant!.ToString());
+        // With no persistable payload the variant takes the payload-less IGNORE path.
+        Assert.Contains("INSERT RELATION IGNORE INTO links", variant.ToString());
+    }
+
+    [Fact]
+    public void CG056_DoesNotFire_OnMappablePayload()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public sealed class LinksAttribute : ForwardRelation;
+
+            [Table] public partial class Node {
+                [Id] public partial NodeId Id { get; set; }
+            }
+
+            [Links] public partial class NodeLinksNode {
+                [In]  public partial Node Source { get; set; }
+                [Out] public partial Node Target { get; set; }
+                [Property] public partial string Label { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, compileDiags) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id == "CG056");
+        Assert.Empty(compileDiags);
+    }
+
+    // ── diagnostic source-location helpers ──────────────────────────────────────
+    //
+    // Diagnostics are reported with external-file locations rehydrated from the
+    // pipeline's LocationInfo records (path + span captured at extraction or resolved
+    // via the declaration-location map). The fixture is compiled under FixturePath so
+    // the reported path is observable; line assertions are anchored to a unique
+    // snippet of the fixture source rather than hard-coded numbers.
+
+    private const string FixturePath = "Fixture.cs";
+
+    private static void AssertLocationAt(Diagnostic diagnostic, string src, string snippet)
+    {
+        var lineSpan = diagnostic.Location.GetLineSpan();
+        Assert.Equal(FixturePath, lineSpan.Path);
+        Assert.Equal(LineOf(src, snippet), lineSpan.StartLinePosition.Line);
+    }
+
+    /// <summary>Zero-based line index of the first line containing <paramref name="snippet"/>.</summary>
+    private static int LineOf(string src, string snippet)
+    {
+        var index = src.IndexOf(snippet, StringComparison.Ordinal);
+        Assert.True(index >= 0, $"Snippet not found in fixture: {snippet}");
+        var line = 0;
+        for (var i = 0; i < index; i++)
+        {
+            if (src[i] == '\n')
+            {
+                line++;
+            }
+        }
+
+        return line;
     }
 }

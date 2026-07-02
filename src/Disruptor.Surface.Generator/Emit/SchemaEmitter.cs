@@ -30,6 +30,8 @@ namespace Disruptor.Surface.Generator.Emit;
 ///   <item>Inline-element collection <c>[Property]</c> (<c>IReadOnlyList&lt;T&gt;</c> /
 ///         <c>IList&lt;T&gt;</c> / <c>List&lt;T&gt;</c> of records) → <c>TYPE array&lt;object&gt;
 ///         DEFAULT []</c> plus per-member <c>field.*.member</c> sub-field DDL.</item>
+///   <item>Primitive-element collection <c>[Property]</c> (<c>IReadOnlyList&lt;string&gt;</c>,
+///         <c>List&lt;int&gt;</c>, …) → <c>TYPE array&lt;{scalar}&gt; DEFAULT []</c>.</item>
 ///   <item><c>[Reference]</c> → <c>TYPE record&lt;target&gt;</c> (or <c>option&lt;record&lt;…&gt;&gt;</c> when nullable),
 ///         plus <c>REFERENCE ON DELETE {behavior}</c> matching the <c>[Reject]</c>/<c>[Unset]</c>/
 ///         <c>[Cascade]</c>/<c>[Ignore]</c> attribute.</item>
@@ -132,7 +134,7 @@ internal static class SchemaEmitter
     private static void WriteRawStringContent(CodeWriter writer, string content)
     {
         var normalised = content.Replace("\r\n", "\n").Replace('\r', '\n');
-        if (normalised.EndsWith("\n"))
+        if (normalised.EndsWith("\n", StringComparison.Ordinal))
         {
             normalised = normalised[..^1];
         }
@@ -171,7 +173,12 @@ internal static class SchemaEmitter
     private static List<string> BuildChunks(ModelGraph graph)
     {
         var chunks = new List<string>();
-        var orderedTables = graph.Tables.OrderBy(t => t.Name, StringComparer.Ordinal).ToList();
+        // CG042 losers are skipped so the DDL doesn't silently interleave two CLR types'
+        // field sets onto one physical table; the CG error already fails the build.
+        var orderedTables = graph.Tables
+            .Where(t => !graph.IsCollisionLoser(NameCollisionKind.TableName, t.FullName))
+            .OrderBy(t => t.Name, StringComparer.Ordinal)
+            .ToList();
 
         // Chunk: entity table declarations.
         var entityTablesSb = new StringBuilder();
@@ -200,8 +207,11 @@ internal static class SchemaEmitter
         // RestrictsAttribute's FQN); the lookup keys exactly match RelationKindModel.FullName.
         var variantsByKind = graph.RelationVariants.ToLookup(v => v.KindAttributeFqn, StringComparer.Ordinal);
 
+        // CG043 losers are skipped so the same edge table isn't defined twice with
+        // disagreeing FROM/TO clauses; the CG error already fails the build.
         var fwdKinds = graph.RelationKinds
             .Where(k => k.Direction == RelationDirection.Forward)
+            .Where(k => !graph.IsCollisionLoser(NameCollisionKind.EdgeName, k.FullName))
             .OrderBy(k => k.Name, StringComparer.Ordinal);
         foreach (var fwdKind in fwdKinds)
         {
@@ -388,6 +398,21 @@ internal static class SchemaEmitter
             return;
         }
 
+        // Primitive-element collection — array<T> with the element's scalar mapping.
+        // Unsupported element shapes fall through to the "not mapped" comment below;
+        // CG050 has already failed the build for those.
+        if (IsElementCollection(p.Type) && p.Type.TypeArguments.Count == 1)
+        {
+            var element = p.Type.TypeArguments[0];
+            if (!element.IsNullable && MapScalarType(element).Type is { } elementType)
+            {
+                sb.Append("DEFINE FIELD IF NOT EXISTS ").Append(fieldName)
+                  .Append(" ON ").Append(tableName)
+                  .Append(" TYPE array<").Append(elementType).AppendLine("> DEFAULT [];");
+                return;
+            }
+        }
+
         var (surrealType, defaultExpr) = MapScalarType(p.Type);
         if (surrealType is null)
         {
@@ -419,7 +444,7 @@ internal static class SchemaEmitter
     internal static (string? Type, string? Default) MapScalarType(TypeRef type)
     {
         var fqn = StripGlobal(type.FullyQualifiedName);
-        if (fqn.EndsWith("?"))
+        if (fqn.EndsWith("?", StringComparison.Ordinal))
         {
             fqn = fqn[..^1];
         }
@@ -533,6 +558,11 @@ internal static class SchemaEmitter
             var (fieldType, fieldDefault) = MapScalarType(p.Type);
             if (fieldType is null)
             {
+                // Unmapped payload type — flagged as CG056 (warning) at validation; the
+                // save/hydrate emit skips the field too, so it's in-memory-only state.
+                sb.Append("// SCHEMA: payload type '").Append(p.Type.FullyQualifiedName)
+                  .Append("' on ").Append(edgeName).Append('.').Append(p.FieldName)
+                  .AppendLine(" not mapped; field omitted (CG056).");
                 continue;
             }
 
@@ -691,7 +721,7 @@ internal static class SchemaEmitter
             return exactMatch;
         }
 
-        if (simpleName.EndsWith("Id"))
+        if (simpleName.EndsWith("Id", StringComparison.Ordinal))
         {
             var stripped = simpleName[..^"Id".Length];
             var strippedMatch = graph.Tables.FirstOrDefault(t => t.Name == stripped);
@@ -728,5 +758,5 @@ internal static class SchemaEmitter
     }
 
     private static string StripGlobal(string fqn) =>
-        fqn.StartsWith("global::") ? fqn[8..] : fqn;
+        fqn.StartsWith("global::", StringComparison.Ordinal) ? fqn[8..] : fqn;
 }

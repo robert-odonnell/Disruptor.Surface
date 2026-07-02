@@ -77,10 +77,9 @@ internal static class PartialEmitter
                 declarationParts.Add("sealed");
             }
 
-            var typeParameters = table.TypeParameters.Count > 0
-                ? $"<{string.Join(", ", table.TypeParameters)}>"
-                : string.Empty;
-            declarationParts.Add($"partial class {table.Name}{typeParameters}");
+            // No type-parameter list: generic [Table] classes never reach the emitters —
+            // RelationLinker filters them into GenericTableIssues (CG049).
+            declarationParts.Add($"partial class {CSharpText.Identifier(table.Name)}");
 
             var baseTypes = new List<string> {
                 Namespaces.EntityInterface };
@@ -258,7 +257,7 @@ internal static class PartialEmitter
         var singular = SurrealNaming.Singularize(p.Name);
 
         writer.Line($"private readonly {listType} {backing} = new();");
-        writer.Line($"{access} partial {declaredType} {p.Name} => {backing};");
+        writer.Line($"{access} partial {declaredType} {CSharpText.Identifier(p.Name)} => {backing};");
         writer.Line($"public void Add{singular}({elementType} item) => {backing}.Add(item);");
         writer.Line($"public bool Remove{singular}({elementType} item) => {backing}.Remove(item);");
         writer.Line($"public void Clear{p.Name}() => {backing}.Clear();");
@@ -295,7 +294,7 @@ internal static class PartialEmitter
         var idArg = StripNullable(idType);
         var access = FormatAccessibility(p.DeclaredAccessibility);
 
-        using (writer.Block($"{access} partial {idType} {p.Name}"))
+        using (writer.Block($"{access} partial {idType} {CSharpText.Identifier(p.Name)}"))
         {
             writer.Line($"get => _id ??= {idArg}.New();");
             if (p.HasSetter)
@@ -335,11 +334,11 @@ internal static class PartialEmitter
 
         if (!p.HasSetter && !p.HasInitOnlySetter)
         {
-            writer.Line($"{access} partial {type} {p.Name} => {backing};");
+            writer.Line($"{access} partial {type} {CSharpText.Identifier(p.Name)} => {backing};");
             return;
         }
 
-        using (writer.Block($"{access} partial {type} {p.Name}"))
+        using (writer.Block($"{access} partial {type} {CSharpText.Identifier(p.Name)}"))
         {
             writer.Line($"get => {backing};");
             writer.Line($"{(p.HasInitOnlySetter ? "init" : "set")} => {backing} = value;");
@@ -376,7 +375,7 @@ internal static class PartialEmitter
         writer.Line($"private {typeArg}? {backing};");
         writer.Line($"private global::Disruptor.Surface.Runtime.RecordId? {idBacking};");
 
-        using (writer.Block($"{access} partial {declared} {p.Name}"))
+        using (writer.Block($"{access} partial {declared} {CSharpText.Identifier(p.Name)}"))
         {
             if (nullable)
             {
@@ -428,7 +427,7 @@ internal static class PartialEmitter
         var sliceKeyLit = Quote(sliceKey);
         var fetchHintLit = Quote($".Include{p.Name}(...) on the parent query");
 
-        using (writer.Block($"{access} partial {declared} {p.Name}"))
+        using (writer.Block($"{access} partial {declared} {CSharpText.Identifier(p.Name)}"))
         {
             using (writer.Block("get"))
             {
@@ -468,7 +467,7 @@ internal static class PartialEmitter
         writer.Line($"private {typeArg}? {backing};");
         writer.Line($"private global::Disruptor.Surface.Runtime.RecordId? {idBacking};");
 
-        using (writer.Block($"{access} partial {declared} {p.Name}"))
+        using (writer.Block($"{access} partial {declared} {CSharpText.Identifier(p.Name)}"))
         {
             // Getter
             if (!nullable)
@@ -533,7 +532,7 @@ internal static class PartialEmitter
         if (crossAggregate)
         {
             var method = p.RelationRole == RelationRole.ForwardRelation ? "QueryRelatedIds" : "QueryInverseRelatedIds";
-            using (writer.Block($"{access} partial {declared} {p.Name}"))
+            using (writer.Block($"{access} partial {declared} {CSharpText.Identifier(p.Name)}"))
             {
                 using (writer.Block("get"))
                 {
@@ -554,7 +553,7 @@ internal static class PartialEmitter
             ? "QueryOutgoing"
             : "QueryIncoming";
 
-        using (writer.Block($"{access} partial {declared} {p.Name}"))
+        using (writer.Block($"{access} partial {declared} {CSharpText.Identifier(p.Name)}"))
         {
             using (writer.Block("get"))
             {
@@ -616,7 +615,7 @@ internal static class PartialEmitter
     {
         var type = p.Type.FullyQualifiedName;
         var access = FormatAccessibility(p.DeclaredAccessibility);
-        writer.Line($"{access} partial {type} {p.Name} => throw new global::System.NotImplementedException();");
+        writer.Line($"{access} partial {type} {CSharpText.Identifier(p.Name)} => throw new global::System.NotImplementedException();");
     }
 
     private static string ToCamel(string s) =>
@@ -823,10 +822,49 @@ internal static class PartialEmitter
     /// </summary>
     private static void EmitSaveAsync(CodeWriter writer, TableModel table)
     {
+        // Library-managed value overlays — validated by CG052–CG055 before emit, so by
+        // this point each is a unique, correctly-typed scalar [Property].
+        var createdAtProp = table.Properties.FirstOrDefault(p => p.AutoValue == AutoValueKind.CreatedAt);
+        var updatedAtProp = table.Properties.FirstOrDefault(p => p.AutoValue == AutoValueKind.UpdatedAt);
+        var versionProp = table.Properties.FirstOrDefault(p => p.AutoValue == AutoValueKind.Version);
+
         using (writer.Block($"async global::System.Threading.Tasks.Task {Namespaces.EntityInterface}.SaveAsync(global::Disruptor.Surface.Runtime.ISaveContext ctx, global::System.Threading.CancellationToken ct)"))
         {
             writer.Line($"var __id = (({Namespaces.EntityInterface})this).Id;");
             writer.Line("var __isNew = !ctx.IsTracked(__id);");
+
+            // Audit stamping + version seed — write the backing fields BEFORE the
+            // content build so the standard scalar Set lines below pick the values up.
+            // One ctx.UtcNow read per dispatch: CREATE stamps created + updated with
+            // the same instant; UPDATE refreshes only updated ([CreatedAt] keeps its
+            // loaded value). [Version] seeds to 1 on CREATE; the UPDATE-side increment
+            // is deferred until the guarded dispatch succeeds (see below).
+            if (createdAtProp is not null || updatedAtProp is not null)
+            {
+                writer.Line("var __now = ctx.UtcNow;");
+            }
+
+            if (createdAtProp is not null || versionProp is not null)
+            {
+                writer.Line("if (__isNew)");
+                using (writer.BracedBlock())
+                {
+                    if (createdAtProp is not null)
+                    {
+                        writer.Line($"_{ToCamel(createdAtProp.Name)} = {AuditInstantExpr(createdAtProp)};");
+                    }
+
+                    if (versionProp is not null)
+                    {
+                        writer.Line($"_{ToCamel(versionProp.Name)} = 1;");
+                    }
+                }
+            }
+
+            if (updatedAtProp is not null)
+            {
+                writer.Line($"_{ToCamel(updatedAtProp.Name)} = {AuditInstantExpr(updatedAtProp)};");
+            }
 
             // Forward dependency walk: [Reference] + [Parent], skip relation-role properties.
             // Backing fields hold the entity ref directly under the new pure-setter model, so
@@ -890,7 +928,7 @@ internal static class PartialEmitter
                                 foreach (var im in p.InlineMembers)
                                 {
                                     var subLit = Quote(SurrealNaming.ToFieldName(im.Name));
-                                    writer.Line($"global::Disruptor.Surface.Runtime.ContentValue.Set({objLocal}, {subLit}, {elemLocal}.{im.Name});");
+                                    writer.Line($"global::Disruptor.Surface.Runtime.ContentValue.Set({objLocal}, {subLit}, {elemLocal}.{CSharpText.Identifier(im.Name)});");
                                 }
 
                                 writer.Line($"__list.Add(new global::Disruptor.Surreal.Values.SurrealObjectValue({objLocal}));");
@@ -898,6 +936,13 @@ internal static class PartialEmitter
 
                             writer.Line($"__content[{fieldLit}] = new global::Disruptor.Surreal.Values.SurrealListValue(__list);");
                         }
+                    }
+                    else if (p.AutoValue == AutoValueKind.Version)
+                    {
+                        // [Version] — CREATE dispatches the seeded value (1); UPDATE
+                        // dispatches n+1 while the backing field still holds n (the
+                        // in-memory bump waits for the guarded dispatch to succeed).
+                        writer.Line($"global::Disruptor.Surface.Runtime.ContentValue.Set(__content, {fieldLit}, __isNew ? {backing} : {backing} + 1);");
                     }
                     else
                     {
@@ -918,18 +963,65 @@ internal static class PartialEmitter
                 }
             }
 
-            // Typed CBOR dispatch — SDK methods accept ISurrealRecordId + SurrealObject and
-            // CBOR-encode end-to-end. No SurrealQL string, no escape rules.
+            // Typed CBOR dispatch through the ISaveContext seam — the single-save
+            // context dispatches immediately via the SDK's typed methods (CBOR
+            // end-to-end, no SurrealQL string, no escape rules); the batch-save
+            // context buffers plain creates so contiguous same-table CREATEs coalesce
+            // into one INSERT statement.
             writer.Line("if (__isNew)");
             using (writer.Indent())
             {
-                writer.Line("await ctx.Transaction.CreateAsync(global::Disruptor.Surface.Runtime.RecordIdSdkBridge.ToSdk(__id), __content, ct);");
+                writer.Line("await ctx.DispatchCreateAsync(__id, __content, ct);");
             }
 
-            writer.Line("else");
-            using (writer.Indent())
+            if (versionProp is null)
             {
-                writer.Line("await ctx.Transaction.UpsertAsync(global::Disruptor.Surface.Runtime.RecordIdSdkBridge.ToSdk(__id), __content, ct);");
+                writer.Line("else");
+                using (writer.Indent())
+                {
+                    writer.Line("await ctx.DispatchUpsertAsync(__id, __content, ct);");
+                }
+            }
+            else
+            {
+                // [Version]-guarded UPDATE. The plain path uses the typed upsert seam,
+                // but the guard needs a WHERE clause, so this goes through the raw-query
+                // seam with typed CBOR bindings (same "UPDATE $_record_id
+                // CONTENT $_content" shape the SDK's own UpdateAsync issues, plus the
+                // version guard). A non-matching WHERE returns an empty result set —
+                // no row carried the expected version, i.e. a competing writer bumped
+                // it since this session loaded. Fail closed: throw before MarkSaved;
+                // the throw propagates through SurrealSession.SaveAsync's catch, which
+                // closes the session. Only a confirmed match bumps the in-memory value.
+                var versionBacking = $"_{ToCamel(versionProp.Name)}";
+                var versionField = SurrealNaming.ToFieldName(versionProp.Name);
+                writer.Line("else");
+                using (writer.BracedBlock())
+                {
+                    writer.Line($"var __expectedVersion = {versionBacking};");
+                    writer.Line("var __versionBindings = new global::Disruptor.Surreal.Values.SurrealObject");
+                    writer.Line("{");
+                    using (writer.Indent())
+                    {
+                        writer.Line("[\"_record_id\"] = new global::Disruptor.Surreal.Values.SurrealRecordIdValue(global::Disruptor.Surface.Runtime.RecordIdSdkBridge.ToSdk(__id)),");
+                        writer.Line("[\"_content\"] = new global::Disruptor.Surreal.Values.SurrealObjectValue(__content),");
+                    }
+
+                    writer.Line("};");
+                    writer.Line("global::Disruptor.Surface.Runtime.ContentValue.Set(__versionBindings, \"_expected_version\", __expectedVersion);");
+                    writer.Line($"const string __versionSql = \"UPDATE $_record_id CONTENT $_content WHERE {versionField} = $_expected_version;\";");
+                    writer.Line("var __versionResponse = await ctx.DispatchQueryAsync(__versionSql, __versionBindings, ct);");
+                    writer.Line("__versionResponse.EnsureSuccess();");
+                    writer.Line("var __versionResult = __versionResponse.Count > 0 ? __versionResponse.Take(0) : global::Disruptor.Surreal.Values.SurrealValue.None;");
+                    writer.Line("var __versionMatched = __versionResult is global::Disruptor.Surreal.Values.SurrealObjectValue or global::Disruptor.Surreal.Values.SurrealListValue { List.Count: > 0 };");
+                    writer.Line("if (!__versionMatched)");
+                    using (writer.Indent())
+                    {
+                        writer.Line("throw new global::Disruptor.Surface.Runtime.SurrealVersionConflictException(__id, __expectedVersion);");
+                    }
+
+                    writer.Line($"{versionBacking} = __expectedVersion + 1;");
+                }
             }
 
             writer.Line("ctx.MarkSaved(this);");
@@ -945,7 +1037,7 @@ internal static class PartialEmitter
                 }
 
                 var elemLocal = $"__child_{ToCamel(p.Name)}";
-                using (writer.Block($"foreach (var {elemLocal} in this.{p.Name})"))
+                using (writer.Block($"foreach (var {elemLocal} in this.{CSharpText.Identifier(p.Name)})"))
                 {
                     writer.Line($"if (!ctx.IsTracked((({Namespaces.EntityInterface}){elemLocal}).Id))");
                     using (writer.Indent())
@@ -964,6 +1056,18 @@ internal static class PartialEmitter
             // expect from any client that doesn't re-implement a write buffer in front of it.
         }
     }
+
+    /// <summary>
+    /// The expression assigning the per-dispatch <c>__now</c> instant (a
+    /// <c>DateTimeOffset</c> read from <c>ISaveContext.UtcNow</c>) into an audit
+    /// backing field. <c>DateTime</c>-typed audit fields store <c>UtcDateTime</c> —
+    /// deterministic and Kind=Utc, matching the write path's instant contract
+    /// (<c>ContentValue.ToInstant</c> treats Utc as identity).
+    /// </summary>
+    private static string AuditInstantExpr(PropertyModel p)
+        => StripNullable(p.Type.FullyQualifiedName) is "global::System.DateTime" or "System.DateTime"
+            ? "__now.UtcDateTime"
+            : "__now";
 
     // ──────────────────────────── Hydrate emission ──────────────────────────
 
@@ -1003,9 +1107,18 @@ internal static class PartialEmitter
             {
                 if (p.Kinds.HasFlag(PropertyKind.Property))
                 {
-                    if (IsElementCollection(p.Type) && p.InlineMembers.Count > 0)
+                    if (IsElementCollection(p.Type))
                     {
-                        EmitHydrateElementCollection(writer, p);
+                        // Element collections repopulate the generated readonly backing
+                        // list (Clear + Add) — assigning it like a scalar would be CS0191.
+                        if (p.InlineMembers.Count > 0)
+                        {
+                            EmitHydrateElementCollection(writer, p);
+                        }
+                        else
+                        {
+                            EmitHydratePrimitiveElementCollection(writer, p);
+                        }
                     }
                     else
                     {
@@ -1062,13 +1175,13 @@ internal static class PartialEmitter
     }
 
     /// <summary>
-    /// Hydrates an element-collection [Property] of records (the
+    /// Hydrates an element-collection [Property] of records / POCOs (the
     /// <c>IReadOnlyList&lt;Scenario&gt;</c> shape): clears the backing list, walks the
-    /// SurrealListValue elements, constructs each <c>T</c> via its primary constructor
-    /// using the public scalar properties discovered at codegen time. Pure typed code,
-    /// no reflection. Primitive-element collections take the
-    /// <see cref="EmitHydrateValueProperty"/> path instead (HydrationValue's typed
-    /// converter handles primitive element types).
+    /// SurrealListValue elements, constructs each <c>T</c> per the construction shape
+    /// resolved at extraction time — named constructor arguments for the
+    /// positional-record shape, an object initializer for the parameterless-ctor POCO
+    /// shape. Pure typed code, no reflection. Primitive-element collections take
+    /// <see cref="EmitHydratePrimitiveElementCollection"/> instead.
     /// </summary>
     private static void EmitHydrateElementCollection(CodeWriter writer, PropertyModel p)
     {
@@ -1084,6 +1197,7 @@ internal static class PartialEmitter
         var arrLocal = $"__sl_{ToCamel(p.Name)}";
         var elemLocal = $"__el_{ToCamel(p.Name)}";
         var elemObjLocal = $"__eo_{ToCamel(p.Name)}";
+        var objectInit = p.InlineConstruction == InlineConstructionKind.ObjectInitializer;
 
         using (writer.Block($"if (__obj.Object.TryGetValue({fieldLit}, out var {arrLocal}) && {arrLocal} is global::Disruptor.Surreal.Values.SurrealListValue {arrLocal}Cast)"))
         {
@@ -1091,7 +1205,14 @@ internal static class PartialEmitter
             using (writer.Block($"foreach (var {elemLocal} in {arrLocal}Cast.List)"))
             {
                 writer.Line($"if ({elemLocal} is not global::Disruptor.Surreal.Values.SurrealObjectValue {elemObjLocal}) continue;");
-                writer.Line($"{backing}.Add(new {elementType}(");
+                writer.Line(objectInit
+                    ? $"{backing}.Add(new {elementType}"
+                    : $"{backing}.Add(new {elementType}(");
+                if (objectInit)
+                {
+                    writer.Line("{");
+                }
+
                 using (writer.Indent())
                 {
                     for (var i = 0; i < p.InlineMembers.Count; i++)
@@ -1101,22 +1222,53 @@ internal static class PartialEmitter
                         var typeFqn = im.Type.FullyQualifiedName;
                         // String fast-path mirrors EmitHydrateValueProperty's optimisation:
                         // only non-nullable strings use the empty-string fallback.
-                        var trailing = i == p.InlineMembers.Count - 1 ? "" : ",";
+                        var trailing = !objectInit && i == p.InlineMembers.Count - 1 ? "" : ",";
+                        var assign = objectInit ? $"{CSharpText.Identifier(im.Name)} = " : $"{CSharpText.Identifier(im.Name)}: ";
                         var nullable = im.Type.IsNullable;
                         var isString = typeFqn is "string" or "global::System.String" or "string?" or "global::System.String?";
                         if (!nullable && isString)
                         {
-                            writer.Line($"{im.Name}: global::Disruptor.Surface.Runtime.HydrationValue.ReadString({elemObjLocal}, {subLit}){trailing}");
+                            writer.Line($"{assign}global::Disruptor.Surface.Runtime.HydrationValue.ReadString({elemObjLocal}, {subLit}){trailing}");
                         }
                         else
                         {
                             var deserialiseAs = nullable && !isString ? typeFqn : StripNullable(typeFqn);
-                            writer.Line($"{im.Name}: global::Disruptor.Surface.Runtime.HydrationValue.ReadOrDefault<{deserialiseAs}>({elemObjLocal}, {subLit}){trailing}");
+                            writer.Line($"{assign}global::Disruptor.Surface.Runtime.HydrationValue.ReadOrDefault<{deserialiseAs}>({elemObjLocal}, {subLit}){trailing}");
                         }
                     }
                 }
 
-                writer.Line("));");
+                writer.Line(objectInit ? "});" : "));");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Hydrates a primitive-element collection [Property] (<c>IReadOnlyList&lt;string&gt;</c>,
+    /// <c>List&lt;int&gt;</c>, …): reads the row's array through
+    /// <see cref="Disruptor.Surface.Runtime.HydrationValue"/>'s typed list conversion,
+    /// then repopulates the generated readonly backing list (Clear + AddRange) — the
+    /// scalar assignment path would be CS0191 against the readonly field.
+    /// </summary>
+    private static void EmitHydratePrimitiveElementCollection(CodeWriter writer, PropertyModel p)
+    {
+        var backing = $"_{ToCamel(p.Name)}";
+        var fieldLit = Quote(SurrealNaming.ToFieldName(p.Name));
+        if (p.Type.TypeArguments.Count == 0)
+        {
+            writer.Line($"throw new global::System.NotSupportedException(\"Hydrate: collection element type for property '{p.Name}' could not be resolved at codegen time.\");");
+            return;
+        }
+
+        var elementType = StripNullable(p.Type.TypeArguments[0].FullyQualifiedName);
+        var valsLocal = $"__vals_{ToCamel(p.Name)}";
+        using (writer.BracedBlock())
+        {
+            writer.Line($"var {valsLocal} = global::Disruptor.Surface.Runtime.HydrationValue.ReadOrDefault<global::System.Collections.Generic.List<{elementType}>>(__obj, {fieldLit});");
+            using (writer.Block($"if ({valsLocal} is not null)"))
+            {
+                writer.Line($"{backing}.Clear();");
+                writer.Line($"{backing}.AddRange({valsLocal});");
             }
         }
     }
@@ -1161,10 +1313,10 @@ internal static class PartialEmitter
 
     // ──────────────────────────── helpers ────────────────────────────────────
 
-    private static string Quote(string s) => $"\"{s.Replace("\"", "\\\"")}\"";
+    private static string Quote(string s) => CSharpText.Quote(s);
 
     private static string StripNullable(string typeName)
-        => typeName.EndsWith("?") ? typeName[..^1] : typeName;
+        => typeName.EndsWith("?", StringComparison.Ordinal) ? typeName[..^1] : typeName;
 
     private static string FormatAccessibility(string raw) => raw switch
     {

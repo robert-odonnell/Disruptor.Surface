@@ -31,6 +31,55 @@ internal static class RelationLinker
         ImmutableArray<UnionMembershipCandidate> unionMembershipCandidates,
         ImmutableArray<SharedShapeInterfaceCandidate> sharedShapeCandidates)
     {
+        // Multi-declaration dedupe. The CreateSyntaxProvider-based extractors (relation
+        // kinds, relation variants, shared shapes) run once per *declaration*, but
+        // GetDeclaredSymbol merges partials — a type split across two matching partial
+        // declarations yields N identical models, and the per-symbol emitters would then
+        // AddSource the same hint twice (ArgumentException → CS8785, generator contributes
+        // nothing). Models are value-equatable, so keep the first occurrence per full name.
+        // Union candidates are exempt on purpose: interface candidates are deduped by the
+        // per-interface accumulator in ComputeUnionEndpoints, and membership candidates are
+        // intentionally per-declaration (each partial contributes its own base list).
+        forwardKinds = DedupeByFullName(forwardKinds, static k => k.FullName);
+        inverseKinds = DedupeByFullName(inverseKinds, static k => k.FullName);
+        relationVariants = DedupeByFullName(relationVariants, static v => v.FullName);
+        sharedShapeCandidates = DedupeByFullName(sharedShapeCandidates, static c => c.InterfaceFullName);
+
+        // CG045 — nested [Table] / [CompositionRoot] declarations. The emitters produce
+        // namespace-scoped partials only, so a nested declaration would emit an orphan
+        // top-level partial (CS9248/CS9249 storm) and every string-keyed graph lookup
+        // (aggregate membership, cascade cycles, CG017/CG021) would silently miss it.
+        // Fail closed: pull them out of the model here; ModelGenerator.Emit reports the
+        // issue list.
+        var nestedTypeIssues = ImmutableArray.CreateBuilder<NestedTypeIssueModel>();
+        tables = FilterNestedTables(tables, nestedTypeIssues);
+        compositionRoots = FilterNestedCompositionRoots(compositionRoots, nestedTypeIssues);
+
+        // CG048 — [Table] / [CompositionRoot] / relation kind attributes on record
+        // declarations. The FAWMN predicates admit records only so we can reject them
+        // here; the emitters' partial-class fragments don't compose with record
+        // synthesis. Same fail-closed pattern as nested types above.
+        var recordTypeIssues = ImmutableArray.CreateBuilder<RecordTypeIssueModel>();
+        tables = FilterRecords(tables, recordTypeIssues, static t => t.IsRecord, static t => (t.FullName, "Table", t.IssueLocation));
+        compositionRoots = FilterRecords(compositionRoots, recordTypeIssues, static r => r.IsRecord, static r => (r.FullName, "CompositionRoot", r.IssueLocation));
+        relationVariants = FilterRecords(relationVariants, recordTypeIssues, static v => v.IsRecord,
+            static v => (v.FullName, SurrealNaming.StripAttributeSuffix(SurrealNaming.SimpleName(v.KindAttributeFqn)), v.IssueLocation));
+
+        // CG049 — generic [Table] classes, rejected fail-closed. Nothing downstream
+        // supports them: the table name ignores type arguments (closed constructions
+        // would share one physical table), {Name}Id is non-generic, the query/hydration
+        // roots would reference an open generic (CS0305), and every string-keyed graph
+        // lookup misses the backtick-arity FullName.
+        var genericTableIssues = ImmutableArray.CreateBuilder<GenericTableIssueModel>();
+        tables = FilterGenericTables(tables, genericTableIssues);
+
+        // CG046 — variants declaring the same singular role ([In]/[Out]/[Id]) more than
+        // once. The extractor flags them (RelationVariantModel.DuplicateRoles) instead of
+        // dropping them, so the user gets a diagnostic naming the variant and the role
+        // rather than a CS9248 wall. Same fail-closed pattern as nested types above.
+        var relationVariantIssues = ImmutableArray.CreateBuilder<RelationVariantIssueModel>();
+        relationVariants = FilterDuplicateRoleVariants(relationVariants, relationVariantIssues);
+
         var tableFullNames = new HashSet<string>();
         foreach (var t in tables)
         {
@@ -59,10 +108,11 @@ internal static class RelationLinker
         // Variants whose own annotated members are empty get In / Out / Id / Payload
         // lifted from a matching annotated shared-shape interface (preview.56). Variants
         // whose In or Out remain null after the lift attempt — because no matching
-        // shared-shape interface is annotated — are dropped silently here, the same
-        // fail-soft contract the extractor used to enforce by returning null pre-lift.
-        // Real merge conflicts are still fail-closed, but now flow to emit as CG036.
-        var (liftedVariants, liftConflicts) = LiftVariantsFromSharedShape(rewrittenVariants, sharedShapeCandidates, tableFullNames);
+        // shared-shape interface is annotated — are filtered into the issue list and
+        // reported as CG047 by ModelGenerator.Emit (they used to be dropped silently).
+        // Real merge conflicts stay fail-closed too, flowing to emit as CG036.
+        var (liftedVariants, liftConflicts) = LiftVariantsFromSharedShape(
+            rewrittenVariants, sharedShapeCandidates, tableFullNames, relationVariantIssues);
 
         var unions = ComputeUnions(linked, forwardKinds, inverseKinds);
         var unionEndpoints = ComputeUnionEndpoints(linked, unionInterfaceCandidates, unionMembershipCandidates);
@@ -70,6 +120,7 @@ internal static class RelationLinker
         var (indexes, indexIssues) = ComputeIndexes(linked);
         var (aggregates, conflicts) = ComputeAggregates(linked);
         var cascadeCycles = ComputeCascadeCycles(linked);
+        var nameCollisions = ComputeNameCollisions(linked, forwardKinds);
 
         return new ModelGraph(
             Tables: linked,
@@ -81,10 +132,245 @@ internal static class RelationLinker
             SharedShapeLiftConflicts: new EquatableArray<SharedShapeLiftConflict>(liftConflicts),
             Indexes: new EquatableArray<IndexModel>(indexes),
             IndexIssues: new EquatableArray<IndexIssueModel>(indexIssues),
+            NameCollisions: new EquatableArray<NameCollisionModel>(nameCollisions),
+            NestedTypeIssues: new EquatableArray<NestedTypeIssueModel>(nestedTypeIssues.ToImmutable()),
+            RecordTypeIssues: new EquatableArray<RecordTypeIssueModel>(recordTypeIssues.ToImmutable()),
+            GenericTableIssues: new EquatableArray<GenericTableIssueModel>(genericTableIssues.ToImmutable()),
+            RelationVariantIssues: new EquatableArray<RelationVariantIssueModel>(relationVariantIssues.ToImmutable()),
             Aggregates: new EquatableArray<AggregateModel>(aggregates),
             AggregateConflicts: new EquatableArray<string>(conflicts),
             CascadeCycles: new EquatableArray<string>(cascadeCycles),
             CompositionRoots: new EquatableArray<CompositionRootModel>(compositionRoots));
+    }
+
+    private static ImmutableArray<TableModel> FilterNestedTables(
+        ImmutableArray<TableModel> tables,
+        ImmutableArray<NestedTypeIssueModel>.Builder issues)
+    {
+        if (!tables.Any(static t => t.IsNested))
+        {
+            return tables;
+        }
+
+        var kept = ImmutableArray.CreateBuilder<TableModel>(tables.Length);
+        foreach (var t in tables)
+        {
+            if (t.IsNested)
+            {
+                issues.Add(new NestedTypeIssueModel(t.FullName, "Table", t.IssueLocation));
+            }
+            else
+            {
+                kept.Add(t);
+            }
+        }
+
+        return kept.ToImmutable();
+    }
+
+    /// <summary>
+    /// Pulls generic <c>[Table]</c> classes (CG049) out of the table set. See
+    /// <see cref="GenericTableIssueModel"/> for why generic tables are fail-closed.
+    /// </summary>
+    private static ImmutableArray<TableModel> FilterGenericTables(
+        ImmutableArray<TableModel> tables,
+        ImmutableArray<GenericTableIssueModel>.Builder issues)
+    {
+        if (!tables.Any(static t => t.TypeParameters.Count > 0))
+        {
+            return tables;
+        }
+
+        var kept = ImmutableArray.CreateBuilder<TableModel>(tables.Length);
+        foreach (var t in tables)
+        {
+            if (t.TypeParameters.Count > 0)
+            {
+                issues.Add(new GenericTableIssueModel(
+                    t.FullName,
+                    t.Name,
+                    string.Join(", ", t.TypeParameters),
+                    t.IssueLocation));
+            }
+            else
+            {
+                kept.Add(t);
+            }
+        }
+
+        return kept.ToImmutable();
+    }
+
+    /// <summary>
+    /// Pulls record-declared models (CG048) out of a collected set, adding one
+    /// <see cref="RecordTypeIssueModel"/> per offender. Generic over the model type so
+    /// tables, composition roots, and relation variants share one filter.
+    /// </summary>
+    private static ImmutableArray<T> FilterRecords<T>(
+        ImmutableArray<T> models,
+        ImmutableArray<RecordTypeIssueModel>.Builder issues,
+        Func<T, bool> isRecord,
+        Func<T, (string FullName, string AttributeName, LocationInfo? Location)> describe)
+    {
+        if (!models.Any(isRecord))
+        {
+            return models;
+        }
+
+        var kept = ImmutableArray.CreateBuilder<T>(models.Length);
+        foreach (var model in models)
+        {
+            if (isRecord(model))
+            {
+                var (fullName, attributeName, location) = describe(model);
+                issues.Add(new RecordTypeIssueModel(fullName, attributeName, location));
+            }
+            else
+            {
+                kept.Add(model);
+            }
+        }
+
+        return kept.ToImmutable();
+    }
+
+    /// <summary>
+    /// Pulls variants with duplicate singular-role declarations ([In]/[Out]/[Id] declared
+    /// twice) out of the model, one <see cref="RelationVariantIssueModel"/> per duplicated
+    /// role. Reported as CG046 by <c>ModelGenerator.Emit</c>.
+    /// </summary>
+    private static ImmutableArray<RelationVariantModel> FilterDuplicateRoleVariants(
+        ImmutableArray<RelationVariantModel> variants,
+        ImmutableArray<RelationVariantIssueModel>.Builder issues)
+    {
+        if (!variants.Any(static v => v.DuplicateRoles.Count > 0))
+        {
+            return variants;
+        }
+
+        var kept = ImmutableArray.CreateBuilder<RelationVariantModel>(variants.Length);
+        foreach (var v in variants)
+        {
+            if (v.DuplicateRoles.Count > 0)
+            {
+                foreach (var role in v.DuplicateRoles)
+                {
+                    issues.Add(new RelationVariantIssueModel(v.FullName, RelationVariantIssueKind.DuplicateRole, role.Role, role.Location));
+                }
+            }
+            else
+            {
+                kept.Add(v);
+            }
+        }
+
+        return kept.ToImmutable();
+    }
+
+    private static ImmutableArray<CompositionRootModel> FilterNestedCompositionRoots(
+        ImmutableArray<CompositionRootModel> roots,
+        ImmutableArray<NestedTypeIssueModel>.Builder issues)
+    {
+        if (!roots.Any(static r => r.IsNested))
+        {
+            return roots;
+        }
+
+        var kept = ImmutableArray.CreateBuilder<CompositionRootModel>(roots.Length);
+        foreach (var r in roots)
+        {
+            if (r.IsNested)
+            {
+                issues.Add(new NestedTypeIssueModel(r.FullName, "CompositionRoot", r.IssueLocation));
+            }
+            else
+            {
+                kept.Add(r);
+            }
+        }
+
+        return kept.ToImmutable();
+    }
+
+    /// <summary>
+    /// Pre-emit uniqueness validation over every generated-name space that is keyed on a
+    /// *simple* name (CG042/CG043/CG044). Without it, two same-named types silently merge
+    /// onto one physical table / edge table (SchemaEmitter keys DDL on the simple name)
+    /// or crash the whole generator with a duplicate <c>AddSource</c> hint (the aggregate
+    /// loader family keys hints and member names on the root's simple name). Reported by
+    /// <c>ModelGenerator.Emit</c>; emitters that key output on the colliding name consult
+    /// <see cref="ModelGraph.IsCollisionLoser"/> to skip the duplicates.
+    /// </summary>
+    private static ImmutableArray<NameCollisionModel> ComputeNameCollisions(
+        ImmutableArray<TableModel> tables,
+        ImmutableArray<RelationKindModel> forwardKinds)
+    {
+        var collisions = ImmutableArray.CreateBuilder<NameCollisionModel>();
+
+        // CG042 — physical table name (pluralised + snake-cased simple name). Catches
+        // both same-simple-name-across-namespaces (A.Design + B.Design) and distinct
+        // names that pluralise together (Item + Items → items).
+        AddCollisions(collisions, NameCollisionKind.TableName,
+            tables.Select(static t => (SurrealNaming.ToTableName(t.Name), t.FullName)));
+
+        // CG043 — edge table name from the forward attribute's simple class name.
+        AddCollisions(collisions, NameCollisionKind.EdgeName,
+            forwardKinds.Select(static k => (SurrealNaming.ToEdgeName(k.Name), k.FullName)));
+
+        // CG044 — aggregate-root simple name. AggregateLoaderEmitter /
+        // CompositionRootEmitter / LoadEntryEmitter key loader class names, AddSource
+        // hints, and Load{Name}Async members on it.
+        AddCollisions(collisions, NameCollisionKind.AggregateRootName,
+            tables.Where(static t => t.IsAggregateRoot).Select(static t => (t.Name, t.FullName)));
+
+        return collisions.ToImmutable();
+    }
+
+    private static void AddCollisions(
+        ImmutableArray<NameCollisionModel>.Builder collisions,
+        NameCollisionKind kind,
+        IEnumerable<(string Name, string FullName)> entries)
+    {
+        foreach (var group in entries
+                     .GroupBy(static e => e.Name, StringComparer.Ordinal)
+                     .Where(static g => g.Count() > 1)
+                     .OrderBy(static g => g.Key, StringComparer.Ordinal))
+        {
+            var participants = group
+                .Select(static e => e.FullName)
+                .OrderBy(static n => n, StringComparer.Ordinal)
+                .ToList();
+            collisions.Add(new NameCollisionModel(
+                Kind: kind,
+                CollidingName: group.Key,
+                ParticipantFullNames: new EquatableArray<string>(participants)));
+        }
+    }
+
+    /// <summary>
+    /// Keeps the first model per full name, dropping later duplicates. Duplicates are
+    /// identical by construction (the extractors snapshot the *merged* symbol once per
+    /// declaration), so "first wins" loses nothing; a genuine same-name redeclaration is
+    /// a CS0101 in the user's code and never reaches a healthy emit pass anyway.
+    /// </summary>
+    private static ImmutableArray<T> DedupeByFullName<T>(ImmutableArray<T> models, Func<T, string> fullName)
+    {
+        if (models.Length <= 1)
+        {
+            return models;
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var builder = ImmutableArray.CreateBuilder<T>(models.Length);
+        foreach (var model in models)
+        {
+            if (seen.Add(fullName(model)))
+            {
+                builder.Add(model);
+            }
+        }
+
+        return builder.Count == models.Length ? models : builder.ToImmutable();
     }
 
     private static (ImmutableArray<IndexModel> Indexes, ImmutableArray<IndexIssueModel> Issues) ComputeIndexes(
@@ -342,7 +628,8 @@ internal static class RelationLinker
     private static (ImmutableArray<RelationVariantModel> Variants, ImmutableArray<SharedShapeLiftConflict> Conflicts) LiftVariantsFromSharedShape(
         ImmutableArray<RelationVariantModel> variants,
         ImmutableArray<SharedShapeInterfaceCandidate> candidates,
-        HashSet<string> tableFullNames)
+        HashSet<string> tableFullNames,
+        ImmutableArray<RelationVariantIssueModel>.Builder issues)
     {
         if (variants.Length == 0)
         {
@@ -388,8 +675,28 @@ internal static class RelationLinker
                 }
             }
 
-            if (conflicted || merged.In is null || merged.Out is null)
+            if (conflicted)
             {
+                // Merge conflict — already captured as a SharedShapeLiftConflict (CG036).
+                continue;
+            }
+
+            if (merged.In is null || merged.Out is null)
+            {
+                // CG047 — no matching annotated shared-shape interface supplied the
+                // missing endpoint(s). Name what's missing so the diagnostic reads as
+                // an instruction, not a shrug.
+                var missing = (merged.In, merged.Out) switch
+                {
+                    (null, null) => "[In] or [Out] endpoint",
+                    (null, _)    => "[In] endpoint",
+                    _            => "[Out] endpoint",
+                };
+                // No embedded location: healthy variants must stay position-independent,
+                // and CG047 is only decided here (after the lift). The diagnostics
+                // output resolves the variant declaration via the location map instead.
+                issues.Add(new RelationVariantIssueModel(
+                    variant.FullName, RelationVariantIssueKind.MissingEndpoints, missing, Location: null));
                 continue;
             }
 
@@ -711,8 +1018,8 @@ internal static class RelationLinker
         var markerNamespace = lastDot >= 0 ? markerFullName[..lastDot] : string.Empty;
         var markerSimpleName = lastDot >= 0 ? markerFullName[(lastDot + 1)..] : markerFullName;
 
-        if (!markerSimpleName.StartsWith("I")
-            || !markerSimpleName.EndsWith("RecordId")
+        if (!markerSimpleName.StartsWith("I", StringComparison.Ordinal)
+            || !markerSimpleName.EndsWith("RecordId", StringComparison.Ordinal)
             || markerSimpleName.Length <= "IRecordId".Length)
         {
             return null;
@@ -941,12 +1248,12 @@ internal static class RelationLinker
     private static string StripGlobalAndNullable(string fqn)
     {
         const string prefix = "global::";
-        if (fqn.StartsWith(prefix))
+        if (fqn.StartsWith(prefix, StringComparison.Ordinal))
         {
             fqn = fqn[prefix.Length..];
         }
 
-        if (fqn.EndsWith("?"))
+        if (fqn.EndsWith("?", StringComparison.Ordinal))
         {
             fqn = fqn[..^1];
         }
@@ -994,7 +1301,7 @@ internal static class RelationLinker
     private static string Strip(string fqn)
     {
         const string prefix = "global::";
-        if (fqn.StartsWith(prefix))
+        if (fqn.StartsWith(prefix, StringComparison.Ordinal))
         {
             fqn = fqn[prefix.Length..];
         }
@@ -1105,7 +1412,7 @@ internal static class RelationLinker
     }
 
     private static string StripAttribute(string name)
-        => name.EndsWith("Attribute") ? name[..^"Attribute".Length] : name;
+        => name.EndsWith("Attribute", StringComparison.Ordinal) ? name[..^"Attribute".Length] : name;
 
     private static string QualifyName(string ns, string name)
         => string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}";

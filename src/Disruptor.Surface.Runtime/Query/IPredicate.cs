@@ -9,8 +9,19 @@ namespace Disruptor.Surface.Runtime.Query;
 /// </summary>
 public interface IPredicate;
 
-/// <summary>Equality test: <c>field = $param</c>.</summary>
+/// <summary>
+/// Equality test: <c>field = $param</c>. A <c>null</c> <see cref="Value"/> compiles to
+/// the unset test <c>(field IS NONE OR field IS NULL)</c> instead of a binding — the
+/// write path omits keys for null values, so stored nulls are NONE (absent fields) and
+/// <c>field = NULL</c> would never match them.
+/// </summary>
 public sealed record EqPredicate(string Field, object? Value) : IPredicate;
+
+/// <summary>Field-unset test: <c>(field IS NONE OR field IS NULL)</c>. The named form of <c>Eq(null)</c>.</summary>
+public sealed record IsNonePredicate(string Field) : IPredicate;
+
+/// <summary>Field-set test: <c>(field IS NOT NONE AND field IS NOT NULL)</c>. The complement of <see cref="IsNonePredicate"/>.</summary>
+public sealed record IsNotNonePredicate(string Field) : IPredicate;
 
 /// <summary>Comparison operators emitted as <c>&lt;</c>, <c>&lt;=</c>, <c>&gt;</c>, <c>&gt;=</c>.</summary>
 public enum RangeOp
@@ -54,6 +65,41 @@ public sealed record StartsWithPredicate(string Field, string Prefix) : IPredica
 
 /// <summary>String suffix match: <c>string::ends_with(field, $param)</c>.</summary>
 public sealed record EndsWithPredicate(string Field, string Suffix) : IPredicate;
+
+/// <summary>
+/// String null-or-empty test: <c>(field IS NONE OR field IS NULL OR field = '')</c>.
+/// NONE-aware for the same reason as <see cref="IsNonePredicate"/> — the write path
+/// stores unset optionals as NONE (absent key) — with the empty-string arm on top so
+/// the predicate matches C#'s <c>string.IsNullOrEmpty</c> semantics.
+/// </summary>
+public sealed record IsNullOrEmptyPredicate(string Field) : IPredicate;
+
+/// <summary>
+/// String has-content test: <c>(field IS NOT NONE AND field IS NOT NULL AND field != '')</c>
+/// — the exact complement of <see cref="IsNullOrEmptyPredicate"/>.
+/// </summary>
+public sealed record IsNotNullOrEmptyPredicate(string Field) : IPredicate;
+
+/// <summary>
+/// Regex match for string fields. Compiles to <c>string::matches(field, $param)</c> —
+/// SurrealDB's regex primitive that accepts the pattern as a bound string parameter.
+/// (The <c>~</c> / <c>?~</c> / <c>*~</c> operators are <i>fuzzy</i>-match operators in
+/// SurrealQL, not regex, so they are deliberately not used here.)
+/// </summary>
+public sealed record MatchesPredicate(string Field, string Pattern) : IPredicate;
+
+/// <summary>
+/// Case-insensitive substring match:
+/// <c>string::contains(string::lowercase(field), $param)</c> with the operand
+/// lowercased invariantly at compile time.
+/// </summary>
+public sealed record ContainsIgnoreCasePredicate(string Field, string Substring) : IPredicate;
+
+/// <summary>Case-insensitive prefix match: <c>string::starts_with(string::lowercase(field), $param)</c>.</summary>
+public sealed record StartsWithIgnoreCasePredicate(string Field, string Prefix) : IPredicate;
+
+/// <summary>Case-insensitive suffix match: <c>string::ends_with(string::lowercase(field), $param)</c>.</summary>
+public sealed record EndsWithIgnoreCasePredicate(string Field, string Suffix) : IPredicate;
 
 /// <summary>Logical conjunction. Operands are AND-merged in compile order.</summary>
 public sealed record AndPredicate(IReadOnlyList<IPredicate> Operands) : IPredicate;

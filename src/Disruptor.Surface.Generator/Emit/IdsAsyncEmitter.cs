@@ -31,9 +31,7 @@ internal static class IdsAsyncEmitter
 {
     public static void Emit(SourceProductionContext spc, TableModel table)
     {
-        var entityFqn = string.IsNullOrEmpty(table.Namespace)
-            ? $"global::{table.Name}"
-            : $"global::{table.Namespace}.{table.Name}";
+        var entityFqn = CSharpText.GlobalName(table.Namespace, table.Name);
         var idFqn = $"{entityFqn}Id";
         var className = $"{table.Name}QueryIds";
 

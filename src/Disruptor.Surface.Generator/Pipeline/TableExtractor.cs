@@ -15,7 +15,12 @@ internal static class TableExtractor
             return null;
         }
 
-        if (type.TypeKind != TypeKind.Class)
+        // Records are admitted (the FAWMN predicate matches record declarations) so the
+        // linker can reject them with CG048 — previously `[Table] partial record X`
+        // compiled clean and generated nothing. Non-record structs/interfaces can't
+        // carry [Table] (AttributeTargets.Class), so the class-or-record guard is
+        // purely defensive.
+        if (type.TypeKind != TypeKind.Class && !type.IsRecord)
         {
             return null;
         }
@@ -40,21 +45,39 @@ internal static class TableExtractor
         }
 
         var ns = type.ContainingNamespace?.ToDisplayString() ?? string.Empty;
-        var fullName = string.IsNullOrEmpty(ns) ? type.MetadataName : $"{ns}.{type.MetadataName}";
+        // NormaliseFullName keeps containing types in the name (Ns.Outer.Inner) so a
+        // nested [Table] — rejected with CG045 by the linker — is reported under its
+        // real name. For namespace-scoped types it's identical to {ns}.{MetadataName}.
+        var fullName = NormaliseFullName(type);
         var hint = $"{fullName}.g.cs";
+
+        // Declaration location, captured ONLY for shapes the linker is guaranteed to
+        // reject (nested → CG045, record → CG048, generic → CG049). Healthy tables keep
+        // null: a populated LocationInfo makes TableModel equality position-sensitive,
+        // which only an already-failing build can afford.
+        LocationInfo? issueLocation = null;
+        if (type.ContainingType is not null || type.IsRecord || typeParameters.Count > 0)
+        {
+            issueLocation = ctx.TargetNode is TypeDeclarationSyntax decl
+                ? LocationInfo.FromToken(decl.Identifier)
+                : LocationInfo.FromLocation(type.Locations.FirstOrDefault());
+        }
 
         return new TableModel(
             FullName: fullName,
             Namespace: ns,
             Name: type.Name,
             IsPartial: isPartial,
+            IsNested: type.ContainingType is not null,
+            IsRecord: type.IsRecord,
             IsAbstract: type.IsAbstract,
             IsSealed: type.IsSealed,
             IsAggregateRoot: isAggregateRoot,
             DeclaredAccessibility: type.DeclaredAccessibility.ToString(),
             TypeParameters: typeParameters,
             Properties: propertiesBuilder.ToImmutable(),
-            FileHintName: hint);
+            FileHintName: hint,
+            IssueLocation: issueLocation);
     }
 
     private static PropertyModel? TryBuildProperty(IPropertySymbol p)
@@ -63,7 +86,9 @@ internal static class TableExtractor
         var kinds = ResolvePropertyKinds(attrs);
         var (role, kindFullName) = ResolveRelationRole(attrs);
         var indexes = ResolveIndexAnnotations(attrs, p);
-        if (kinds == PropertyKind.None && role == RelationRole.None && indexes.Count == 0)
+        var autoValue = ResolveAutoValueKinds(attrs);
+        if (kinds == PropertyKind.None && role == RelationRole.None && indexes.Count == 0
+            && autoValue == AutoValueKind.None)
         {
             return null;
         }
@@ -74,6 +99,7 @@ internal static class TableExtractor
         // (delete behavior on [Parent]) can fire.
         var (deletePolicy, hasExplicit, hasMultiple) = ResolveReferenceDelete(attrs);
         var isInline = HasAttribute(attrs, AnnotationsMetadata.Inline);
+        var (inlineMembers, inlineConstruction) = ResolveInlineMembers(p.Type);
 
         return new PropertyModel(
             Name: p.Name,
@@ -90,9 +116,32 @@ internal static class TableExtractor
             IsPartial: PartialDeclaration.IsMember(p),
             IsStatic: p.IsStatic,
             DeclaredAccessibility: p.DeclaredAccessibility.ToString(),
-            InlineMembers: ResolveInlineMembers(p.Type),
+            InlineMembers: inlineMembers,
+            InlineConstruction: inlineConstruction,
             Indexes: indexes,
-            IsInline: isInline);
+            IsInline: isInline,
+            AutoValue: autoValue);
+    }
+
+    /// <summary>
+    /// Resolves the library-managed value overlays ([CreatedAt] / [UpdatedAt] /
+    /// [Version]) carried by the property. Collected as flags — a property carrying
+    /// more than one is malformed and fails closed with CG055 at validation.
+    /// </summary>
+    private static AutoValueKind ResolveAutoValueKinds(ImmutableArray<AttributeData> attrs)
+    {
+        var kinds = AutoValueKind.None;
+        foreach (var attr in attrs)
+        {
+            kinds |= AttributeFullName(attr) switch
+            {
+                AnnotationsMetadata.CreatedAt => AutoValueKind.CreatedAt,
+                AnnotationsMetadata.UpdatedAt => AutoValueKind.UpdatedAt,
+                AnnotationsMetadata.Version   => AutoValueKind.Version,
+                _ => AutoValueKind.None,
+            };
+        }
+        return kinds;
     }
 
     private static bool HasAttribute(ImmutableArray<AttributeData> attrs, string fullName)
@@ -109,18 +158,35 @@ internal static class TableExtractor
 
     /// <summary>
     /// For an inline-element collection property (<c>IReadOnlyList&lt;T&gt;</c> /
-    /// <c>IList&lt;T&gt;</c> / <c>List&lt;T&gt;</c>) where <c>T</c> is a record / POCO with
-    /// public instance properties, walks <c>T</c>'s members so the schema emitter can
-    /// produce <c>scenarios.*.kind</c>-style sub-field DDL and <see cref="PartialEmitter"/>
-    /// can emit typed Hydrate / Save bodies. Returns empty for primitive-element
-    /// collections (<c>IReadOnlyList&lt;int&gt;</c>) and anything that isn't a
-    /// supported collection shape.
+    /// <c>IList&lt;T&gt;</c> / <c>List&lt;T&gt;</c>) where <c>T</c> is a record / POCO,
+    /// resolves the persistable members of <c>T</c> plus the construction shape the
+    /// generated Hydrate body uses to rebuild elements, so the schema emitter can produce
+    /// <c>scenarios.*.kind</c>-style sub-field DDL and <see cref="Emit.PartialEmitter"/>
+    /// can emit typed Hydrate / Save bodies.
+    /// <para>
+    /// Persistable members are public, instance, non-indexer, readable properties with a
+    /// SurrealDB-mappable scalar type (this excludes <c>string</c>'s <c>Length</c>-style
+    /// helpers only via the primitive short-circuit below; on element records it excludes
+    /// indexers and lets get-only computed members of unmappable types pass as ignored).
+    /// The member set must then be constructible: either a public constructor matches it
+    /// positionally (name + type per parameter — the positional-record shape), or the
+    /// type has a public parameterless constructor and every member is settable (POCO
+    /// shape). Anything else returns empty/<see cref="InlineConstructionKind.None"/> and
+    /// is rejected with CG050 at validation — previously the naive member walk emitted
+    /// un-compilable construction code (CS0443/CS1739/CS1503 in the <c>.g.cs</c>).
+    /// </para>
+    /// <para>
+    /// Primitive/scalar element types (<c>IReadOnlyList&lt;string&gt;</c>,
+    /// <c>List&lt;int&gt;</c>, …) return empty with <see cref="InlineConstructionKind.None"/>:
+    /// they take the direct <c>array&lt;T&gt;</c> schema/save/hydrate path instead of the
+    /// per-member inline expansion.
+    /// </para>
     /// </summary>
-    private static EquatableArray<InlineMember> ResolveInlineMembers(ITypeSymbol type)
+    private static (EquatableArray<InlineMember> Members, InlineConstructionKind Construction) ResolveInlineMembers(ITypeSymbol type)
     {
         if (type is not INamedTypeSymbol { Arity: 1 } named)
         {
-            return [];
+            return ([], InlineConstructionKind.None);
         }
 
         var def = named.ConstructedFrom;
@@ -128,11 +194,24 @@ internal static class TableExtractor
         var isCollection = ns == "System.Collections.Generic" && def.Name is "IReadOnlyList" or "IList" or "List";
         if (!isCollection)
         {
-            return [];
+            return ([], InlineConstructionKind.None);
         }
 
         var element = named.TypeArguments[0];
-        var members = new List<InlineMember>();
+
+        // Primitive-element collections take the array<T> direct path — walking string's
+        // members here used to produce `new string(this[]: …, Length: …)` (CS0443).
+        if (Emit.SchemaEmitter.IsMappableScalar(TypeRefBuilder.Build(element)))
+        {
+            return ([], InlineConstructionKind.None);
+        }
+
+        if (element is not INamedTypeSymbol elementNamed)
+        {
+            return ([], InlineConstructionKind.None);
+        }
+
+        var members = new List<IPropertySymbol>();
         foreach (var member in element.GetMembers())
         {
             // Public instance properties only — covers both classic class properties
@@ -142,24 +221,85 @@ internal static class TableExtractor
                 continue;
             }
 
-            if (prop.DeclaredAccessibility != Accessibility.Public)
-            {
-                continue;
-            }
-
-            if (prop.IsStatic)
+            if (prop.IsIndexer || prop.IsStatic || prop.DeclaredAccessibility != Accessibility.Public)
             {
                 continue;
             }
 
             if (prop.GetMethod is null)
             {
+                // Set-only property — can't be read at save time, so the element type
+                // can't round-trip. Fail closed (CG050 fires at validation).
+                return ([], InlineConstructionKind.None);
+            }
+
+            if (!Emit.SchemaEmitter.IsMappableScalar(TypeRefBuilder.Build(prop.Type)))
+            {
+                if (prop.SetMethod is not null)
+                {
+                    // A writable member we can't persist — saving would silently drop
+                    // data on round-trip. Fail closed (CG050).
+                    return ([], InlineConstructionKind.None);
+                }
+
+                // Get-only computed member of an unmappable type (e.g. `Uri Link =>`)
+                // — safely ignorable; it's derived, not stored.
                 continue;
             }
 
-            members.Add(new InlineMember(prop.Name, TypeRefBuilder.Build(prop.Type)));
+            members.Add(prop);
         }
-        return members.ToEquatableArray();
+
+        if (members.Count == 0)
+        {
+            return ([], InlineConstructionKind.None);
+        }
+
+        // Constructibility. Preferred shape: a public constructor whose parameters match
+        // the member set positionally by (name, type) — what a positional record gives us.
+        foreach (var ctor in elementNamed.InstanceConstructors)
+        {
+            if (ctor.DeclaredAccessibility != Accessibility.Public || ctor.Parameters.Length != members.Count)
+            {
+                continue;
+            }
+
+            var ordered = new List<InlineMember>(members.Count);
+            var allMatched = true;
+            foreach (var param in ctor.Parameters)
+            {
+                var match = members.Find(m =>
+                    string.Equals(m.Name, param.Name, StringComparison.Ordinal)
+                    && SymbolEqualityComparer.Default.Equals(m.Type, param.Type));
+                if (match is null)
+                {
+                    allMatched = false;
+                    break;
+                }
+
+                ordered.Add(new InlineMember(match.Name, TypeRefBuilder.Build(match.Type)));
+            }
+
+            if (allMatched)
+            {
+                return (ordered.ToEquatableArray(), InlineConstructionKind.PositionalConstructor);
+            }
+        }
+
+        // Fallback shape: parameterless public constructor + every member settable
+        // (set or init) — hydrate uses an object initializer.
+        var hasParameterlessCtor = elementNamed.InstanceConstructors.Any(c =>
+            c.DeclaredAccessibility == Accessibility.Public && c.Parameters.Length == 0);
+        if (hasParameterlessCtor
+            && members.All(m => m.SetMethod is { DeclaredAccessibility: Accessibility.Public }))
+        {
+            var declared = members
+                .Select(m => new InlineMember(m.Name, TypeRefBuilder.Build(m.Type)))
+                .ToEquatableArray();
+            return (declared, InlineConstructionKind.ObjectInitializer);
+        }
+
+        return ([], InlineConstructionKind.None);
     }
 
     private static (ReferenceDeletePolicy Policy, bool HasExplicit, bool HasMultiple) ResolveReferenceDelete(ImmutableArray<AttributeData> attrs)
@@ -271,6 +411,25 @@ internal static class TableExtractor
         return new EquatableArray<IndexAnnotationModel>(indexes.ToImmutable());
     }
 
+    /// <summary>
+    /// Resolves the position-independent identity the index grouping in
+    /// <c>RelationLinker.ComputeIndexes</c> relies on:
+    /// <list type="bullet">
+    ///   <item><c>DeclarationKey</c> — which partial type declaration the property lives
+    ///         in, as the declaration's ordinal within the containing type symbol's
+    ///         <see cref="ISymbol.DeclaringSyntaxReferences"/>. Composite indexes must
+    ///         keep all fields in one declaration (CG038), and the ordinal distinguishes
+    ///         partial declarations without embedding a file path.</item>
+    ///   <item><c>SourceOrder</c> — the property's member ordinal within that type
+    ///         declaration, giving composite indexes their column order (= property
+    ///         declaration order).</item>
+    /// </list>
+    /// Both values are stable under edits elsewhere in the file. The previous encoding
+    /// (<c>"{filePath}:{typeDeclSpanStart}"</c> + property <c>SpanStart</c>) used absolute
+    /// positions, so ANY edit above an index-annotated property (a comment, a using)
+    /// changed model equality and re-emitted every file — the exact cache regression the
+    /// incremental-generator contract warns about — and was machine-path-sensitive.
+    /// </summary>
     private static (string DeclarationKey, int SourceOrder) ResolveSourceLocation(IPropertySymbol property)
     {
         var syntaxRef = property.DeclaringSyntaxReferences.FirstOrDefault();
@@ -280,9 +439,29 @@ internal static class TableExtractor
         }
 
         var typeDeclaration = declaration.Ancestors().OfType<TypeDeclarationSyntax>().FirstOrDefault();
-        var filePath = declaration.SyntaxTree.FilePath ?? string.Empty;
-        var declarationStart = typeDeclaration?.SpanStart ?? 0;
-        return ($"{filePath}:{declarationStart}", declaration.SpanStart);
+        if (typeDeclaration is null)
+        {
+            return (string.Empty, int.MaxValue);
+        }
+
+        var declarationOrdinal = 0;
+        var containingType = property.ContainingType;
+        if (containingType is not null)
+        {
+            var references = containingType.DeclaringSyntaxReferences;
+            for (var i = 0; i < references.Length; i++)
+            {
+                if (references[i].SyntaxTree == typeDeclaration.SyntaxTree
+                    && references[i].Span == typeDeclaration.Span)
+                {
+                    declarationOrdinal = i;
+                    break;
+                }
+            }
+        }
+
+        var memberOrdinal = typeDeclaration.Members.IndexOf(declaration);
+        return ($"decl:{declarationOrdinal}", memberOrdinal < 0 ? int.MaxValue : memberOrdinal);
     }
 
     internal static bool InheritsFromForwardRelation(INamedTypeSymbol cls)

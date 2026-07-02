@@ -35,8 +35,11 @@ internal static class EdgeQueryRootEmitter
             return;
         }
 
+        // CG043 losers are skipped — their StripAttributeSuffix accessor name is already
+        // taken by the first colliding kind (CS0102 otherwise).
         var forwardKinds = graph.RelationKinds
             .Where(k => k.Direction == RelationDirection.Forward)
+            .Where(k => !graph.IsCollisionLoser(NameCollisionKind.EdgeName, k.FullName))
             .OrderBy(k => k.Name, StringComparer.Ordinal)
             .ToList();
         if (forwardKinds.Count == 0)

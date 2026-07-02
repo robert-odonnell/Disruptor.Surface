@@ -17,6 +17,23 @@ public enum PropertyKind
 }
 
 /// <summary>
+/// Library-managed value overlays on a scalar <c>[Property]</c> field. Flags so the
+/// validation pass can detect (and reject with CG055) a property carrying more than one
+/// marker; a valid property carries at most one.
+/// </summary>
+[Flags]
+public enum AutoValueKind
+{
+    None      = 0,
+    /// <summary>[CreatedAt] — stamped with the save instant on CREATE dispatch only.</summary>
+    CreatedAt = 1 << 0,
+    /// <summary>[UpdatedAt] — stamped with the save instant on every dispatch.</summary>
+    UpdatedAt = 1 << 1,
+    /// <summary>[Version] — optimistic-concurrency counter: 1 on CREATE, n+1 via a WHERE-guarded UPDATE.</summary>
+    Version   = 1 << 2,
+}
+
+/// <summary>
 /// What happens to a referencing record when the referenced record is deleted. Mirrors
 /// the runtime's <c>ReferenceDeleteBehavior</c> enum — names kept in lockstep so the
 /// generator can emit references to the runtime type directly.
@@ -52,10 +69,18 @@ public enum RelationRole
 /// </param>
 /// <param name="InlineMembers">
 /// For inline-element collection <c>[Property]</c> shapes (<c>IReadOnlyList&lt;T&gt;</c> /
-/// <c>IList&lt;T&gt;</c> / <c>List&lt;T&gt;</c> of records / POCOs), the public instance
-/// members of <c>T</c>. Drives <c>scenarios.*.kind</c>-style sub-field DDL in the schema
-/// emitter and the typed per-element Hydrate / Save in the partial emitter. Empty for
-/// any other kind of property (including primitive-element collections).
+/// <c>IList&lt;T&gt;</c> / <c>List&lt;T&gt;</c> of records / POCOs), the persistable
+/// members of <c>T</c>: public, instance, non-indexer, readable, schema-mappable, and
+/// covered by <paramref name="InlineConstruction"/> (constructor-positional or settable).
+/// Drives <c>scenarios.*.kind</c>-style sub-field DDL in the schema emitter and the typed
+/// per-element Hydrate / Save in the partial emitter. Empty for any other kind of
+/// property, for primitive-element collections (which take the <c>array&lt;T&gt;</c>
+/// direct path), and for unsupported element shapes (rejected via CG050).
+/// </param>
+/// <param name="InlineConstruction">
+/// How Hydrate reconstructs an inline-collection element — see
+/// <see cref="InlineConstructionKind"/>. <see cref="InlineConstructionKind.None"/>
+/// whenever <paramref name="InlineMembers"/> is empty.
 /// </param>
 public sealed record PropertyModel(
     string Name,
@@ -73,5 +98,7 @@ public sealed record PropertyModel(
     bool IsStatic,
     string DeclaredAccessibility,
     EquatableArray<InlineMember> InlineMembers,
+    InlineConstructionKind InlineConstruction,
     EquatableArray<IndexAnnotationModel> Indexes,
-    bool IsInline);
+    bool IsInline,
+    AutoValueKind AutoValue = AutoValueKind.None);

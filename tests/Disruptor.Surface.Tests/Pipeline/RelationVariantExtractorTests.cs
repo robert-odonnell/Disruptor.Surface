@@ -162,8 +162,10 @@ public sealed class RelationVariantExtractorTests
     }
 
     [Fact]
-    public void Multiple_In_Returns_Null()
+    public void Multiple_In_Flags_DuplicateRole()
     {
+        // Duplicate singular roles no longer collapse the model to null — the extractor
+        // flags them so the linker can filter the variant into the CG046 issue list.
         const string fixture = Preamble + """
 
             [Restricts]
@@ -178,11 +180,35 @@ public sealed class RelationVariantExtractorTests
         var cls = compilation.GetTypeByMetadataName("M.TwoIns");
         Assert.NotNull(cls);
 
-        Assert.Null(RelationVariantExtractor.TryExtractFromSymbol(cls!, CancellationToken.None));
+        var model = RelationVariantExtractor.TryExtractFromSymbol(cls!, CancellationToken.None);
+        Assert.NotNull(model);
+        Assert.Equal(["In"], model!.DuplicateRoles.Select(r => r.Role).ToArray());
+        // The duplicate role carries the location of the SECOND [In] attribute so CG046
+        // can point at the extra annotation rather than the class.
+        var location = Assert.Single(model.DuplicateRoles).Location;
+        Assert.NotNull(location);
+        Assert.Equal(LineOf(fixture, "[In] public partial Constraint SourceB"), location!.StartLine);
+    }
+
+    /// <summary>Zero-based line index of the first line containing <paramref name="snippet"/>.</summary>
+    private static int LineOf(string source, string snippet)
+    {
+        var index = source.IndexOf(snippet, StringComparison.Ordinal);
+        Assert.True(index >= 0, $"Snippet not found in fixture: {snippet}");
+        var line = 0;
+        for (var i = 0; i < index; i++)
+        {
+            if (source[i] == '\n')
+            {
+                line++;
+            }
+        }
+
+        return line;
     }
 
     [Fact]
-    public void Multiple_Out_Returns_Null()
+    public void Multiple_Out_Flags_DuplicateRole()
     {
         const string fixture = Preamble + """
 
@@ -198,7 +224,9 @@ public sealed class RelationVariantExtractorTests
         var cls = compilation.GetTypeByMetadataName("M.TwoOuts");
         Assert.NotNull(cls);
 
-        Assert.Null(RelationVariantExtractor.TryExtractFromSymbol(cls!, CancellationToken.None));
+        var model = RelationVariantExtractor.TryExtractFromSymbol(cls!, CancellationToken.None);
+        Assert.NotNull(model);
+        Assert.Equal(["Out"], model!.DuplicateRoles.Select(r => r.Role).ToArray());
     }
 
     [Fact]

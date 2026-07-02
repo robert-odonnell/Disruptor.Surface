@@ -43,7 +43,13 @@ internal static class QueryRootEmitter
             return;
         }
 
-        var ordered = graph.Tables.OrderBy(t => t.Name, StringComparer.Ordinal).ToList();
+        // CG042 losers are skipped — their pluralised accessor name is already taken by
+        // the first colliding table, so emitting both would be a CS0102 wall on top of
+        // the CG error that already fails the build.
+        var ordered = graph.Tables
+            .Where(t => !graph.IsCollisionLoser(NameCollisionKind.TableName, t.FullName))
+            .OrderBy(t => t.Name, StringComparer.Ordinal)
+            .ToList();
 
         var writer = new CodeWriter().Header();
         using (writer.Namespace(root.Namespace))
@@ -68,9 +74,7 @@ internal static class QueryRootEmitter
                 {
                     var tableName = SurrealNaming.ToTableName(table.Name);
                     var propertyName = PascalPluralize(table.Name);
-                    var entityFqn = string.IsNullOrEmpty(table.Namespace)
-                        ? $"global::{table.Name}"
-                        : $"global::{table.Namespace}.{table.Name}";
+                    var entityFqn = CSharpText.GlobalName(table.Namespace, table.Name);
 
                     writer.Line($"public {Namespaces.QueryFqn}<{entityFqn}> {propertyName} => new(\"{tableName}\");");
                 }
@@ -83,11 +87,11 @@ internal static class QueryRootEmitter
     /// <summary>
     /// Pascal-cased pluralisation of the C# type name (e.g. <c>Constraint</c> → <c>Constraints</c>,
     /// <c>Details</c> stays <c>Details</c>, <c>AcceptanceCriteria</c> stays
-    /// <c>AcceptanceCriteria</c>). Mirrors what <see cref="SurrealNaming.ToTableName"/> does
-    /// minus the snake-casing — the query-root property names must stay valid C# identifiers.
+    /// <c>AcceptanceCriteria</c>). Routed through <see cref="SurrealNaming"/> so the
+    /// Humanizer call runs culture-invariant like every other baked identifier.
     /// </summary>
     private static string PascalPluralize(string typeName)
-        => Humanizer.InflectorExtensions.Pluralize(typeName, inputIsKnownToBeSingular: false);
+        => SurrealNaming.PascalPluralize(typeName);
 
     private static string FormatTypeDeclaration(string accessibility, string typeName)
     {

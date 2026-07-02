@@ -106,4 +106,83 @@ public sealed class ProjectionQuery<T, TRow>
         }
         return list;
     }
+
+    /// <summary>
+    /// Execute the projection capped at one row and return the first materialised row,
+    /// or <c>default(TRow)</c> (<c>null</c> for reference-type rows) when nothing
+    /// matches. Compiles with <c>LIMIT 1</c>, overriding any user <see cref="Limit"/>;
+    /// <see cref="Start"/> and <see cref="OrderBy"/> still apply.
+    /// </summary>
+    public Task<TRow?> FirstOrDefaultAsync(SurrealClient db, CancellationToken ct = default)
+        => FirstOrDefaultAsync(db.QueryAsync, ct);
+
+    /// <inheritdoc cref="FirstOrDefaultAsync(SurrealClient, CancellationToken)"/>
+    public Task<TRow?> FirstOrDefaultAsync(SurrealTransaction tx, CancellationToken ct = default)
+        => FirstOrDefaultAsync(tx.QueryAsync, ct);
+
+    private async Task<TRow?> FirstOrDefaultAsync(
+        Func<string, SurrealObject?, CancellationToken, Task<SurrealQueryResponse>> queryFn,
+        CancellationToken ct)
+    {
+        var rows = await Limit(1).ExecuteAsync(queryFn, ct);
+        return rows.Count > 0 ? rows[0] : default;
+    }
+
+    /// <summary>
+    /// Execute the projection expecting exactly one match and return it. Compiles with
+    /// <c>LIMIT 2</c> (enough to detect ambiguity without pulling the full result set;
+    /// overrides any user <see cref="Limit"/>). Throws
+    /// <see cref="InvalidOperationException"/> when the query matches no rows or more
+    /// than one row.
+    /// </summary>
+    public Task<TRow> SingleAsync(SurrealClient db, CancellationToken ct = default)
+        => SingleAsync(db.QueryAsync, ct);
+
+    /// <inheritdoc cref="SingleAsync(SurrealClient, CancellationToken)"/>
+    public Task<TRow> SingleAsync(SurrealTransaction tx, CancellationToken ct = default)
+        => SingleAsync(tx.QueryAsync, ct);
+
+    private async Task<TRow> SingleAsync(
+        Func<string, SurrealObject?, CancellationToken, Task<SurrealQueryResponse>> queryFn,
+        CancellationToken ct)
+    {
+        var rows = await Limit(2).ExecuteAsync(queryFn, ct);
+        ThrowIfMoreThanOne(rows);
+        if (rows.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Single query on '{SurfaceQuery.Table}' matched no rows. Use SingleOrDefaultAsync if an empty result is a legal state.");
+        }
+        return rows[0];
+    }
+
+    /// <summary>
+    /// As <see cref="SingleAsync(SurrealClient, CancellationToken)"/> but returns
+    /// <c>default(TRow)</c> when the query matches no rows. Still throws
+    /// <see cref="InvalidOperationException"/> on more than one match.
+    /// </summary>
+    public Task<TRow?> SingleOrDefaultAsync(SurrealClient db, CancellationToken ct = default)
+        => SingleOrDefaultAsync(db.QueryAsync, ct);
+
+    /// <inheritdoc cref="SingleOrDefaultAsync(SurrealClient, CancellationToken)"/>
+    public Task<TRow?> SingleOrDefaultAsync(SurrealTransaction tx, CancellationToken ct = default)
+        => SingleOrDefaultAsync(tx.QueryAsync, ct);
+
+    private async Task<TRow?> SingleOrDefaultAsync(
+        Func<string, SurrealObject?, CancellationToken, Task<SurrealQueryResponse>> queryFn,
+        CancellationToken ct)
+    {
+        var rows = await Limit(2).ExecuteAsync(queryFn, ct);
+        ThrowIfMoreThanOne(rows);
+        return rows.Count > 0 ? rows[0] : default;
+    }
+
+    private void ThrowIfMoreThanOne(IReadOnlyList<TRow> rows)
+    {
+        if (rows.Count > 1)
+        {
+            throw new InvalidOperationException(
+                $"Single query on '{SurfaceQuery.Table}' matched more than one row. Narrow the predicate, or use FirstOrDefaultAsync if any match will do.");
+        }
+    }
 }
