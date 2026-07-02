@@ -759,6 +759,33 @@ public sealed class ModelGenerator : IIncrementalGenerator
             PartialEmitter.Emit(spc, table, graph);
         }
 
+        // CG056 (warning) — relation-variant payload [Property] whose type has no
+        // SurrealDB scalar mapping. The entity-table equivalent is CG025 (error), but
+        // variant payloads stay a warning: multi-variant kinds get SCHEMALESS edge
+        // tables where field omission is a tolerated shape, so the fail-soft contract
+        // is "the property compiles as in-memory-only state" — SchemaEmitter omits the
+        // DDL field and RelationVariantEmitter omits the field from the dispatched
+        // content + hydrate (previously the save path emitted a ContentValue.Set call
+        // with no matching overload — a raw CS1503 wall in the .g.cs).
+        foreach (var variant in graph.RelationVariants)
+        {
+            foreach (var p in variant.PayloadProperties)
+            {
+                if (p.Role != RelationVariantPropertyRole.Property
+                    || SchemaEmitter.IsMappableScalar(p.Type))
+                {
+                    continue;
+                }
+
+                spc.ReportDiagnostic(Diagnostic.Create(
+                    Diagnostics.VariantPayloadTypeNotMappable,
+                    Location.None,
+                    variant.FullName,
+                    p.Name,
+                    p.Type.FullyQualifiedName));
+            }
+        }
+
         // Per-variant relation classes — emits IEntity scaffolding, [In]/[Out]/[Property]
         // backing fields, Hydrate / SaveAsync. Per-kind sidecars (variant marker interface,
         // hydration dispatcher) emit alongside.

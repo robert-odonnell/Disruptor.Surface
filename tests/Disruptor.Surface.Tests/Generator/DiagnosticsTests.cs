@@ -1240,4 +1240,75 @@ public sealed class DiagnosticsTests
         Assert.Empty(compileDiags);
     }
 
+    [Fact]
+    public void CG056_VariantPayloadTypeNotMappable_WarnsAndCompiles()
+    {
+        // TimeSpan payload on a relation variant: no schema mapping. Previously the
+        // save path emitted a ContentValue.Set call with no matching overload (raw
+        // CS1503 wall in the .g.cs); now the field is omitted from DDL + wire and the
+        // user gets a warning naming the property.
+        const string src = """
+            using System;
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public sealed class LinksAttribute : ForwardRelation;
+
+            [Table] public partial class Node {
+                [Id] public partial NodeId Id { get; set; }
+            }
+
+            [Links] public partial class NodeLinksNode {
+                [In]  public partial Node Source { get; set; }
+                [Out] public partial Node Target { get; set; }
+                [Property] public partial TimeSpan Duration { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (result, _, runDiags, compileDiags) = GeneratorHarness.Run(src);
+
+        var warning = Assert.Single(runDiags, d => d.Id == "CG056");
+        Assert.Equal(DiagnosticSeverity.Warning, warning.Severity);
+        Assert.Contains("Duration", warning.GetMessage());
+        Assert.Contains("System.TimeSpan", warning.GetMessage());
+
+        // Fail-soft: the fixture still compiles; the field is omitted from the DDL and
+        // from the dispatched edge content (the property stays as in-memory state).
+        Assert.Empty(compileDiags);
+        var schema = GeneratorHarness.FindGeneratedFile(result, "Workspace.Schema.g.cs");
+        Assert.NotNull(schema);
+        Assert.DoesNotContain("DEFINE FIELD IF NOT EXISTS duration", schema!.ToString());
+        var variant = GeneratorHarness.FindGeneratedFile(result, "NodeLinksNode");
+        Assert.NotNull(variant);
+        Assert.DoesNotContain("\"duration\"", variant!.ToString());
+        // With no persistable payload the variant takes the payload-less IGNORE path.
+        Assert.Contains("INSERT RELATION IGNORE INTO links", variant.ToString());
+    }
+
+    [Fact]
+    public void CG056_DoesNotFire_OnMappablePayload()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public sealed class LinksAttribute : ForwardRelation;
+
+            [Table] public partial class Node {
+                [Id] public partial NodeId Id { get; set; }
+            }
+
+            [Links] public partial class NodeLinksNode {
+                [In]  public partial Node Source { get; set; }
+                [Out] public partial Node Target { get; set; }
+                [Property] public partial string Label { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, compileDiags) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id == "CG056");
+        Assert.Empty(compileDiags);
+    }
 }

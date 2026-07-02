@@ -373,4 +373,12 @@ internal static class Diagnostics
         category: Category,
         defaultSeverity: DiagnosticSeverity.Error,
         isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor VariantPayloadTypeNotMappable = new(
+        id: "CG056",
+        title: "Relation-variant payload [Property] type is not schema-mappable",
+        messageFormat: "[Property] '{0}.{1}' has type '{2}' which is not schema-mappable; the field will be omitted from the emitted DDL and from the dispatched edge content — it becomes in-memory-only state that never round-trips. Map the type to one of: string, int/long, bool, float/double, decimal, DateTime/DateTimeOffset, Guid, Ulid to persist it.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Warning,
+        isEnabledByDefault: true);
 }
