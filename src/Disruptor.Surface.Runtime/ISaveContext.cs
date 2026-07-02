@@ -1,4 +1,5 @@
 using Disruptor.Surreal;
+using Disruptor.Surreal.Values;
 
 namespace Disruptor.Surface.Runtime;
 
@@ -49,4 +50,42 @@ public interface ISaveContext
     /// see it. Generator-emitted SaveAsync calls this after dispatching its own CREATE/UPDATE.
     /// </summary>
     void MarkSaved(IEntity entity);
+
+    // ─────────────────────────── dispatch seam ───────────────────────────
+    // Every wire send an emitted IEntity.SaveAsync body performs goes through one of
+    // the three members below rather than calling ctx.Transaction directly. The
+    // defaults ARE the single-save behavior (immediate dispatch through Transaction);
+    // SurrealSession's batch SaveAsync overload substitutes a buffering context that
+    // coalesces contiguous same-table plain creates into one INSERT statement and
+    // flushes the buffer before any other dispatch, so wire-statement order (and
+    // therefore in-transaction visibility) is preserved.
+
+    /// <summary>
+    /// Dispatch a plain CREATE of a new record — the only dispatch kind that is safe
+    /// to batch (it has no per-dispatch result the emitted body inspects, and new
+    /// records — including <c>[Version]</c>-seeded ones, which CREATE with version 1
+    /// unguarded — carry no conflict guard). Default: immediate
+    /// <see cref="SurrealTransaction.CreateAsync"/> (<c>CREATE $_record_id CONTENT $_content</c>).
+    /// </summary>
+    ValueTask DispatchCreateAsync(RecordId id, SurrealObject content, CancellationToken ct)
+        => new(Transaction.CreateAsync(id.ToSdk(), content, ct));
+
+    /// <summary>
+    /// Dispatch an UPSERT of an already-tracked record. Never batched — updates must
+    /// land in their original order relative to the creates they may depend on.
+    /// Default: immediate <see cref="SurrealTransaction.UpsertAsync"/>
+    /// (<c>UPSERT $_record_id CONTENT $_content</c>).
+    /// </summary>
+    ValueTask DispatchUpsertAsync(RecordId id, SurrealObject content, CancellationToken ct)
+        => new(Transaction.UpsertAsync(id.ToSdk(), content, ct));
+
+    /// <summary>
+    /// Dispatch a raw SurrealQL statement whose response the emitted body inspects —
+    /// the <c>[Version]</c>-guarded <c>UPDATE … WHERE version = $_expected_version</c>
+    /// (each needs its own empty-result conflict check) and the relation-variant
+    /// <c>INSERT RELATION INTO …</c>. Never batched. Default: immediate
+    /// <see cref="SurrealTransaction.QueryAsync"/>.
+    /// </summary>
+    ValueTask<SurrealQueryResponse> DispatchQueryAsync(string sql, SurrealObject bindings, CancellationToken ct)
+        => new(Transaction.QueryAsync(sql, bindings, ct));
 }

@@ -1033,6 +1033,7 @@ Async dispatch methods (talk to SurrealDB through an app-owned `Transaction`):
 | Method | Purpose |
 | --- | --- |
 | `SaveAsync(IEntity entity, Transaction tx, ct)` | Per-entity Save. Auto-binds the entity, walks forward dependencies (Reference / Parent), dispatches a whole-entity `CREATE/UPDATE record:id CONTENT { ... }`, walks new children. **Relation variants are entities too** — passing a variant instance (`new ConstraintRestrictsUserStory { Source = …, Target = … }`) routes through the variant's emitted `IEntity.SaveAsync` body, which dispatches `INSERT RELATION INTO {edge} $_content [ON DUPLICATE KEY UPDATE …]` and updates the in-memory edge index so subsequent `QueryOutgoing` / `QueryIncoming` reads see the new edge. The user picks what to save; the library does no change tracking. |
+| `SaveAsync(IEnumerable<IEntity> entities, Transaction tx, ct)` | Batch Save. Same semantics as one `SaveAsync(entity, tx)` call per element (forward-dependency walk, children walk, auto-bind + `Initialize`, `MarkSaved` promotion across elements — later elements see earlier ones as tracked), but batches the wire: contiguous plain CREATEs of new entities on the same table coalesce into one `INSERT INTO $_table $_records` statement (CBOR array binding, per-record `id` embedded — new `[Version]` entities batch too, seeded at `1`). Anything else — UPSERTs of tracked entities, `[Version]`-guarded UPDATEs (each needs its own empty-result conflict check), relation-variant `INSERT RELATION` — flushes the buffer and dispatches immediately in original order, so no statement is ever deferred past one that could depend on it. A run of one flushes as the single-save-identical `CREATE`. One logical operation: any failure closes the session with `SessionCloseKind.BatchSaveFailed` (stamped with the element in flight). Empty enumerable is a no-op. |
 | `DeleteAsync(IEntity entity, Transaction tx, ct)` | Run `OnDeleting`, dispatch a single `DELETE`, remove from the in-memory snapshot. |
 | `UnrelateAsync<TKind>(source?, target?, tx, ct)` | Direct `DELETE`-edge dispatch. At least one endpoint non-null; one-side-null is the bulk form (every matching edge of the kind, persisted-or-not). |
 | `QueryVariantsOutgoingAsync<TVariant>(srcId, tx \| db, ct)` / `QueryVariantsIncomingAsync<TVariant>(tgtId, tx \| db, ct)` | Async traversal returning hydrated variant entities. Tracked in the session, edges mirrored in `state.Edges`. `IEntity` convenience overloads accept a source/target entity directly. |
@@ -1045,7 +1046,7 @@ Lifecycle:
 - The session stays open across multiple Save/Delete/Relate dispatches — feel free to dispatch into one `tx`, commit it, dispatch into another `tx`, etc.
 - Any exception during a dispatch closes the session (`IsClosed` becomes `true`); subsequent operations throw `InvalidOperationException`.
 - `Abandon()` closes the session explicitly.
-- `CloseReason` (a `SessionCloseReason?` — `null` while open) records **why** the session closed: the closing operation (`SessionCloseKind`: `Abandoned`, `SaveFailed`, `DeleteFailed`, `RejectedDelete`, `UnrelateFailed`, `FetchFailed`, `QueryFailed`), the entity/edge id being operated on where one was available (`EntityId`), and the original exception (`Cause` — the failing call threw it unwrapped; this is the diagnostic echo). The first close wins: abandoning a session that already failed a Save keeps reporting the Save failure. The closed-session `InvalidOperationException` message embeds `CloseReason.Summary`, e.g. `This SurrealSession is closed (SaveAsync of designs:x failed: SurrealRpcException: …). Sessions are one-shot — load a new session for further work.`
+- `CloseReason` (a `SessionCloseReason?` — `null` while open) records **why** the session closed: the closing operation (`SessionCloseKind`: `Abandoned`, `SaveFailed`, `BatchSaveFailed`, `DeleteFailed`, `RejectedDelete`, `UnrelateFailed`, `FetchFailed`, `QueryFailed`), the entity/edge id being operated on where one was available (`EntityId`), and the original exception (`Cause` — the failing call threw it unwrapped; this is the diagnostic echo). The first close wins: abandoning a session that already failed a Save keeps reporting the Save failure. The closed-session `InvalidOperationException` message embeds `CloseReason.Summary`, e.g. `This SurrealSession is closed (SaveAsync of designs:x failed: SurrealRpcException: …). Sessions are one-shot — load a new session for further work.`
 - The transaction lifecycle is the app's responsibility — the library never opens or commits transactions on your behalf.
 
 ### `RecordIdFormat`
@@ -1182,6 +1183,20 @@ public interface ISaveContext
     // through. Adds the entity to the identity map and flips IsTracked for it to
     // true for subsequent calls in the same Save pass.
     void MarkSaved(IEntity entity);
+
+    // Dispatch seam — every wire send an emitted SaveAsync body performs routes
+    // through one of these. The defaults ARE the single-save behavior (immediate
+    // typed dispatch through Transaction); the session's batch SaveAsync overload
+    // substitutes a buffering context that coalesces contiguous same-table plain
+    // creates into one INSERT and flushes before any other dispatch. Only plain
+    // creates batch: DispatchUpsertAsync and DispatchQueryAsync (the [Version]-
+    // guarded UPDATE and the variant INSERT RELATION) always dispatch in order.
+    ValueTask DispatchCreateAsync(RecordId id, SurrealObject content, CancellationToken ct)
+        => new(Transaction.CreateAsync(id.ToSdk(), content, ct));
+    ValueTask DispatchUpsertAsync(RecordId id, SurrealObject content, CancellationToken ct)
+        => new(Transaction.UpsertAsync(id.ToSdk(), content, ct));
+    ValueTask<SurrealQueryResponse> DispatchQueryAsync(string sql, SurrealObject bindings, CancellationToken ct)
+        => new(Transaction.QueryAsync(sql, bindings, ct));
 }
 ```
 

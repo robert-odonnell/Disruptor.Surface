@@ -832,6 +832,82 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     }
 
     /// <summary>
+    /// Batch Save: saves every entity of <paramref name="entities"/> with the same
+    /// semantics as one <see cref="SaveAsync(IEntity, SurrealTransaction, CancellationToken)"/>
+    /// call per entity (forward-dependency walk, children walk, auto-bind + Initialize,
+    /// MarkSaved promotion across entities), but batches the wire dispatches: contiguous
+    /// plain CREATEs of new entities that land on the same table coalesce into a single
+    /// <c>INSERT INTO $_table $_records</c> statement (one CBOR array binding carrying
+    /// each record's content with its <c>id</c> embedded). Everything else — UPSERTs of
+    /// already-tracked entities, <c>[Version]</c>-guarded UPDATEs (each needs its own
+    /// empty-result conflict check), relation-variant <c>INSERT RELATION</c> — dispatches
+    /// immediately in its original order, after flushing any buffered creates.
+    /// <para>
+    /// Flush policy (correctness argument): buffered creates are held only while the
+    /// next dispatch is another plain create <em>for the same table</em>. Any other
+    /// dispatch — a different-table create, an UPSERT, or a raw query — flushes the
+    /// buffer first. The wire therefore sees every statement in exactly the relative
+    /// order the equivalent single saves would have produced, except that runs of
+    /// contiguous same-table creates become one INSERT whose array preserves the run's
+    /// order. Since SurrealDB executes a transaction's statements sequentially (later
+    /// statements see earlier writes) and INSERT processes its rows in array order,
+    /// every dependency the single-save order satisfied is still satisfied — nothing
+    /// is ever deferred past a statement that could depend on it.
+    /// </para>
+    /// <para>
+    /// The batch is one logical operation: any failure closes the session
+    /// (<see cref="SessionCloseKind.BatchSaveFailed"/>, stamped with the entity being
+    /// processed when the failure surfaced) and rethrows. An empty batch is a no-op.
+    /// An entity appearing twice dispatches twice (CREATE then UPSERT), exactly like
+    /// two single saves — each batch element gets a fresh save pass whose MarkSaved
+    /// promotes into the session's tracked set.
+    /// </para>
+    /// </summary>
+    public async Task SaveAsync(IEnumerable<IEntity> entities, SurrealTransaction tx, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(entities);
+        ArgumentNullException.ThrowIfNull(tx);
+        ThrowIfClosed();
+
+        var batch = entities.ToList();
+        if (batch.Count == 0)
+        {
+            return;
+        }
+
+        if (batch.Contains(null!))
+        {
+            throw new ArgumentException("The batch contains a null entity.", nameof(entities));
+        }
+
+        var buffer = new PendingCreateBuffer(tx);
+        var current = batch[0];
+        try
+        {
+            foreach (var entity in batch)
+            {
+                current = entity;
+                // Fresh context per element — identical to N single SaveAsync calls
+                // (per-pass visited/saved sets; MarkSaved promotes into loadedAtStart
+                // so later elements see earlier ones as tracked). Only the dispatch
+                // seam differs: creates buffer through the shared PendingCreateBuffer.
+                var ctx = new BatchSaveContext(this, tx, buffer);
+                await ctx.SaveAsync(entity, ct).ConfigureAwait(false);
+            }
+
+            await buffer.FlushAsync(ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Fail-closed: the batch is one logical Save. Same contract as the
+            // single-entity overload, with its own close kind so diagnostics say
+            // which write surface died.
+            Close(new SessionCloseReason(SessionCloseKind.BatchSaveFailed, current.Id, ex));
+            throw;
+        }
+    }
+
+    /// <summary>
     /// Auto-binds <paramref name="entity"/> for Save: binds the session into the entity's
     /// <c>_session</c> field, runs <c>Initialize</c> (idempotently — the emitted body
     /// guards each <c>OnCreate*</c> hook so already-set mandatory references aren't
@@ -868,7 +944,7 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     /// Internal orchestration: tracks visited-this-pass (cycle break + saved-this-pass
     /// signal for the entity body's IsTracked / CREATE-vs-UPDATE check).
     /// </summary>
-    private sealed class SaveContext(SurrealSession session, SurrealTransaction tx) : ISaveContext
+    private class SaveContext(SurrealSession session, SurrealTransaction tx) : ISaveContext
     {
         private readonly HashSet<RecordId> visited = [];
         private readonly HashSet<RecordId> savedThisPass = [];
@@ -929,6 +1005,108 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
             {
                 session.RecordVariantEdge(entity);
             }
+        }
+
+        // Dispatch seam — the single-save behavior IS the ISaveContext defaults
+        // (immediate dispatch through Transaction); declared here as virtuals so
+        // BatchSaveContext can substitute buffering without touching orchestration.
+
+        public virtual ValueTask DispatchCreateAsync(RecordId id, SurrealObject content, CancellationToken ct)
+            => new(Transaction.CreateAsync(id.ToSdk(), content, ct));
+
+        public virtual ValueTask DispatchUpsertAsync(RecordId id, SurrealObject content, CancellationToken ct)
+            => new(Transaction.UpsertAsync(id.ToSdk(), content, ct));
+
+        public virtual ValueTask<SurrealQueryResponse> DispatchQueryAsync(string sql, SurrealObject bindings, CancellationToken ct)
+            => new(Transaction.QueryAsync(sql, bindings, ct));
+    }
+
+    /// <summary>
+    /// The batch-save flavor of <see cref="SaveContext"/>: identical orchestration
+    /// (auto-bind, visited set, MarkSaved promotion), but plain creates buffer into the
+    /// batch-shared <paramref name="buffer"/> instead of dispatching immediately, and
+    /// every non-batchable dispatch flushes the buffer first so wire-statement order is
+    /// preserved (see the batch
+    /// <see cref="SurrealSession.SaveAsync(IEnumerable{IEntity}, SurrealTransaction, CancellationToken)"/>
+    /// doc for the flush-policy correctness argument).
+    /// </summary>
+    private sealed class BatchSaveContext(SurrealSession session, SurrealTransaction tx, PendingCreateBuffer buffer)
+        : SaveContext(session, tx)
+    {
+        public override ValueTask DispatchCreateAsync(RecordId id, SurrealObject content, CancellationToken ct)
+            => buffer.AddAsync(id, content, ct);
+
+        public override async ValueTask DispatchUpsertAsync(RecordId id, SurrealObject content, CancellationToken ct)
+        {
+            await buffer.FlushAsync(ct).ConfigureAwait(false);
+            await base.DispatchUpsertAsync(id, content, ct).ConfigureAwait(false);
+        }
+
+        public override async ValueTask<SurrealQueryResponse> DispatchQueryAsync(string sql, SurrealObject bindings, CancellationToken ct)
+        {
+            await buffer.FlushAsync(ct).ConfigureAwait(false);
+            return await base.DispatchQueryAsync(sql, bindings, ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Order-preserving buffer of plain CREATE dispatches for the batch Save path.
+    /// Holds at most one contiguous run of same-table creates; a create for a different
+    /// table flushes the pending run before starting a new one. Flush dispatches a run
+    /// of one as the single-save-identical <c>CREATE $_record_id CONTENT $_content</c>
+    /// (via <see cref="SurrealTransaction.CreateAsync"/>) and a run of many as one
+    /// <c>INSERT INTO $_table $_records</c> (via
+    /// <see cref="SurrealTransaction.InsertAsync(string, IEnumerable{SurrealObject}, CancellationToken)"/>
+    /// — the SDK binds the table as a <c>SurrealTableValue</c> and the records as a
+    /// CBOR array), embedding each record's <c>id</c> into its content object so the
+    /// inserted rows land at the same explicit record ids a CREATE would have used.
+    /// INSERT and CREATE agree on new-record semantics: both error when the id already
+    /// exists (no IGNORE / ON DUPLICATE clause is emitted).
+    /// </summary>
+    private sealed class PendingCreateBuffer(SurrealTransaction tx)
+    {
+        private readonly List<(SurrealRecordId SdkId, SurrealObject Content)> pending = [];
+        private string? table;
+
+        public async ValueTask AddAsync(RecordId id, SurrealObject content, CancellationToken ct)
+        {
+            if (table is not null && !string.Equals(table, id.Table, StringComparison.Ordinal))
+            {
+                await FlushAsync(ct).ConfigureAwait(false);
+            }
+
+            table = id.Table;
+            pending.Add((id.ToSdk(), content));
+        }
+
+        public async ValueTask FlushAsync(CancellationToken ct)
+        {
+            if (pending.Count == 0)
+            {
+                return;
+            }
+
+            // Detach the run before the await — a failed flush closes the session
+            // anyway, but a re-entrant/late flush must never re-dispatch stale rows.
+            var flushTable = table!;
+            var run = pending.ToList();
+            pending.Clear();
+            table = null;
+
+            if (run.Count == 1)
+            {
+                await tx.CreateAsync(run[0].SdkId, run[0].Content, ct).ConfigureAwait(false);
+                return;
+            }
+
+            var records = new List<SurrealObject>(run.Count);
+            foreach (var (sdkId, content) in run)
+            {
+                content["id"] = new SurrealRecordIdValue(sdkId);
+                records.Add(content);
+            }
+
+            await tx.InsertAsync(flushTable, records, ct).ConfigureAwait(false);
         }
     }
 
