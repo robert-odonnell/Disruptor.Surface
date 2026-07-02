@@ -85,10 +85,10 @@ internal static class RelationVariantEmitter
                 }
 
                 // RelationLinker guarantees lifted In/Out for every variant in the final
-                // RelationVariants list (preview.56). Anything still null here means the
-                // linker dropped its lift attempt — emit nothing rather than NRE'ing into
-                // EmitVariant. The user gets no diagnostic in this defensive path; the
-                // earlier malformed-variant contract was already silent-fail.
+                // RelationVariants list (preview.56): variants whose endpoints stay
+                // unresolved are filtered into graph.RelationVariantIssues and reported
+                // as CG047 by ModelGenerator.Emit. This guard is purely defensive (e.g.
+                // tests feeding hand-built graphs) — skip rather than NRE into EmitVariant.
                 if (variant.In is null || variant.Out is null)
                 {
                     continue;

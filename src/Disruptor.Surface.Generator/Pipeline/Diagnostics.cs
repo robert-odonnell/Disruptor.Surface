@@ -293,4 +293,20 @@ internal static class Diagnostics
         category: Category,
         defaultSeverity: DiagnosticSeverity.Error,
         isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor VariantDuplicateRole = new(
+        id: "CG046",
+        title: "Relation variant declares duplicate role annotations",
+        messageFormat: "Relation variant '{0}' declares more than one [{1}] member; the [In]/[Out]/[Id] roles are singular per variant (one source endpoint, one target endpoint, one id), so duplicates are ambiguous — remove the extra [{1}] annotation",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor VariantMissingEndpoints = new(
+        id: "CG047",
+        title: "Relation variant declares or inherits no [In]/[Out] endpoints",
+        messageFormat: "Relation variant '{0}' declares or inherits no {1}; every variant needs exactly one [In] and one [Out] endpoint — declare them on the class, or implement an annotated shared-shape interface (an IRelationVariant-derived interface whose members carry [In]/[Out]) that supplies them",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
 }

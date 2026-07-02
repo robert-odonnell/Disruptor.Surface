@@ -55,6 +55,13 @@ internal static class RelationLinker
         tables = FilterNestedTables(tables, nestedTypeIssues);
         compositionRoots = FilterNestedCompositionRoots(compositionRoots, nestedTypeIssues);
 
+        // CG046 — variants declaring the same singular role ([In]/[Out]/[Id]) more than
+        // once. The extractor flags them (RelationVariantModel.DuplicateRoles) instead of
+        // dropping them, so the user gets a diagnostic naming the variant and the role
+        // rather than a CS9248 wall. Same fail-closed pattern as nested types above.
+        var relationVariantIssues = ImmutableArray.CreateBuilder<RelationVariantIssueModel>();
+        relationVariants = FilterDuplicateRoleVariants(relationVariants, relationVariantIssues);
+
         var tableFullNames = new HashSet<string>();
         foreach (var t in tables)
         {
@@ -83,10 +90,11 @@ internal static class RelationLinker
         // Variants whose own annotated members are empty get In / Out / Id / Payload
         // lifted from a matching annotated shared-shape interface (preview.56). Variants
         // whose In or Out remain null after the lift attempt — because no matching
-        // shared-shape interface is annotated — are dropped silently here, the same
-        // fail-soft contract the extractor used to enforce by returning null pre-lift.
-        // Real merge conflicts are still fail-closed, but now flow to emit as CG036.
-        var (liftedVariants, liftConflicts) = LiftVariantsFromSharedShape(rewrittenVariants, sharedShapeCandidates, tableFullNames);
+        // shared-shape interface is annotated — are filtered into the issue list and
+        // reported as CG047 by ModelGenerator.Emit (they used to be dropped silently).
+        // Real merge conflicts stay fail-closed too, flowing to emit as CG036.
+        var (liftedVariants, liftConflicts) = LiftVariantsFromSharedShape(
+            rewrittenVariants, sharedShapeCandidates, tableFullNames, relationVariantIssues);
 
         var unions = ComputeUnions(linked, forwardKinds, inverseKinds);
         var unionEndpoints = ComputeUnionEndpoints(linked, unionInterfaceCandidates, unionMembershipCandidates);
@@ -108,6 +116,7 @@ internal static class RelationLinker
             IndexIssues: new EquatableArray<IndexIssueModel>(indexIssues),
             NameCollisions: new EquatableArray<NameCollisionModel>(nameCollisions),
             NestedTypeIssues: new EquatableArray<NestedTypeIssueModel>(nestedTypeIssues.ToImmutable()),
+            RelationVariantIssues: new EquatableArray<RelationVariantIssueModel>(relationVariantIssues.ToImmutable()),
             Aggregates: new EquatableArray<AggregateModel>(aggregates),
             AggregateConflicts: new EquatableArray<string>(conflicts),
             CascadeCycles: new EquatableArray<string>(cascadeCycles),
@@ -133,6 +142,39 @@ internal static class RelationLinker
             else
             {
                 kept.Add(t);
+            }
+        }
+
+        return kept.ToImmutable();
+    }
+
+    /// <summary>
+    /// Pulls variants with duplicate singular-role declarations ([In]/[Out]/[Id] declared
+    /// twice) out of the model, one <see cref="RelationVariantIssueModel"/> per duplicated
+    /// role. Reported as CG046 by <c>ModelGenerator.Emit</c>.
+    /// </summary>
+    private static ImmutableArray<RelationVariantModel> FilterDuplicateRoleVariants(
+        ImmutableArray<RelationVariantModel> variants,
+        ImmutableArray<RelationVariantIssueModel>.Builder issues)
+    {
+        if (!variants.Any(static v => v.DuplicateRoles.Count > 0))
+        {
+            return variants;
+        }
+
+        var kept = ImmutableArray.CreateBuilder<RelationVariantModel>(variants.Length);
+        foreach (var v in variants)
+        {
+            if (v.DuplicateRoles.Count > 0)
+            {
+                foreach (var role in v.DuplicateRoles)
+                {
+                    issues.Add(new RelationVariantIssueModel(v.FullName, RelationVariantIssueKind.DuplicateRole, role));
+                }
+            }
+            else
+            {
+                kept.Add(v);
             }
         }
 
@@ -500,7 +542,8 @@ internal static class RelationLinker
     private static (ImmutableArray<RelationVariantModel> Variants, ImmutableArray<SharedShapeLiftConflict> Conflicts) LiftVariantsFromSharedShape(
         ImmutableArray<RelationVariantModel> variants,
         ImmutableArray<SharedShapeInterfaceCandidate> candidates,
-        HashSet<string> tableFullNames)
+        HashSet<string> tableFullNames,
+        ImmutableArray<RelationVariantIssueModel>.Builder issues)
     {
         if (variants.Length == 0)
         {
@@ -546,8 +589,25 @@ internal static class RelationLinker
                 }
             }
 
-            if (conflicted || merged.In is null || merged.Out is null)
+            if (conflicted)
             {
+                // Merge conflict — already captured as a SharedShapeLiftConflict (CG036).
+                continue;
+            }
+
+            if (merged.In is null || merged.Out is null)
+            {
+                // CG047 — no matching annotated shared-shape interface supplied the
+                // missing endpoint(s). Name what's missing so the diagnostic reads as
+                // an instruction, not a shrug.
+                var missing = (merged.In, merged.Out) switch
+                {
+                    (null, null) => "[In] or [Out] endpoint",
+                    (null, _)    => "[In] endpoint",
+                    _            => "[Out] endpoint",
+                };
+                issues.Add(new RelationVariantIssueModel(
+                    variant.FullName, RelationVariantIssueKind.MissingEndpoints, missing));
                 continue;
             }
 

@@ -137,6 +137,20 @@ public sealed class ModelGenerator : IIncrementalGenerator
                 nested.AttributeName));
         }
 
+        // CG046/CG047 — malformed relation variants pulled out of the graph by the
+        // linker (duplicate [In]/[Out]/[Id] roles; endpoints unresolved after the
+        // shared-shape lift). Previously these were dropped silently and surfaced only
+        // as a CS9248 wall in the user's own partial declarations.
+        foreach (var issue in graph.RelationVariantIssues)
+        {
+            var descriptor = issue.Kind switch
+            {
+                RelationVariantIssueKind.DuplicateRole => Diagnostics.VariantDuplicateRole,
+                _ => Diagnostics.VariantMissingEndpoints,
+            };
+            spc.ReportDiagnostic(Diagnostic.Create(descriptor, Location.None, issue.FullName, issue.Detail));
+        }
+
         foreach (var conflict in graph.AggregateConflicts)
         {
             // Format from RelationLinker.ComputeAggregates: "Member|Root1,Root2,...".
