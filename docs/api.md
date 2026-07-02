@@ -681,7 +681,13 @@ catch (LoadShapeViolationException)
 }
 ```
 
-`FetchAsync` is a slice widener: existing entities re-Hydrate (overwriting scalar fields with the DB row); brand-new entities go through the include's full Hydrate. Slices listed in the extension query's `Includes` are marked loaded. **Caveat:** if you've mutated an entity in memory and Fetch re-hydrates it, your edits get clobbered — Save first or accept the clobber. Per-field "did the user touch this" tracking was deliberately removed under the explicit-Save model. Closed sessions throw `InvalidOperationException`.
+`FetchAsync` is a slice widener: the pinned root re-Hydrates over the tracked instance (overwriting scalar fields with the DB row); nested include rows hydrate new children / relation targets as needed. Slices listed in the extension query's `Includes` are marked loaded. **Caveat:** if you've mutated an entity in memory and Fetch re-hydrates it, your edits get clobbered — Save first or accept the clobber. Per-field "did the user touch this" tracking was deliberately removed under the explicit-Save model. Closed sessions throw `InvalidOperationException`.
+
+**Enforced contract** — Fetch never invents new aggregate roots:
+
+- The query **must** pin a root id via `WithId(...)`. A pin-less query (`.Where(...).Limit(n).Include*(...)`) throws `ArgumentException` before any wire dispatch; the session stays open (pure API misuse, same stance as `UnrelateAsync`'s both-null guard).
+- The pinned id **must already be tracked** in the session. An unknown pin throws `InvalidOperationException` before dispatch and closes the session with `SessionCloseKind.RejectedFetch` — a fetch rooted at an id the snapshot doesn't hold means the caller's view of the session is already wrong.
+- Any returned **root** row whose id differs from the pin is rejected before it hydrates: the session closes (`SessionCloseKind.FetchFailed`) and the foreign row is not tracked. Only the root is guarded — nested includes still hydrate freely.
 
 ```csharp
 public Task FetchAsync<T>(
@@ -1039,7 +1045,7 @@ Async dispatch methods (talk to SurrealDB through an app-owned `Transaction`):
 | `QueryVariantsOutgoingAsync<TVariant>(srcId, tx \| db, ct)` / `QueryVariantsIncomingAsync<TVariant>(tgtId, tx \| db, ct)` | Async traversal returning hydrated variant entities. Tracked in the session, edges mirrored in `state.Edges`. `IEntity` convenience overloads accept a source/target entity directly. |
 | `QueryOutgoingAsync<TKind, TTarget>(srcId, tx \| db, ct)` / `QueryIncomingAsync<TKind, TTarget>(tgtId, tx \| db, ct)` | Async traversal returning target entities directly (skips variant materialisation); not auto-tracked. Same `IEntity` convenience overloads. |
 | `QueryVariantsAsync<TVariant>(sql, bindings, tx \| db, ct)` | Raw-SQL escape hatch for variant traversal that doesn't fit the canonical shape. |
-| `FetchAsync<T>(SurfaceQuery<T> query, db \| tx, ct)` | Top-up extension query — partial-merge hydrate into the existing session, mark Included slices loaded. Pending writes always win. |
+| `FetchAsync<T>(SurfaceQuery<T> query, db \| tx, ct)` | Top-up extension query — partial-merge hydrate into the existing session, mark Included slices loaded. Requires the query to pin an already-tracked root via `WithId(...)` (see "Strict-with-escape"); never invents new aggregate roots. Pending writes always win. |
 
 Lifecycle:
 
