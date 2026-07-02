@@ -162,8 +162,10 @@ public sealed class RelationVariantExtractorTests
     }
 
     [Fact]
-    public void Multiple_In_Returns_Null()
+    public void Multiple_In_Flags_DuplicateRole()
     {
+        // Duplicate singular roles no longer collapse the model to null — the extractor
+        // flags them so the linker can filter the variant into the CG046 issue list.
         const string fixture = Preamble + """
 
             [Restricts]
@@ -178,11 +180,13 @@ public sealed class RelationVariantExtractorTests
         var cls = compilation.GetTypeByMetadataName("M.TwoIns");
         Assert.NotNull(cls);
 
-        Assert.Null(RelationVariantExtractor.TryExtractFromSymbol(cls!, CancellationToken.None));
+        var model = RelationVariantExtractor.TryExtractFromSymbol(cls!, CancellationToken.None);
+        Assert.NotNull(model);
+        Assert.Equal(["In"], model!.DuplicateRoles.ToArray());
     }
 
     [Fact]
-    public void Multiple_Out_Returns_Null()
+    public void Multiple_Out_Flags_DuplicateRole()
     {
         const string fixture = Preamble + """
 
@@ -198,7 +202,9 @@ public sealed class RelationVariantExtractorTests
         var cls = compilation.GetTypeByMetadataName("M.TwoOuts");
         Assert.NotNull(cls);
 
-        Assert.Null(RelationVariantExtractor.TryExtractFromSymbol(cls!, CancellationToken.None));
+        var model = RelationVariantExtractor.TryExtractFromSymbol(cls!, CancellationToken.None);
+        Assert.NotNull(model);
+        Assert.Equal(["Out"], model!.DuplicateRoles.ToArray());
     }
 
     [Fact]

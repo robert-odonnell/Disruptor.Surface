@@ -293,4 +293,52 @@ internal static class Diagnostics
         category: Category,
         defaultSeverity: DiagnosticSeverity.Error,
         isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor VariantDuplicateRole = new(
+        id: "CG046",
+        title: "Relation variant declares duplicate role annotations",
+        messageFormat: "Relation variant '{0}' declares more than one [{1}] member; the [In]/[Out]/[Id] roles are singular per variant (one source endpoint, one target endpoint, one id), so duplicates are ambiguous — remove the extra [{1}] annotation",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor RecordTypeNotSupported = new(
+        id: "CG048",
+        title: "Model attribute is not supported on record declarations",
+        messageFormat: "'{0}' carries [{1}] but is declared as a record; the generator emits partial-class implementation halves (backing fields, IEntity plumbing, session binding) that don't compose with record synthesis (positional constructor, copy semantics, value equality). Declare '{0}' as a partial class.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor GenericTableNotSupported = new(
+        id: "CG049",
+        title: "[Table] is not supported on generic types",
+        messageFormat: "[Table] '{0}' declares type parameter(s) <{1}>; generic tables are not supported — the physical SurrealDB table name derives from the simple class name and ignores type arguments (so two closed constructions like Foo<int> and Foo<string> would silently share one table), the {2}Id record-id struct is non-generic, and the generated query/hydration accessors cannot name an open generic type. Make the table non-generic (e.g. one concrete [Table] class per closed shape).",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor VariantMissingEndpoints = new(
+        id: "CG047",
+        title: "Relation variant declares or inherits no [In]/[Out] endpoints",
+        messageFormat: "Relation variant '{0}' declares or inherits no {1}; every variant needs exactly one [In] and one [Out] endpoint — declare them on the class, or implement an annotated shared-shape interface (an IRelationVariant-derived interface whose members carry [In]/[Out]) that supplies them",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ElementCollectionElementNotSupported = new(
+        id: "CG050",
+        title: "Element-collection [Property] element type is not supported",
+        messageFormat: "Element-collection [Property] '{0}.{1}' has element type '{2}' which is not supported: {3}",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ElementCollectionMustBeGetOnly = new(
+        id: "CG051",
+        title: "Element-collection [Property] must be get-only",
+        messageFormat: "Element-collection [Property] '{0}.{1}' declares a setter; element collections are get-only — the generator emits a read-only view over a generated backing list plus Add{2}(...)/Remove{2}(...)/Clear{1}() mutators, so a user-declared setter has no generated implementation to pair with (it would surface as CS9252 in the .g.cs). Remove the setter and mutate through the generated helpers.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
 }

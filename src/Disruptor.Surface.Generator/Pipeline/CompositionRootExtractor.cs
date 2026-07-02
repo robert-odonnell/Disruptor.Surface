@@ -17,7 +17,10 @@ internal static class CompositionRootExtractor
             return null;
         }
 
-        if (type.TypeKind != TypeKind.Class)
+        // Records are admitted so the linker can reject them with CG048 (mirrors
+        // TableExtractor) — a [CompositionRoot] record would otherwise be silently
+        // ignored by the class-only predicate.
+        if (type.TypeKind != TypeKind.Class && !type.IsRecord)
         {
             return null;
         }
@@ -36,6 +39,7 @@ internal static class CompositionRootExtractor
             Name: type.Name,
             DeclaredAccessibility: type.DeclaredAccessibility.ToString(),
             IsPartial: PartialDeclaration.IsDeclared(type, ct),
-            IsNested: type.ContainingType is not null);
+            IsNested: type.ContainingType is not null,
+            IsRecord: type.IsRecord);
     }
 }

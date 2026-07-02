@@ -39,3 +39,33 @@ public sealed record NameCollisionModel(
 public sealed record NestedTypeIssueModel(
     string FullName,
     string AttributeName);
+
+/// <summary>
+/// A model attribute (<c>[Table]</c> / <c>[CompositionRoot]</c> / an on-class relation
+/// kind attribute) applied to a <c>record</c> declaration (CG048). The FAWMN predicates
+/// admit record declarations only so the transform can flag them; the linker pulls the
+/// flagged models out of the graph and this issue explains why nothing was emitted —
+/// previously the predicate silently skipped records (clean compile, zero output).
+/// </summary>
+public sealed record RecordTypeIssueModel(
+    string FullName,
+    string AttributeName);
+
+/// <summary>
+/// A <c>[Table]</c> declared with type parameters (CG049). Generic tables are rejected
+/// fail-closed: the physical table name derives from the simple class name and ignores
+/// type arguments (two closed constructions would silently share one table), the
+/// <c>{Name}Id</c> struct is non-generic, and the query/hydration root accessors cannot
+/// name an open generic type. Previously the half-supported shape emitted a
+/// <c>partial class Foo&lt;T&gt;</c> whose <c>MetadataName</c>-keyed FullName
+/// (<c>Ns.Foo`1</c>) never matched any use-site lookup, so aggregate membership, CG014
+/// cycle detection, and CG017/CG021 silently skipped it while the generated roots
+/// referenced the open generic (CS0305).
+/// </summary>
+/// <param name="FullName">The table's full name (metadata form, e.g. <c>Ns.Foo`1</c>).</param>
+/// <param name="SimpleName">The table's simple name (for the <c>{Name}Id</c> mention in the message).</param>
+/// <param name="TypeParameters">Comma-joined type parameter names, e.g. <c>T, TKey</c>.</param>
+public sealed record GenericTableIssueModel(
+    string FullName,
+    string SimpleName,
+    string TypeParameters);

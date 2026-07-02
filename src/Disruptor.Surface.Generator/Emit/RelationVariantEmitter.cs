@@ -85,10 +85,10 @@ internal static class RelationVariantEmitter
                 }
 
                 // RelationLinker guarantees lifted In/Out for every variant in the final
-                // RelationVariants list (preview.56). Anything still null here means the
-                // linker dropped its lift attempt — emit nothing rather than NRE'ing into
-                // EmitVariant. The user gets no diagnostic in this defensive path; the
-                // earlier malformed-variant contract was already silent-fail.
+                // RelationVariants list (preview.56): variants whose endpoints stay
+                // unresolved are filtered into graph.RelationVariantIssues and reported
+                // as CG047 by ModelGenerator.Emit. This guard is purely defensive (e.g.
+                // tests feeding hand-built graphs) — skip rather than NRE into EmitVariant.
                 if (variant.In is null || variant.Out is null)
                 {
                     continue;
@@ -314,7 +314,7 @@ internal static class RelationVariantEmitter
         var writer = new CodeWriter().Header();
         using (writer.Namespace(variant.Namespace))
         {
-            var declaration = $"{FormatAccessibility(variant.DeclaredAccessibility)} partial class {variant.Name} : {string.Join(", ", baseTypes)}";
+            var declaration = $"{FormatAccessibility(variant.DeclaredAccessibility)} partial class {CSharpText.Identifier(variant.Name)} : {string.Join(", ", baseTypes)}";
             using (writer.Block(declaration))
             {
                 EntityEmitterCommon.WriteSessionPlumbing(writer);
@@ -434,11 +434,11 @@ internal static class RelationVariantEmitter
 
             if (!p.HasSetter && !p.HasInitOnlySetter)
             {
-                writer.Line($"{access} {partialKw}{declared} {p.Name} => {backing};");
+                writer.Line($"{access} {partialKw}{declared} {CSharpText.Identifier(p.Name)} => {backing};");
                 return;
             }
 
-            writer.Line($"{access} {partialKw}{declared} {p.Name}");
+            writer.Line($"{access} {partialKw}{declared} {CSharpText.Identifier(p.Name)}");
             using (writer.BracedBlock())
             {
                 writer.Line($"get => {backing};");
@@ -458,7 +458,7 @@ internal static class RelationVariantEmitter
 
             writer.Line($"private {typeArg}? {backing};");
             writer.Line($"private global::Disruptor.Surface.Runtime.RecordId? {idBacking};");
-            writer.Line($"{access} {partialKw}{declared} {p.Name}");
+            writer.Line($"{access} {partialKw}{declared} {CSharpText.Identifier(p.Name)}");
             using (writer.BracedBlock())
             {
 
@@ -498,11 +498,11 @@ internal static class RelationVariantEmitter
 
             if (!p.HasSetter && !p.HasInitOnlySetter)
             {
-                writer.Line($"{access} {partialKw}{declared} {p.Name} => {backing};");
+                writer.Line($"{access} {partialKw}{declared} {CSharpText.Identifier(p.Name)} => {backing};");
                 return;
             }
 
-            writer.Line($"{access} {partialKw}{declared} {p.Name}");
+            writer.Line($"{access} {partialKw}{declared} {CSharpText.Identifier(p.Name)}");
             using (writer.BracedBlock())
             {
                 writer.Line($"get => {backing};");
@@ -698,11 +698,23 @@ internal static class RelationVariantEmitter
         else
         {
             // Typed-id: cast through (RecordId?) using the implicit operator on {Name}Id.
-            // Default-valued (unset) typed ids would convert to a RecordId with empty
-            // Value — but EnumerateReferences is only called on hydrated/saved variants,
-            // by which point both endpoints are required to be set.
+            // Nullable endpoints guard with `is { }` — the lifted user-defined conversion
+            // on a null Nullable<{Name}Id> throws InvalidOperationException, so the
+            // unguarded cast would blow up EnumerateReferences for an unset optional
+            // endpoint instead of yielding (field, null). Mirrors the union branch above.
+            // Non-nullable endpoints keep the direct cast: EnumerateReferences is only
+            // called on hydrated/saved variants, by which point both required endpoints
+            // are set.
             var backing = $"_{ToCamel(p.Name)}";
-            writer.Line($"yield return ({fieldLit}, (global::Disruptor.Surface.Runtime.RecordId?)(global::Disruptor.Surface.Runtime.RecordId){backing});");
+            if (p.Type.IsNullable)
+            {
+                var local = $"__v_{ToCamel(p.Name)}";
+                writer.Line($"yield return ({fieldLit}, {backing} is {{ }} {local} ? (global::Disruptor.Surface.Runtime.RecordId?)(global::Disruptor.Surface.Runtime.RecordId){local} : null);");
+            }
+            else
+            {
+                writer.Line($"yield return ({fieldLit}, (global::Disruptor.Surface.Runtime.RecordId?)(global::Disruptor.Surface.Runtime.RecordId){backing});");
+            }
         }
     }
 
@@ -996,11 +1008,11 @@ internal static class RelationVariantEmitter
 
         if (!p.HasSetter && !p.HasInitOnlySetter)
         {
-            writer.Line($"{access} {partialKw}{type} {p.Name} => {backing};");
+            writer.Line($"{access} {partialKw}{type} {CSharpText.Identifier(p.Name)} => {backing};");
             return;
         }
 
-        writer.Line($"{access} {partialKw}{type} {p.Name}");
+        writer.Line($"{access} {partialKw}{type} {CSharpText.Identifier(p.Name)}");
         using (writer.BracedBlock())
         {
             writer.Line($"get => {backing};");
@@ -1025,7 +1037,7 @@ internal static class RelationVariantEmitter
     private static string StripNullable(string typeName)
         => typeName.EndsWith("?", StringComparison.Ordinal) ? typeName[..^1] : typeName;
 
-    private static string Quote(string s) => $"\"{s.Replace("\"", "\\\"")}\"";
+    private static string Quote(string s) => CSharpText.Quote(s);
 
     private static string FormatAccessibility(string raw) => raw switch
     {
@@ -1155,7 +1167,7 @@ internal static class RelationVariantEmitter
                     {
                         foreach (var (inTable, outTable, variant) in pairs)
                         {
-                            writer.Line($"({Quote(inTable)}, {Quote(outTable)}) => new global::{variant.FullName}(),");
+                            writer.Line($"({Quote(inTable)}, {Quote(outTable)}) => new {CSharpText.GlobalType(variant.FullName)}(),");
                         }
 
                         writer.Line("_ => null,");

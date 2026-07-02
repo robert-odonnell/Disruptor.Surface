@@ -74,9 +74,7 @@ internal static class QueryRootEmitter
                 {
                     var tableName = SurrealNaming.ToTableName(table.Name);
                     var propertyName = PascalPluralize(table.Name);
-                    var entityFqn = string.IsNullOrEmpty(table.Namespace)
-                        ? $"global::{table.Name}"
-                        : $"global::{table.Namespace}.{table.Name}";
+                    var entityFqn = CSharpText.GlobalName(table.Namespace, table.Name);
 
                     writer.Line($"public {Namespaces.QueryFqn}<{entityFqn}> {propertyName} => new(\"{tableName}\");");
                 }

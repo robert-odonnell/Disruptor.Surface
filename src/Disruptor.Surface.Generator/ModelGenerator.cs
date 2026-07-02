@@ -12,10 +12,13 @@ public sealed class ModelGenerator : IIncrementalGenerator
 {
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
+        // Record declarations are admitted alongside classes so the pipeline can REJECT
+        // them with CG048 — AttributeTargets.Class allows `[Table] partial record X`,
+        // and a class-only predicate silently ignored it (clean compile, no output).
         var tables = context.SyntaxProvider
             .ForAttributeWithMetadataName(
                 AnnotationsMetadata.Table,
-                predicate: static (node, _) => node is ClassDeclarationSyntax,
+                predicate: static (node, _) => node is ClassDeclarationSyntax or RecordDeclarationSyntax,
                 transform: static (ctx, ct) => TableExtractor.TryExtract(ctx, ct))
             .Where(static t => t is not null)
             .Select(static (t, _) => t!);
@@ -48,7 +51,7 @@ public sealed class ModelGenerator : IIncrementalGenerator
         var compositionRoots = context.SyntaxProvider
             .ForAttributeWithMetadataName(
                 AnnotationsMetadata.CompositionRoot,
-                predicate: static (node, _) => node is ClassDeclarationSyntax,
+                predicate: static (node, _) => node is ClassDeclarationSyntax or RecordDeclarationSyntax,
                 transform: static (ctx, ct) => CompositionRootExtractor.TryExtract(ctx, ct))
             .Where(static c => c is not null)
             .Select(static (c, _) => c!);
@@ -135,6 +138,45 @@ public sealed class ModelGenerator : IIncrementalGenerator
                 Location.None,
                 nested.FullName,
                 nested.AttributeName));
+        }
+
+        // CG048 — [Table] / [CompositionRoot] / relation kind attributes on record
+        // declarations. The linker pulled these out of the graph; this explains why
+        // nothing was emitted for them (previously: silent skip, clean compile).
+        foreach (var record in graph.RecordTypeIssues)
+        {
+            spc.ReportDiagnostic(Diagnostic.Create(
+                Diagnostics.RecordTypeNotSupported,
+                Location.None,
+                record.FullName,
+                record.AttributeName));
+        }
+
+        // CG049 — generic [Table] classes, rejected fail-closed by the linker (the
+        // table name ignores type arguments, so closed constructions would silently
+        // share one physical table; the generated roots can't name an open generic).
+        foreach (var generic in graph.GenericTableIssues)
+        {
+            spc.ReportDiagnostic(Diagnostic.Create(
+                Diagnostics.GenericTableNotSupported,
+                Location.None,
+                generic.FullName,
+                generic.TypeParameters,
+                generic.SimpleName));
+        }
+
+        // CG046/CG047 — malformed relation variants pulled out of the graph by the
+        // linker (duplicate [In]/[Out]/[Id] roles; endpoints unresolved after the
+        // shared-shape lift). Previously these were dropped silently and surfaced only
+        // as a CS9248 wall in the user's own partial declarations.
+        foreach (var issue in graph.RelationVariantIssues)
+        {
+            var descriptor = issue.Kind switch
+            {
+                RelationVariantIssueKind.DuplicateRole => Diagnostics.VariantDuplicateRole,
+                _ => Diagnostics.VariantMissingEndpoints,
+            };
+            spc.ReportDiagnostic(Diagnostic.Create(descriptor, Location.None, issue.FullName, issue.Detail));
         }
 
         foreach (var conflict in graph.AggregateConflicts)
@@ -545,9 +587,7 @@ public sealed class ModelGenerator : IIncrementalGenerator
                     continue;
                 }
 
-                if (p.Type.MetadataName is "System.Collections.Generic.IReadOnlyList`1"
-                    or "System.Collections.Generic.IList`1"
-                    or "System.Collections.Generic.List`1")
+                if (IsElementCollection(p.Type))
                 {
                     continue;
                 }
@@ -563,6 +603,67 @@ public sealed class ModelGenerator : IIncrementalGenerator
                     table.FullName,
                     p.Name,
                     p.Type.FullyQualifiedName));
+                valid = false;
+            }
+
+            // CG050/CG051 — element-collection [Property] shape validation. CG025 skips
+            // these (they aren't scalars), so without their own checks unsupported
+            // element types surfaced as raw CS errors inside the .g.cs: string elements
+            // generated `new string(this[]: …, Length: …)` (CS0443), List<int> fell to
+            // the scalar save path with no matching ContentValue.Set overload (CS1503),
+            // and a user-declared setter met a getter-only emitted impl (CS9252).
+            foreach (var p in table.Properties)
+            {
+                if (!p.Kinds.HasFlag(PropertyKind.Property) || p.RelationRole != RelationRole.None)
+                {
+                    continue;
+                }
+
+                if (!IsElementCollection(p.Type))
+                {
+                    continue;
+                }
+
+                // CG051 — element collections are get-only by contract: the emitted impl
+                // is a read-only view over a generated backing list plus Add/Remove/Clear
+                // helpers. A setter (or init) has nothing to pair with.
+                if (p.HasSetter || p.HasInitOnlySetter)
+                {
+                    spc.ReportDiagnostic(Diagnostic.Create(
+                        Diagnostics.ElementCollectionMustBeGetOnly,
+                        Location.None,
+                        table.FullName,
+                        p.Name,
+                        SurrealNaming.Singularize(p.Name)));
+                    valid = false;
+                }
+
+                // Supported element shapes: (a) inline record/POCO — extraction resolved
+                // a constructible member set; (b) non-nullable mappable scalar — the
+                // array<T> direct path. Everything else is CG050.
+                if (p.InlineMembers.Count > 0)
+                {
+                    continue;
+                }
+
+                var element = p.Type.TypeArguments.Count == 1 ? p.Type.TypeArguments[0] : null;
+                if (element is not null && !element.IsNullable && SchemaEmitter.IsMappableScalar(element))
+                {
+                    continue;
+                }
+
+                var detail = element is null
+                    ? "the element type could not be resolved at extraction time"
+                    : element.IsNullable && SchemaEmitter.IsMappableScalar(element)
+                        ? "nullable element types are not supported — a null element has no stable wire round-trip; use a non-nullable element type and omit unset values"
+                        : "the element type is neither a SurrealDB-mappable scalar nor a type constructible from its public mappable properties (use a positional record, or a parameterless-constructor type whose mappable public properties are all readable and settable)";
+                spc.ReportDiagnostic(Diagnostic.Create(
+                    Diagnostics.ElementCollectionElementNotSupported,
+                    Location.None,
+                    table.FullName,
+                    p.Name,
+                    element?.FullyQualifiedName ?? "<unresolved>",
+                    detail));
                 valid = false;
             }
 
@@ -688,6 +789,15 @@ public sealed class ModelGenerator : IIncrementalGenerator
     private static TypeRef UnwrapTask(TypeRef t) => t.FullyQualifiedName.StartsWith("global::System.Threading.Tasks.Task<", StringComparison.Ordinal) && t.TypeArguments.Count > 0
         ? t.TypeArguments[0]
         : t;
+
+    /// <summary>
+    /// The recognised element-collection shapes for a <c>[Property]</c> column. Mirrors
+    /// the detection in <c>TableExtractor.ResolveInlineMembers</c> / the emitters.
+    /// </summary>
+    private static bool IsElementCollection(TypeRef t) =>
+        t.MetadataName is "System.Collections.Generic.IReadOnlyList`1"
+                       or "System.Collections.Generic.IList`1"
+                       or "System.Collections.Generic.List`1";
 
     private static string DescribeSharedShapeLiftMember(
         RelationVariantPropertyRole role,

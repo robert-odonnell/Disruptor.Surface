@@ -46,6 +46,7 @@ public enum RelationVariantPropertyRole
 /// <param name="IsPartial">Whether the class itself is declared <c>partial</c> (required to receive emitted IEntity members).</param>
 /// <param name="DeclaredAccessibility">Class-level accessibility — emitted IEntity members match.</param>
 /// <param name="ImplementedInterfaceFullNames">User-declared interfaces the variant implements (FQNs without <c>global::</c>). Used to match the variant into <see cref="SharedShapeModel"/>s — interfaces deriving from <c>Disruptor.Surface.Runtime.IRelationVariant</c> are shared-shape contracts.</param>
+/// <param name="DuplicateRoles">Role names ("In"/"Out"/"Id") that the class declares more than once. Non-empty variants are malformed: <c>RelationLinker.Build</c> filters them into <see cref="RelationVariantIssueModel"/>s and <c>ModelGenerator.Emit</c> reports CG046 — they never reach the emitters. For duplicated roles the single-slot snapshot (<see cref="In"/>/<see cref="Out"/>/<see cref="Id"/>) holds the last declaration seen; the value is never emitted.</param>
 public sealed record RelationVariantModel(
     string FullName,
     string Namespace,
@@ -57,4 +58,6 @@ public sealed record RelationVariantModel(
     EquatableArray<RelationVariantPropertyModel> PayloadProperties,
     bool IsPartial,
     string DeclaredAccessibility,
-    EquatableArray<string> ImplementedInterfaceFullNames);
+    EquatableArray<string> ImplementedInterfaceFullNames,
+    EquatableArray<string> DuplicateRoles,
+    bool IsRecord);

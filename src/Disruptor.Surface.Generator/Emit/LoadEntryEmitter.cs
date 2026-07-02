@@ -55,14 +55,10 @@ internal static class LoadEntryEmitter
 
     private static void EmitOne(SourceProductionContext spc, CompositionRootModel root, TableModel aggRoot)
     {
-        var entityFqn = string.IsNullOrEmpty(aggRoot.Namespace)
-            ? $"global::{aggRoot.Name}"
-            : $"global::{aggRoot.Namespace}.{aggRoot.Name}";
+        var entityFqn = CSharpText.GlobalName(aggRoot.Namespace, aggRoot.Name);
         var idFqn = $"{entityFqn}Id";
         var loaderFqn = $"global::Disruptor.Surface.Runtime.{aggRoot.Name}AggregateLoader";
-        var refRegistryFqn = string.IsNullOrEmpty(root.Namespace)
-            ? $"global::{root.Name}.ReferenceRegistry"
-            : $"global::{root.Namespace}.{root.Name}.ReferenceRegistry";
+        var refRegistryFqn = $"{CSharpText.GlobalName(root.Namespace, root.Name)}.ReferenceRegistry";
 
         var writer = new CodeWriter().Header();
         using (writer.Namespace(root.Namespace))

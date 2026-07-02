@@ -4,6 +4,8 @@ namespace Disruptor.Surface.Generator.Model;
 /// Index attribute occurrence found on a table property. The attribute type names the
 /// index; applying the same attribute to multiple properties creates a composite index.
 /// </summary>
+/// <param name="DeclarationKey">Position-independent identity of the partial type declaration the property lives in (<c>"decl:{ordinal}"</c> within the containing symbol's DeclaringSyntaxReferences). Distinct keys across one composite index trigger CG038. Never an absolute file position — that busted the incremental cache on every edit above the property.</param>
+/// <param name="SourceOrder">The property's member ordinal within its type declaration — composite column order is property declaration order.</param>
 public sealed record IndexAnnotationModel(
     string AttributeFullName,
     string AttributeName,

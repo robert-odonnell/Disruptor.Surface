@@ -101,7 +101,7 @@ internal static class SharedShapeEmitter
             var first = true;
             foreach (var (variantFullName, marker, _) in shape.Variants)
             {
-                var variantFqn = $"global::{variantFullName}";
+                var variantFqn = CSharpText.GlobalType(variantFullName);
                 var keyword = first ? "if" : "else if";    
                 writer.Line($"{keyword} (typeof(TKind) == typeof({marker}))");
                 using (writer.BracedBlock())
@@ -122,7 +122,7 @@ internal static class SharedShapeEmitter
         }
     }
 
-    private static string EscapeForString(string s) => s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+    private static string EscapeForString(string s) => CSharpText.EscapeForString(s);
 
     private static string FormatAccessibility(string raw) => raw switch
     {
