@@ -310,6 +310,14 @@ internal static class Diagnostics
         defaultSeverity: DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
+    public static readonly DiagnosticDescriptor GenericTableNotSupported = new(
+        id: "CG049",
+        title: "[Table] is not supported on generic types",
+        messageFormat: "[Table] '{0}' declares type parameter(s) <{1}>; generic tables are not supported — the physical SurrealDB table name derives from the simple class name and ignores type arguments (so two closed constructions like Foo<int> and Foo<string> would silently share one table), the {2}Id record-id struct is non-generic, and the generated query/hydration accessors cannot name an open generic type. Make the table non-generic (e.g. one concrete [Table] class per closed shape).",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public static readonly DiagnosticDescriptor VariantMissingEndpoints = new(
         id: "CG047",
         title: "Relation variant declares or inherits no [In]/[Out] endpoints",

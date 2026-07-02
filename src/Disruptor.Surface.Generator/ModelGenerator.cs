@@ -152,6 +152,19 @@ public sealed class ModelGenerator : IIncrementalGenerator
                 record.AttributeName));
         }
 
+        // CG049 — generic [Table] classes, rejected fail-closed by the linker (the
+        // table name ignores type arguments, so closed constructions would silently
+        // share one physical table; the generated roots can't name an open generic).
+        foreach (var generic in graph.GenericTableIssues)
+        {
+            spc.ReportDiagnostic(Diagnostic.Create(
+                Diagnostics.GenericTableNotSupported,
+                Location.None,
+                generic.FullName,
+                generic.TypeParameters,
+                generic.SimpleName));
+        }
+
         // CG046/CG047 — malformed relation variants pulled out of the graph by the
         // linker (duplicate [In]/[Out]/[Id] roles; endpoints unresolved after the
         // shared-shape lift). Previously these were dropped silently and surfaced only

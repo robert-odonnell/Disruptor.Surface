@@ -25,6 +25,7 @@ public sealed record ModelGraph(
     EquatableArray<NameCollisionModel> NameCollisions,
     EquatableArray<NestedTypeIssueModel> NestedTypeIssues,
     EquatableArray<RecordTypeIssueModel> RecordTypeIssues,
+    EquatableArray<GenericTableIssueModel> GenericTableIssues,
     EquatableArray<RelationVariantIssueModel> RelationVariantIssues,
     EquatableArray<AggregateModel> Aggregates,
     EquatableArray<string> AggregateConflicts,

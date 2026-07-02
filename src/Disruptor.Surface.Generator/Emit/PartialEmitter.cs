@@ -77,10 +77,9 @@ internal static class PartialEmitter
                 declarationParts.Add("sealed");
             }
 
-            var typeParameters = table.TypeParameters.Count > 0
-                ? $"<{string.Join(", ", table.TypeParameters)}>"
-                : string.Empty;
-            declarationParts.Add($"partial class {table.Name}{typeParameters}");
+            // No type-parameter list: generic [Table] classes never reach the emitters —
+            // RelationLinker filters them into GenericTableIssues (CG049).
+            declarationParts.Add($"partial class {table.Name}");
 
             var baseTypes = new List<string> {
                 Namespaces.EntityInterface };

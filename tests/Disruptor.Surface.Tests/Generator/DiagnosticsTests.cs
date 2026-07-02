@@ -889,6 +889,52 @@ public sealed class DiagnosticsTests
     }
 
     [Fact]
+    public void CG049_GenericTable_IsRejected()
+    {
+        // Generic [Table] was half-supported: the partial declaration compiled but the
+        // physical table name ignored type arguments (Foo<int> and Foo<string> would
+        // share one table), FullName (Ns.Foo`1) never matched any use-site lookup, and
+        // the generated query/hydration roots referenced the open generic (CS0305).
+        // Rejected fail-closed with CG049.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [Table] public partial class Box<T> {
+                [Property] public partial string Label { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG049");
+
+        var message = runDiags.First(d => d.Id == "CG049").GetMessage();
+        Assert.Contains("M.Box`1", message);
+        Assert.Contains("<T>", message);
+
+        // Fail-closed: no partial fragment, no query-root accessor for the generic.
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+        Assert.DoesNotContain(result.GeneratedTrees,
+            t => t.FilePath.Contains("Box", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void CG049_DoesNotFire_OnNonGenericTable()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [Table] public partial class Plain {
+                [Property] public partial string Name { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id == "CG049");
+    }
+
+    [Fact]
     public void CG048_DoesNotFire_OnClassDeclarations()
     {
         const string src = """

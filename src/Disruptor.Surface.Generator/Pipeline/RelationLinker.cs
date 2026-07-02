@@ -65,6 +65,14 @@ internal static class RelationLinker
         relationVariants = FilterRecords(relationVariants, recordTypeIssues, static v => v.IsRecord,
             static v => (v.FullName, SurrealNaming.StripAttributeSuffix(SurrealNaming.SimpleName(v.KindAttributeFqn))));
 
+        // CG049 — generic [Table] classes, rejected fail-closed. Nothing downstream
+        // supports them: the table name ignores type arguments (closed constructions
+        // would share one physical table), {Name}Id is non-generic, the query/hydration
+        // roots would reference an open generic (CS0305), and every string-keyed graph
+        // lookup misses the backtick-arity FullName.
+        var genericTableIssues = ImmutableArray.CreateBuilder<GenericTableIssueModel>();
+        tables = FilterGenericTables(tables, genericTableIssues);
+
         // CG046 — variants declaring the same singular role ([In]/[Out]/[Id]) more than
         // once. The extractor flags them (RelationVariantModel.DuplicateRoles) instead of
         // dropping them, so the user gets a diagnostic naming the variant and the role
@@ -127,6 +135,7 @@ internal static class RelationLinker
             NameCollisions: new EquatableArray<NameCollisionModel>(nameCollisions),
             NestedTypeIssues: new EquatableArray<NestedTypeIssueModel>(nestedTypeIssues.ToImmutable()),
             RecordTypeIssues: new EquatableArray<RecordTypeIssueModel>(recordTypeIssues.ToImmutable()),
+            GenericTableIssues: new EquatableArray<GenericTableIssueModel>(genericTableIssues.ToImmutable()),
             RelationVariantIssues: new EquatableArray<RelationVariantIssueModel>(relationVariantIssues.ToImmutable()),
             Aggregates: new EquatableArray<AggregateModel>(aggregates),
             AggregateConflicts: new EquatableArray<string>(conflicts),
@@ -149,6 +158,38 @@ internal static class RelationLinker
             if (t.IsNested)
             {
                 issues.Add(new NestedTypeIssueModel(t.FullName, "Table"));
+            }
+            else
+            {
+                kept.Add(t);
+            }
+        }
+
+        return kept.ToImmutable();
+    }
+
+    /// <summary>
+    /// Pulls generic <c>[Table]</c> classes (CG049) out of the table set. See
+    /// <see cref="GenericTableIssueModel"/> for why generic tables are fail-closed.
+    /// </summary>
+    private static ImmutableArray<TableModel> FilterGenericTables(
+        ImmutableArray<TableModel> tables,
+        ImmutableArray<GenericTableIssueModel>.Builder issues)
+    {
+        if (!tables.Any(static t => t.TypeParameters.Count > 0))
+        {
+            return tables;
+        }
+
+        var kept = ImmutableArray.CreateBuilder<TableModel>(tables.Length);
+        foreach (var t in tables)
+        {
+            if (t.TypeParameters.Count > 0)
+            {
+                issues.Add(new GenericTableIssueModel(
+                    t.FullName,
+                    t.Name,
+                    string.Join(", ", t.TypeParameters)));
             }
             else
             {
