@@ -36,9 +36,13 @@ public sealed record NameCollisionModel(
 /// are pulled out of the model by the linker and reported instead of emitting an orphan
 /// top-level partial (CS9248/CS9249 storm).
 /// </summary>
+/// <param name="Location">Identifier location of the nested declaration, captured at
+/// extraction. Issue models represent an already-failing build, so the
+/// position-sensitive <see cref="LocationInfo"/> cannot regress incremental caching.</param>
 public sealed record NestedTypeIssueModel(
     string FullName,
-    string AttributeName);
+    string AttributeName,
+    LocationInfo? Location);
 
 /// <summary>
 /// A model attribute (<c>[Table]</c> / <c>[CompositionRoot]</c> / an on-class relation
@@ -47,9 +51,12 @@ public sealed record NestedTypeIssueModel(
 /// flagged models out of the graph and this issue explains why nothing was emitted —
 /// previously the predicate silently skipped records (clean compile, zero output).
 /// </summary>
+/// <param name="Location">Identifier location of the record declaration, captured at
+/// extraction (already-failing build — safe to embed).</param>
 public sealed record RecordTypeIssueModel(
     string FullName,
-    string AttributeName);
+    string AttributeName,
+    LocationInfo? Location);
 
 /// <summary>
 /// A <c>[Table]</c> declared with type parameters (CG049). Generic tables are rejected
@@ -65,7 +72,10 @@ public sealed record RecordTypeIssueModel(
 /// <param name="FullName">The table's full name (metadata form, e.g. <c>Ns.Foo`1</c>).</param>
 /// <param name="SimpleName">The table's simple name (for the <c>{Name}Id</c> mention in the message).</param>
 /// <param name="TypeParameters">Comma-joined type parameter names, e.g. <c>T, TKey</c>.</param>
+/// <param name="Location">Identifier location of the generic declaration, captured at
+/// extraction (already-failing build — safe to embed).</param>
 public sealed record GenericTableIssueModel(
     string FullName,
     string SimpleName,
-    string TypeParameters);
+    string TypeParameters,
+    LocationInfo? Location);

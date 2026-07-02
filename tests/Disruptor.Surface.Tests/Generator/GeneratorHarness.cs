@@ -12,9 +12,9 @@ namespace Disruptor.Surface.Tests.Generator;
 /// </summary>
 internal static class GeneratorHarness
 {
-    public static (GeneratorDriverRunResult Result, Compilation OutputCompilation, ImmutableArray<Diagnostic> RunDiagnostics, ImmutableArray<Diagnostic> CompileDiagnostics) Run(string source)
+    public static (GeneratorDriverRunResult Result, Compilation OutputCompilation, ImmutableArray<Diagnostic> RunDiagnostics, ImmutableArray<Diagnostic> CompileDiagnostics) Run(string source, string path = "")
     {
-        var compilation = CreateCompilation(source);
+        var compilation = CreateCompilation(source, path);
         // The driver's parseOptions must match the fixture's so generator-emitted trees
         // share the language version — otherwise CSharpCompilation rejects the merged
         // tree set with "Inconsistent language versions".
@@ -28,7 +28,11 @@ internal static class GeneratorHarness
         return (runResult, output, diagnostics, compileDiagnostics);
     }
 
-    public static CSharpCompilation CreateCompilation(string source)
+    /// <param name="source">The fixture program.</param>
+    /// <param name="path">Optional file path for the fixture's syntax tree. Location-asserting
+    /// diagnostics tests pass one so the reported diagnostic's <c>GetLineSpan().Path</c> is
+    /// observable; the default (empty) matches the historical behavior.</param>
+    public static CSharpCompilation CreateCompilation(string source, string path = "")
     {
         var references = ReferenceAssemblies();
         // Unique-per-call assembly name so CompileAndLoad can be called many times in
@@ -39,7 +43,7 @@ internal static class GeneratorHarness
             // Preview rather than Latest — partial properties (C# 13+) need it under
             // the bundled Roslyn version. End-to-end tests need the fixture to actually
             // compile, not just have the generator run on it.
-            syntaxTrees: [CSharpSyntaxTree.ParseText(source, new CSharpParseOptions(LanguageVersion.Preview))],
+            syntaxTrees: [CSharpSyntaxTree.ParseText(source, new CSharpParseOptions(LanguageVersion.Preview), path: path)],
             references: references,
             options: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, nullableContextOptions: NullableContextOptions.Enable));
     }

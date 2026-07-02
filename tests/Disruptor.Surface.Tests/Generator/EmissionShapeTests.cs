@@ -372,12 +372,97 @@ public sealed class EmissionShapeTests
         var result = afterSecond.GetRunResult().Results.Single();
 
         // Every source output must come from the cache — the linked ModelGraph is
-        // value-equal, so RegisterSourceOutput is skipped entirely.
+        // value-equal, so RegisterSourceOutput is skipped entirely. (This includes the
+        // diagnostics-only output: its located-diagnostics input re-resolves against the
+        // shifted location map, but resolves to an EMPTY set that is value-equal to the
+        // previous run's, so the output stays cached too.)
         var outputSteps = result.TrackedOutputSteps.SelectMany(kv => kv.Value).SelectMany(step => step.Outputs);
         Assert.NotEmpty(outputSteps);
         Assert.All(outputSteps, output =>
             Assert.True(output.Reason is IncrementalStepRunReason.Cached or IncrementalStepRunReason.Unchanged,
                 $"Expected cached output, got {output.Reason}"));
+    }
+
+    [Fact]
+    public void DiagnosticLocations_DoNotBustEmitOutput_OnPositionOnlyEdits()
+    {
+        // The split-output contract behind diagnostic source locations: diagnostics are
+        // located via a position-sensitive declaration map that feeds ONLY the
+        // diagnostics RegisterSourceOutput. With a live diagnostic in the compilation
+        // (CG017 below — a warning, so emission still happens), an edit that only MOVES
+        // the declarations must (a) leave the ModelGraph value-equal so the emit output
+        // is fully cached, while (b) re-running the diagnostics output — that re-run is
+        // the point of the split: the diagnostic's reported line has to move with the
+        // declaration, and paying for it must not re-fire the emitters.
+        var src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [Table] public partial class Doc {
+                [Id] public partial DocId Id { get; set; }
+                [Reference, Ignore] public partial Meta? Extra { get; set; }
+            }
+
+            [Table] public partial class Meta {
+                [Id] public partial MetaId Id { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var parseOpts = new Microsoft.CodeAnalysis.CSharp.CSharpParseOptions(Microsoft.CodeAnalysis.CSharp.LanguageVersion.Preview);
+        var compilation = GeneratorHarness.CreateCompilation(src);
+        var driver = Microsoft.CodeAnalysis.CSharp.CSharpGeneratorDriver.Create(
+            generators: [new Disruptor.Surface.Generator.ModelGenerator().AsSourceGenerator()],
+            parseOptions: parseOpts,
+            driverOptions: new GeneratorDriverOptions(IncrementalGeneratorOutputKind.None, trackIncrementalGeneratorSteps: true));
+
+        var afterFirst = driver.RunGenerators(compilation);
+        Assert.Contains(afterFirst.GetRunResult().Diagnostics, d => d.Id == "CG017");
+
+        // Position-only edit: a comment above the diagnostic-carrying table shifts every
+        // declaration below it without changing any model-relevant content.
+        var edited = src.Replace(
+            "[Table] public partial class Doc {",
+            "// moved: everything below shifts one line\n[Table] public partial class Doc {");
+        var editedCompilation = compilation.ReplaceSyntaxTree(
+            compilation.SyntaxTrees.Single(),
+            Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(edited, parseOpts));
+
+        var afterSecond = afterFirst.RunGenerators(editedCompilation);
+        var result = afterSecond.GetRunResult().Results.Single();
+
+        // (a) The graph node is value-equal (positions are not part of any healthy
+        // model), so the emit output — the RegisterSourceOutput fed by "ModelGraph" —
+        // comes entirely from the cache.
+        var graphOutputs = result.TrackedSteps["ModelGraph"].SelectMany(step => step.Outputs);
+        Assert.All(graphOutputs, output =>
+            Assert.True(output.Reason is IncrementalStepRunReason.Cached or IncrementalStepRunReason.Unchanged,
+                $"Expected cached ModelGraph, got {output.Reason}"));
+
+        var outputSteps = result.TrackedOutputSteps.SelectMany(kv => kv.Value).ToList();
+        var emitOutput = outputSteps.Where(step => step.Inputs.Any(i => i.Source.Name == "ModelGraph")).ToList();
+        Assert.NotEmpty(emitOutput);
+        Assert.All(emitOutput.SelectMany(step => step.Outputs), output =>
+            Assert.True(output.Reason is IncrementalStepRunReason.Cached or IncrementalStepRunReason.Unchanged,
+                $"Expected cached emit output, got {output.Reason}"));
+
+        // Pending diagnostics are position-independent — cached even with CG017 live.
+        var pendingOutputs = result.TrackedSteps["PendingDiagnostics"].SelectMany(step => step.Outputs);
+        Assert.All(pendingOutputs, output =>
+            Assert.True(output.Reason is IncrementalStepRunReason.Cached or IncrementalStepRunReason.Unchanged,
+                $"Expected cached pending diagnostics, got {output.Reason}"));
+
+        // (b) The located-diagnostics node re-resolves (the CG017 location moved), so
+        // the diagnostics output re-runs — and the reported line tracks the edit.
+        var locatedOutputs = result.TrackedSteps["LocatedDiagnostics"].SelectMany(step => step.Outputs);
+        Assert.Contains(locatedOutputs, output =>
+            output.Reason is IncrementalStepRunReason.Modified or IncrementalStepRunReason.New);
+
+        var movedDiagnostic = afterSecond.GetRunResult().Diagnostics.First(d => d.Id == "CG017");
+        var expectedLine = edited.Substring(0, edited.IndexOf("Meta? Extra", StringComparison.Ordinal))
+            .Count(c => c == '\n');
+        Assert.Equal(expectedLine, movedDiagnostic.Location.GetLineSpan().StartLinePosition.Line);
     }
 
     [Fact]

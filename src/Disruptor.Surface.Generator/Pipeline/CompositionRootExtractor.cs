@@ -33,6 +33,16 @@ internal static class CompositionRootExtractor
         // its real name. Identical to {ns}.{MetadataName} for namespace-scoped types.
         var fullName = TableExtractor.NormaliseFullName(type);
 
+        // Captured ONLY for linker-rejected shapes (nested → CG045, record → CG048);
+        // healthy roots keep null so model equality stays position-independent.
+        LocationInfo? issueLocation = null;
+        if (type.ContainingType is not null || type.IsRecord)
+        {
+            issueLocation = ctx.TargetNode is Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax decl
+                ? LocationInfo.FromToken(decl.Identifier)
+                : LocationInfo.FromLocation(type.Locations.FirstOrDefault());
+        }
+
         return new CompositionRootModel(
             FullName: fullName,
             Namespace: ns,
@@ -40,6 +50,7 @@ internal static class CompositionRootExtractor
             DeclaredAccessibility: type.DeclaredAccessibility.ToString(),
             IsPartial: PartialDeclaration.IsDeclared(type, ct),
             IsNested: type.ContainingType is not null,
-            IsRecord: type.IsRecord);
+            IsRecord: type.IsRecord,
+            IssueLocation: issueLocation);
     }
 }

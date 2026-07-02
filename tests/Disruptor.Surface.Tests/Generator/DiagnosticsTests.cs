@@ -20,11 +20,11 @@ public sealed class DiagnosticsTests
                                [Id] public partial NotPartialId Id { get; set; }
                            }
                            """;
-        _ = GeneratorHarness.Run(src);
-        // CG001 reports against `compileDiags` (Errors), not run-time diagnostics.
-        // Actually wait — CG001 fires from ModelGenerator.Emit, so it shows up in run diagnostics.
-        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG001");
+        // Healthy-model diagnostic: located via the declaration-location map, pointing
+        // at the offending [Table] class declaration.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG001"), src, "[Table] public class NotPartial");
     }
 
     [Fact]
@@ -107,8 +107,11 @@ public sealed class DiagnosticsTests
                                [Property] public string Description { get; set; }
                            }
                            """;
-        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG022");
+        // Member-level precision: the map carries attributed property identifiers, so
+        // the diagnostic points at the non-partial property, not the class.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG022"), src, "[Property] public string Description");
     }
 
     [Fact]
@@ -135,8 +138,10 @@ public sealed class DiagnosticsTests
                 [Parent] public partial B ParentB { get; set; }
             }
             """;
-        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG011");
+        // Points at the entity that is claimed by both aggregates.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG011"), src, "[Table] public partial class Shared");
     }
 
     [Fact]
@@ -389,8 +394,11 @@ public sealed class DiagnosticsTests
             [CompositionRoot] public partial class Workspace { }
             """;
 
-        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG037");
+        // Index issues carry the property name, so the map resolves member-level
+        // precision: the diagnostic points at the mis-indexed property.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG037"), src, "[Lookup] public partial string ExternalKey");
     }
 
     [Fact]
@@ -517,7 +525,7 @@ public sealed class DiagnosticsTests
                 [CompositionRoot] public partial class Workspace { }
             }
             """;
-        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG042");
 
         // Message names both fully-qualified classes and the colliding table name.
@@ -525,6 +533,10 @@ public sealed class DiagnosticsTests
         Assert.Contains("A.Design", message);
         Assert.Contains("B.Design", message);
         Assert.Contains("'designs'", message);
+
+        // Points at the first (ordinal-sorted) participant's declaration — A.Design,
+        // whose class declaration is also the first `class Design` in the fixture.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG042"), src, "[Table] public partial class Design");
 
         // Fail-closed: no generator crash, and the colliding duplicate is not emitted —
         // the schema defines `designs` exactly once.
@@ -652,12 +664,15 @@ public sealed class DiagnosticsTests
                 }
             }
             """;
-        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG045");
 
         var message = runDiags.First(d => d.Id == "CG045").GetMessage();
         Assert.Contains("M.Outer.Inner", message);
         Assert.Contains("[Table]", message);
+
+        // Issue-model location, captured at extraction: points at the nested class.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG045"), src, "[Table] public partial class Inner");
 
         // Skipped emission: no partial fragment for the nested table.
         Assert.All(result.Results, r => Assert.Null(r.Exception));
@@ -712,12 +727,17 @@ public sealed class DiagnosticsTests
                 [Out] public partial UserStory Target { get; set; }
             }
             """;
-        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG046");
 
         var message = runDiags.First(d => d.Id == "CG046").GetMessage();
         Assert.Contains("M.TwoIns", message);
         Assert.Contains("[In]", message);
+
+        // Attribute-level precision: points at the SECOND (duplicate) [In] attribute,
+        // not the variant class — the location was captured from the attribute's
+        // application syntax at extraction time.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG046"), src, "[In] public partial Constraint SourceB");
 
         // Fail-closed: no generator crash and no emission for the malformed variant.
         Assert.All(result.Results, r => Assert.Null(r.Exception));
@@ -777,12 +797,16 @@ public sealed class DiagnosticsTests
                 [Out] public partial UserStory Target { get; set; }
             }
             """;
-        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG047");
 
         var message = runDiags.First(d => d.Id == "CG047").GetMessage();
         Assert.Contains("M.NoSource", message);
         Assert.Contains("[In]", message);
+
+        // CG047 is only decided after the shared-shape lift (no extraction-time
+        // location), so it resolves the variant declaration via the location map.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG047"), src, "public partial class NoSource");
 
         Assert.All(result.Results, r => Assert.Null(r.Exception));
     }
@@ -832,12 +856,15 @@ public sealed class DiagnosticsTests
                 [Property] public partial string Name { get; set; }
             }
             """;
-        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG048");
 
         var message = runDiags.First(d => d.Id == "CG048").GetMessage();
         Assert.Contains("M.Snapshot", message);
         Assert.Contains("[Table]", message);
+
+        // Issue-model location, captured at extraction: points at the record declaration.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG048"), src, "[Table] public partial record Snapshot");
 
         // Fail-closed: nothing emitted for the record.
         Assert.All(result.Results, r => Assert.Null(r.Exception));
@@ -906,12 +933,15 @@ public sealed class DiagnosticsTests
 
             [CompositionRoot] public partial class Workspace { }
             """;
-        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG049");
 
         var message = runDiags.First(d => d.Id == "CG049").GetMessage();
         Assert.Contains("M.Box`1", message);
         Assert.Contains("<T>", message);
+
+        // Issue-model location, captured at extraction: points at the generic declaration.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG049"), src, "[Table] public partial class Box<T>");
 
         // Fail-closed: no partial fragment, no query-root accessor for the generic.
         Assert.All(result.Results, r => Assert.Null(r.Exception));
@@ -1111,8 +1141,10 @@ public sealed class DiagnosticsTests
                 [CreatedAt] public partial DateTimeOffset CreatedAtUtc { get; }
             }
             """;
-        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
         Assert.Contains(runDiags, d => d.Id == "CG052");
+        // Member-level precision via the declaration-location map.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG052"), src, "[CreatedAt] public partial DateTimeOffset CreatedAtUtc");
     }
 
     [Fact]
@@ -1266,12 +1298,14 @@ public sealed class DiagnosticsTests
 
             [CompositionRoot] public partial class Workspace { }
             """;
-        var (result, _, runDiags, compileDiags) = GeneratorHarness.Run(src);
+        var (result, _, runDiags, compileDiags) = GeneratorHarness.Run(src, FixturePath);
 
         var warning = Assert.Single(runDiags, d => d.Id == "CG056");
         Assert.Equal(DiagnosticSeverity.Warning, warning.Severity);
         Assert.Contains("Duration", warning.GetMessage());
         Assert.Contains("System.TimeSpan", warning.GetMessage());
+        // Member-level precision: points at the unmappable payload property.
+        AssertLocationAt(warning, src, "[Property] public partial TimeSpan Duration");
 
         // Fail-soft: the fixture still compiles; the field is omitted from the DDL and
         // from the dispatched edge content (the property stays as in-memory state).
@@ -1310,5 +1344,39 @@ public sealed class DiagnosticsTests
         var (_, _, runDiags, compileDiags) = GeneratorHarness.Run(src);
         Assert.DoesNotContain(runDiags, d => d.Id == "CG056");
         Assert.Empty(compileDiags);
+    }
+
+    // ── diagnostic source-location helpers ──────────────────────────────────────
+    //
+    // Diagnostics are reported with external-file locations rehydrated from the
+    // pipeline's LocationInfo records (path + span captured at extraction or resolved
+    // via the declaration-location map). The fixture is compiled under FixturePath so
+    // the reported path is observable; line assertions are anchored to a unique
+    // snippet of the fixture source rather than hard-coded numbers.
+
+    private const string FixturePath = "Fixture.cs";
+
+    private static void AssertLocationAt(Diagnostic diagnostic, string src, string snippet)
+    {
+        var lineSpan = diagnostic.Location.GetLineSpan();
+        Assert.Equal(FixturePath, lineSpan.Path);
+        Assert.Equal(LineOf(src, snippet), lineSpan.StartLinePosition.Line);
+    }
+
+    /// <summary>Zero-based line index of the first line containing <paramref name="snippet"/>.</summary>
+    private static int LineOf(string src, string snippet)
+    {
+        var index = src.IndexOf(snippet, StringComparison.Ordinal);
+        Assert.True(index >= 0, $"Snippet not found in fixture: {snippet}");
+        var line = 0;
+        for (var i = 0; i < index; i++)
+        {
+            if (src[i] == '\n')
+            {
+                line++;
+            }
+        }
+
+        return line;
     }
 }

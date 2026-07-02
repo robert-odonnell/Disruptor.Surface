@@ -182,7 +182,29 @@ public sealed class RelationVariantExtractorTests
 
         var model = RelationVariantExtractor.TryExtractFromSymbol(cls!, CancellationToken.None);
         Assert.NotNull(model);
-        Assert.Equal(["In"], model!.DuplicateRoles.ToArray());
+        Assert.Equal(["In"], model!.DuplicateRoles.Select(r => r.Role).ToArray());
+        // The duplicate role carries the location of the SECOND [In] attribute so CG046
+        // can point at the extra annotation rather than the class.
+        var location = Assert.Single(model.DuplicateRoles).Location;
+        Assert.NotNull(location);
+        Assert.Equal(LineOf(fixture, "[In] public partial Constraint SourceB"), location!.StartLine);
+    }
+
+    /// <summary>Zero-based line index of the first line containing <paramref name="snippet"/>.</summary>
+    private static int LineOf(string source, string snippet)
+    {
+        var index = source.IndexOf(snippet, StringComparison.Ordinal);
+        Assert.True(index >= 0, $"Snippet not found in fixture: {snippet}");
+        var line = 0;
+        for (var i = 0; i < index; i++)
+        {
+            if (source[i] == '\n')
+            {
+                line++;
+            }
+        }
+
+        return line;
     }
 
     [Fact]
@@ -204,7 +226,7 @@ public sealed class RelationVariantExtractorTests
 
         var model = RelationVariantExtractor.TryExtractFromSymbol(cls!, CancellationToken.None);
         Assert.NotNull(model);
-        Assert.Equal(["Out"], model!.DuplicateRoles.ToArray());
+        Assert.Equal(["Out"], model!.DuplicateRoles.Select(r => r.Role).ToArray());
     }
 
     [Fact]

@@ -51,6 +51,18 @@ internal static class TableExtractor
         var fullName = NormaliseFullName(type);
         var hint = $"{fullName}.g.cs";
 
+        // Declaration location, captured ONLY for shapes the linker is guaranteed to
+        // reject (nested → CG045, record → CG048, generic → CG049). Healthy tables keep
+        // null: a populated LocationInfo makes TableModel equality position-sensitive,
+        // which only an already-failing build can afford.
+        LocationInfo? issueLocation = null;
+        if (type.ContainingType is not null || type.IsRecord || typeParameters.Count > 0)
+        {
+            issueLocation = ctx.TargetNode is TypeDeclarationSyntax decl
+                ? LocationInfo.FromToken(decl.Identifier)
+                : LocationInfo.FromLocation(type.Locations.FirstOrDefault());
+        }
+
         return new TableModel(
             FullName: fullName,
             Namespace: ns,
@@ -64,7 +76,8 @@ internal static class TableExtractor
             DeclaredAccessibility: type.DeclaredAccessibility.ToString(),
             TypeParameters: typeParameters,
             Properties: propertiesBuilder.ToImmutable(),
-            FileHintName: hint);
+            FileHintName: hint,
+            IssueLocation: issueLocation);
     }
 
     private static PropertyModel? TryBuildProperty(IPropertySymbol p)

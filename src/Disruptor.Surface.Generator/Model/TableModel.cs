@@ -8,6 +8,12 @@ namespace Disruptor.Surface.Generator.Model;
 /// type; the linker rejects those with CG045 before they reach any emitter.
 /// <paramref name="IsRecord"/> flags a <c>[Table]</c> on a record declaration; the
 /// linker rejects those with CG048.</para>
+/// <para><paramref name="IssueLocation"/> is the declaration's identifier location,
+/// captured ONLY when the extractor already knows the table will be rejected
+/// (nested / record / generic — CG045 / CG048 / CG049). It MUST stay <c>null</c> on
+/// healthy tables: a populated <see cref="LocationInfo"/> makes model equality
+/// position-sensitive, which is acceptable on an already-failing build but would bust
+/// the incremental cache for every consumer edit otherwise.</para>
 /// </summary>
 public sealed record TableModel(
     string FullName,
@@ -22,4 +28,5 @@ public sealed record TableModel(
     string DeclaredAccessibility,
     EquatableArray<string> TypeParameters,
     EquatableArray<PropertyModel> Properties,
-    string FileHintName);
+    string FileHintName,
+    LocationInfo? IssueLocation);
