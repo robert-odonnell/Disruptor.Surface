@@ -63,7 +63,7 @@ When the user writes `partial IReadOnlyCollection<IRestrictedBy> Foo { get; }`, 
 
 ### Diagnostics
 
-`Pipeline/Diagnostics.cs` defines the `CG001`–`CG041` descriptors. When adding a new validation, add the descriptor here and report it from `ModelGenerator.Emit` (or the appropriate extractor). Selected highlights: CG001 (`[Table]` not partial), CG011 (entity reachable from multiple aggregate roots), CG014 (cascade-only reference cycle), CG018 (multiple `[CompositionRoot]` classes), CG019 (`[CompositionRoot]` class not partial), CG037–CG041 (entity-index shape errors).
+`Pipeline/Diagnostics.cs` defines the `CG001`–`CG045` descriptors. When adding a new validation, add the descriptor here and report it from `ModelGenerator.Emit` (or the appropriate extractor). Selected highlights: CG001 (`[Table]` not partial), CG011 (entity reachable from multiple aggregate roots), CG014 (cascade-only reference cycle), CG018 (multiple `[CompositionRoot]` classes), CG019 (`[CompositionRoot]` class not partial), CG037–CG041 (entity-index shape errors), CG042–CG044 (generated-name collisions: physical table name, edge table name, aggregate-root simple name), CG045 (nested `[Table]`/`[CompositionRoot]` rejected).
 
 ## Runtime model (Disruptor.Surface.Runtime)
 
@@ -173,6 +173,17 @@ The Sample project's classes (`Design`, `Constraint`, `Epic`, `Feature`, `UserSt
 ## Engineering log
 
 Newest first. One or two lines per preview. "Substantive" means architecture / behaviour / new public surface; polish (renames, doc edits, formatting) is omitted.
+
+### preview.59 hardening — name-collision diagnostics, nested-type rejection, partial-decl dedupe, invariant naming (DONE 2026-07-02)
+
+Fixes for review findings §2–§3 of `review-2026-07-02.md`; no version bump.
+
+- **CG042–CG044 (errors)** — pre-emit uniqueness registry in `RelationLinker.ComputeNameCollisions`, reported from `ModelGenerator.Emit`. CG042: two `[Table]` classes resolve to the same physical table name (`A.Design` + `B.Design`, or `Item` + `Items` → `items`) — previously the schema silently interleaved both field sets onto one table. CG043: two forward relation kinds resolve to the same edge table name — the shipped sample hit this (two `ReferencesAttribute` kinds; the Spike one is now `RefersToAttribute` / edge `refers_to`). CG044: two `[AggregateRoot]` tables share a simple name — previously a duplicate `AddSource` hint crashed the whole generator (CS8785). Emission is fail-closed: collision participants are sorted, and `SchemaEmitter` / `QueryRootEmitter` / `HydrateRootEmitter` / `EdgeQueryRootEmitter` / the aggregate-loader family skip the non-first participants via `ModelGraph.IsCollisionLoser` so the build fails with the CG error instead of a crash or a CS0102 wall.
+- **CG045 (error)** — nested `[Table]` / `[CompositionRoot]` declarations are rejected and pulled out of the graph (`TableModel.IsNested` / `CompositionRootModel.IsNested`, filtered in `RelationLinker.Build`). Extractors now build `FullName` via `NormaliseFullName` (keeps containing types) so the diagnostic names the real nested type. Previously a nested `[Table]` emitted an orphan namespace-scoped partial (CS9248/CS9249 storm).
+- **Multi-declaration dedupe** — `RelationLinker.Build` dedupes the `CreateSyntaxProvider`-collected sets (relation kinds, relation variants, shared shapes) by full name, first wins. A type split across two matching partial declarations previously produced N identical models and crashed `AddSource` with a duplicate hint.
+- **Culture-invariant naming** — `SurrealNaming` pins `CurrentCulture` to invariant around every Humanizer call (under tr-TR, `"Issue".Underscore()` produced `ıssues` with dotless ı U+0131, silently baking a machine-dependent schema); `PascalPluralize` moved into `SurrealNaming` so no direct Humanizer call remains. All culture-default `StartsWith`/`EndsWith` structural checks in the generator switched to `StringComparison.Ordinal`.
+
+Tests: CG042/CG043/CG044/CG045 positive (message names all colliders + the colliding name) and negative, split-partial-variant regression, tr-TR naming + full-generation assertions. **310/310 green** (300 prior + 10 net new).
 
 ### preview.59 — entity indexes via parameterless attribute types (DONE 2026-06-19)
 
