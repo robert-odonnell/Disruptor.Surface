@@ -80,9 +80,9 @@ public sealed class SurfaceEdgeQuery<TIn, TOut>
 
     /// <summary>
     /// Adds an arbitrary predicate to the WHERE clause (AND-merged with any side
-    /// restrictions). Pair with the generator-emitted <c>{ForwardKind}EdgeQ</c> factory
-    /// to filter on edge payload fields — e.g.
-    /// <c>edges.OutgoingFrom([id]).Where(UsesEdgeQ.Kind.Eq("call"))</c>.
+    /// restrictions). To filter on edge payload fields, build a
+    /// <see cref="PropertyExpr{T}"/> against the payload's snake_case field name —
+    /// e.g. <c>edges.OutgoingFrom([id]).Where(new PropertyExpr&lt;string&gt;("kind").Eq("call"))</c>.
     /// </summary>
     public SurfaceEdgeQuery<TIn, TOut> Where(IPredicate predicate)
     {
