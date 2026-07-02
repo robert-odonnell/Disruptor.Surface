@@ -41,7 +41,12 @@ internal static class HydrateRootEmitter
             return;
         }
 
-        var ordered = graph.Tables.OrderBy(t => t.Name, StringComparer.Ordinal).ToList();
+        // CG042 losers are skipped — same reasoning as QueryRootEmitter: the pluralised
+        // method name is taken by the first colliding table (CS0111 otherwise).
+        var ordered = graph.Tables
+            .Where(t => !graph.IsCollisionLoser(NameCollisionKind.TableName, t.FullName))
+            .OrderBy(t => t.Name, StringComparer.Ordinal)
+            .ToList();
         var refRegistryFqn = string.IsNullOrEmpty(root.Namespace)
             ? $"global::{root.Name}.ReferenceRegistry"
             : $"global::{root.Namespace}.{root.Name}.ReferenceRegistry";

@@ -22,6 +22,8 @@ public sealed record ModelGraph(
     EquatableArray<SharedShapeLiftConflict> SharedShapeLiftConflicts,
     EquatableArray<IndexModel> Indexes,
     EquatableArray<IndexIssueModel> IndexIssues,
+    EquatableArray<NameCollisionModel> NameCollisions,
+    EquatableArray<NestedTypeIssueModel> NestedTypeIssues,
     EquatableArray<AggregateModel> Aggregates,
     EquatableArray<string> AggregateConflicts,
     EquatableArray<string> CascadeCycles,
@@ -49,6 +51,37 @@ public sealed record ModelGraph(
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// True when <paramref name="fullName"/> is a non-first participant of a name
+    /// collision of the given kind. Emitters that key output on the colliding name
+    /// (physical table name, edge name, aggregate-root simple name) call this to skip
+    /// the duplicates: the CG042/CG043/CG044 error already fails the build, so the goal
+    /// here is only to avoid the duplicate-hint <c>ArgumentException</c> (CS8785) and
+    /// duplicate-member cascades that would bury the real diagnostic. Participants are
+    /// sorted by the linker, so "first participant wins" is deterministic and consistent
+    /// across emitters.
+    /// </summary>
+    public bool IsCollisionLoser(NameCollisionKind kind, string fullName)
+    {
+        foreach (var collision in NameCollisions)
+        {
+            if (collision.Kind != kind)
+            {
+                continue;
+            }
+
+            for (var i = 1; i < collision.ParticipantFullNames.Count; i++)
+            {
+                if (string.Equals(collision.ParticipantFullNames[i], fullName, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     public IReadOnlyDictionary<string, TableModel> BuildTableIndex()

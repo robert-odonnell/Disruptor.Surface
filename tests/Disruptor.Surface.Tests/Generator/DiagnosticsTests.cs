@@ -491,4 +491,227 @@ public sealed class DiagnosticsTests
         var (_, _, runDiags, _) = GeneratorHarness.Run(src);
         Assert.Contains(runDiags, d => d.Id == "CG041");
     }
+
+    [Fact]
+    public void CG042_TwoTables_SameSimpleName_AcrossNamespaces_CollideOnTableName()
+    {
+        // A.Design and B.Design both map to physical table `designs`. Before CG042 the
+        // schema silently interleaved both field sets onto one table and the generated
+        // query/hydration roots collided with CS0102/CS0111.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+
+            namespace A {
+                [Table] public partial class Design {
+                    [Property] public partial string Name { get; set; }
+                }
+            }
+
+            namespace B {
+                [Table] public partial class Design {
+                    [Property] public partial string Title { get; set; }
+                }
+            }
+
+            namespace M {
+                [CompositionRoot] public partial class Workspace { }
+            }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG042");
+
+        // Message names both fully-qualified classes and the colliding table name.
+        var message = runDiags.First(d => d.Id == "CG042").GetMessage();
+        Assert.Contains("A.Design", message);
+        Assert.Contains("B.Design", message);
+        Assert.Contains("'designs'", message);
+
+        // Fail-closed: no generator crash, and the colliding duplicate is not emitted —
+        // the schema defines `designs` exactly once.
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+        var schema = GeneratorHarness.FindGeneratedFile(result, "Schema.g.cs");
+        Assert.NotNull(schema);
+        var defines = schema.ToString().Split("DEFINE TABLE IF NOT EXISTS designs").Length - 1;
+        Assert.Equal(1, defines);
+    }
+
+    [Fact]
+    public void CG042_TwoTables_DistinctNames_PluralizeToSameTableName()
+    {
+        // Item and Items both pluralise to `items` — distinct simple names, same
+        // physical table name.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [Table] public partial class Item {
+                [Property] public partial string Name { get; set; }
+            }
+
+            [Table] public partial class Items {
+                [Property] public partial string Name { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG042");
+
+        var message = runDiags.First(d => d.Id == "CG042").GetMessage();
+        Assert.Contains("M.Item", message);
+        Assert.Contains("M.Items", message);
+        Assert.Contains("'items'", message);
+    }
+
+    [Fact]
+    public void CG043_TwoForwardKinds_SameSimpleName_CollideOnEdgeName()
+    {
+        // Two ReferencesAttribute kinds in different namespaces both derive edge table
+        // `references` — the exact shape the shipped sample used to have. Before CG043
+        // the generated schema defined the edge table twice with disagreeing FROM/TO.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+
+            namespace A {
+                public sealed class ReferencesAttribute : ForwardRelation;
+            }
+
+            namespace B {
+                public sealed class ReferencesAttribute : ForwardRelation;
+            }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG043");
+
+        var message = runDiags.First(d => d.Id == "CG043").GetMessage();
+        Assert.Contains("A.ReferencesAttribute", message);
+        Assert.Contains("B.ReferencesAttribute", message);
+        Assert.Contains("'references'", message);
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+    }
+
+    [Fact]
+    public void CG044_TwoAggregateRoots_SameSimpleName_CollideOnLoaderNames()
+    {
+        // Aggregate loader classes, Load{Name}Async members, and their AddSource hints
+        // all key on the root's simple name. Before CG044 this crashed the whole
+        // generator with a duplicate-hint ArgumentException (CS8785) and zero CG
+        // diagnostics.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+
+            namespace A {
+                [Table, AggregateRoot] public partial class Design {
+                    [Id] public partial DesignId Id { get; set; }
+                }
+            }
+
+            namespace B {
+                [Table, AggregateRoot] public partial class Design {
+                    [Id] public partial DesignId Id { get; set; }
+                }
+            }
+
+            namespace M {
+                [CompositionRoot] public partial class Workspace { }
+            }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG044");
+
+        var message = runDiags.First(d => d.Id == "CG044").GetMessage();
+        Assert.Contains("A.Design", message);
+        Assert.Contains("B.Design", message);
+        Assert.Contains("'Design'", message);
+
+        // The duplicate simple name also collides on the physical table name.
+        Assert.Contains(runDiags, d => d.Id == "CG042");
+
+        // Fail-closed: no duplicate-hint crash — exactly one aggregate loader emitted.
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+        var loaders = result.GeneratedTrees
+            .Where(t => t.FilePath.Contains("DesignAggregateLoader", StringComparison.Ordinal))
+            .ToList();
+        Assert.Single(loaders);
+    }
+
+    [Fact]
+    public void CG045_NestedTable_IsRejected()
+    {
+        // TableExtractor used to build FullName as {namespace}.{MetadataName}, dropping
+        // containing types — a nested [Table] emitted an orphan namespace-scoped partial
+        // (CS9248/CS9249 storm). CG045 rejects the shape and skips emission.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public partial class Outer {
+                [Table] public partial class Inner {
+                    [Property] public partial string Name { get; set; }
+                }
+            }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG045");
+
+        var message = runDiags.First(d => d.Id == "CG045").GetMessage();
+        Assert.Contains("M.Outer.Inner", message);
+        Assert.Contains("[Table]", message);
+
+        // Skipped emission: no partial fragment for the nested table.
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+        Assert.DoesNotContain(result.GeneratedTrees,
+            t => t.FilePath.Contains("Outer.Inner", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void CG045_NestedCompositionRoot_IsRejected()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public partial class Outer {
+                [CompositionRoot] public partial class Workspace { }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG045");
+        var message = runDiags.First(d => d.Id == "CG045").GetMessage();
+        Assert.Contains("M.Outer.Workspace", message);
+        Assert.Contains("[CompositionRoot]", message);
+    }
+
+    [Fact]
+    public void CG042_CG043_CG044_CG045_DoNotFire_OnNormalShapes()
+    {
+        // Distinct table names, one relation kind pair, one aggregate root, everything
+        // namespace-scoped — none of the uniqueness diagnostics may fire.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            using System.Collections.Generic;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+            public sealed class RestrictedByAttribute : InverseRelation<RestrictsAttribute>;
+
+            [Table, AggregateRoot] public partial class Design {
+                [Id] public partial DesignId Id { get; set; }
+                [Children] public partial IReadOnlyCollection<Constraint> Constraints { get; }
+                [RestrictedBy] public partial IReadOnlyCollection<IRecordId> Restrictions { get; }
+            }
+
+            [Table] public partial class Constraint {
+                [Id] public partial ConstraintId Id { get; set; }
+                [Parent] public partial Design Design { get; set; }
+                [Restricts] public partial IReadOnlyCollection<IRecordId> Restrictions { get; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id is "CG042" or "CG043" or "CG044" or "CG045");
+    }
 }

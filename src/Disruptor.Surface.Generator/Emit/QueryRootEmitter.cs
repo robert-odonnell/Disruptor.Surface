@@ -43,7 +43,13 @@ internal static class QueryRootEmitter
             return;
         }
 
-        var ordered = graph.Tables.OrderBy(t => t.Name, StringComparer.Ordinal).ToList();
+        // CG042 losers are skipped — their pluralised accessor name is already taken by
+        // the first colliding table, so emitting both would be a CS0102 wall on top of
+        // the CG error that already fails the build.
+        var ordered = graph.Tables
+            .Where(t => !graph.IsCollisionLoser(NameCollisionKind.TableName, t.FullName))
+            .OrderBy(t => t.Name, StringComparer.Ordinal)
+            .ToList();
 
         var writer = new CodeWriter().Header();
         using (writer.Namespace(root.Namespace))

@@ -43,6 +43,14 @@ internal static class AggregateLoaderEmitter
                 continue;
             }
 
+            // CG044 losers are skipped — the loader class name and its AddSource hint
+            // key on the root's simple name, so a second same-named root would crash
+            // the whole generator (CS8785) instead of failing with the CG error.
+            if (graph.IsCollisionLoser(NameCollisionKind.AggregateRootName, root.FullName))
+            {
+                continue;
+            }
+
             EmitForAggregate(spc, graph, root, agg);
         }
     }

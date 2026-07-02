@@ -106,6 +106,37 @@ public sealed class ModelGenerator : IIncrementalGenerator
 
     private static void Emit(SourceProductionContext spc, ModelGraph graph)
     {
+        // CG042/CG043/CG044 — pre-emit uniqueness violations. Names both (all)
+        // colliding types and the generated name they collide on. Emission stays
+        // fail-closed alongside: the emitters that key output on the colliding name
+        // skip the non-first participants (ModelGraph.IsCollisionLoser) so the build
+        // fails with the CG error instead of a duplicate-hint CS8785 or a CS0102 wall.
+        foreach (var collision in graph.NameCollisions)
+        {
+            var descriptor = collision.Kind switch
+            {
+                NameCollisionKind.TableName => Diagnostics.TableNameCollision,
+                NameCollisionKind.EdgeName => Diagnostics.EdgeNameCollision,
+                _ => Diagnostics.AggregateRootNameCollision,
+            };
+            spc.ReportDiagnostic(Diagnostic.Create(
+                descriptor,
+                Location.None,
+                string.Join(" and ", collision.ParticipantFullNames.Select(n => $"'{n}'")),
+                collision.CollidingName));
+        }
+
+        // CG045 — nested [Table] / [CompositionRoot]. The linker already pulled these
+        // out of the graph, so nothing is emitted for them; this explains why.
+        foreach (var nested in graph.NestedTypeIssues)
+        {
+            spc.ReportDiagnostic(Diagnostic.Create(
+                Diagnostics.NestedModelType,
+                Location.None,
+                nested.FullName,
+                nested.AttributeName));
+        }
+
         foreach (var conflict in graph.AggregateConflicts)
         {
             // Format from RelationLinker.ComputeAggregates: "Member|Root1,Root2,...".

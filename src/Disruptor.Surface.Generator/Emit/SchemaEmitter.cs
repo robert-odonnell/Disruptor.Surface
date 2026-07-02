@@ -171,7 +171,12 @@ internal static class SchemaEmitter
     private static List<string> BuildChunks(ModelGraph graph)
     {
         var chunks = new List<string>();
-        var orderedTables = graph.Tables.OrderBy(t => t.Name, StringComparer.Ordinal).ToList();
+        // CG042 losers are skipped so the DDL doesn't silently interleave two CLR types'
+        // field sets onto one physical table; the CG error already fails the build.
+        var orderedTables = graph.Tables
+            .Where(t => !graph.IsCollisionLoser(NameCollisionKind.TableName, t.FullName))
+            .OrderBy(t => t.Name, StringComparer.Ordinal)
+            .ToList();
 
         // Chunk: entity table declarations.
         var entityTablesSb = new StringBuilder();
@@ -200,8 +205,11 @@ internal static class SchemaEmitter
         // RestrictsAttribute's FQN); the lookup keys exactly match RelationKindModel.FullName.
         var variantsByKind = graph.RelationVariants.ToLookup(v => v.KindAttributeFqn, StringComparer.Ordinal);
 
+        // CG043 losers are skipped so the same edge table isn't defined twice with
+        // disagreeing FROM/TO clauses; the CG error already fails the build.
         var fwdKinds = graph.RelationKinds
             .Where(k => k.Direction == RelationDirection.Forward)
+            .Where(k => !graph.IsCollisionLoser(NameCollisionKind.EdgeName, k.FullName))
             .OrderBy(k => k.Name, StringComparer.Ordinal);
         foreach (var fwdKind in fwdKinds)
         {

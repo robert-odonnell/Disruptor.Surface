@@ -36,7 +36,12 @@ internal static class LoadEntryEmitter
             return;
         }
 
-        var aggregateRoots = graph.Tables.Where(t => t.IsAggregateRoot).ToList();
+        // CG044 losers are skipped — the {Name}QueryLoad class and its AddSource hint
+        // key on the root's simple name (duplicate hint would be CS8785).
+        var aggregateRoots = graph.Tables
+            .Where(t => t.IsAggregateRoot)
+            .Where(t => !graph.IsCollisionLoser(NameCollisionKind.AggregateRootName, t.FullName))
+            .ToList();
         if (aggregateRoots.Count == 0)
         {
             return;

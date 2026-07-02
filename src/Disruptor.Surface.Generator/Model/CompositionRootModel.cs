@@ -12,4 +12,5 @@ public sealed record CompositionRootModel(
     string Namespace,
     string Name,
     string DeclaredAccessibility,
-    bool IsPartial);
+    bool IsPartial,
+    bool IsNested);
