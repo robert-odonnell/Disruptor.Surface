@@ -292,6 +292,110 @@ public sealed class EmissionShapeTests
     }
 
     [Fact]
+    public void KeywordPropertyNames_AreEscapedInEmittedIdentifiers()
+    {
+        // Roslyn strips the `@` from ISymbol.Name, so `[Property] partial string @class`
+        // used to interpolate a bare `class` into the emitted property declaration —
+        // a CS1519 cascade inside the .g.cs. Emitters now @-escape at the boundary.
+        // The SurrealDB field name (snake_case) is unaffected: still `class` / `event`.
+        var src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [Table] public partial class Symbol {
+                [Id] public partial SymbolId Id { get; set; }
+                [Property] public partial string @class { get; set; }
+                [Property] public partial string @event { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (result, _, _, compileDiags) = GeneratorHarness.Run(src);
+        Assert.Empty(compileDiags);
+
+        var symbolFile = GeneratorHarness.FindGeneratedFile(result, "M.Symbol.g.cs");
+        Assert.NotNull(symbolFile);
+        var symbolSrc = symbolFile!.ToString();
+        Assert.Contains("partial string @class", symbolSrc);
+        Assert.Contains("partial string @event", symbolSrc);
+        // Wire field names are the raw snake_case names, not the escaped identifiers.
+        Assert.Contains("\"class\"", symbolSrc);
+        Assert.DoesNotContain("\"@class\"", symbolSrc);
+    }
+
+    [Fact]
+    public void KeywordClassNames_AreEscapedInEmittedTypeReferences()
+    {
+        // A [Table] named with a keyword (`@event`) flows through hand-built type
+        // references in many emitters (query root, hydrate root, traversal builders,
+        // aggregate loader). Every `global::{ns}.{name}` construction now escapes via
+        // CSharpText.GlobalName/GlobalType.
+        var src = """
+            using Disruptor.Surface.Annotations;
+            using System.Collections.Generic;
+            namespace M;
+
+            [Table, AggregateRoot] public partial class @event {
+                [Id] public partial eventId Id { get; set; }
+                [Property] public partial string Name { get; set; }
+                [Children] public partial IReadOnlyCollection<@case> Cases { get; }
+            }
+
+            [Table] public partial class @case {
+                [Id] public partial caseId Id { get; set; }
+                [Parent] public partial @event Owner { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (_, _, _, compileDiags) = GeneratorHarness.Run(src);
+        Assert.Empty(compileDiags);
+    }
+
+    [Fact]
+    public void NullableTypedIdEndpoint_GuardsEnumerateReferences()
+    {
+        // `(RecordId?)(RecordId)_source` on a nullable typed-id endpoint lifts the
+        // user-defined conversion over Nullable<T> — InvalidOperationException when the
+        // endpoint is unset, instead of yielding (field, null). The emitted form now
+        // guards with `is { }` like the union branch.
+        var src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+
+            [Table] public partial class Constraint {
+                [Id] public partial ConstraintId Id { get; set; }
+            }
+
+            [Table] public partial class UserStory {
+                [Id] public partial UserStoryId Id { get; set; }
+            }
+
+            [Restricts]
+            public partial class OptionalSource {
+                [In, Unset] public partial ConstraintId? Source { get; set; }
+                [Out] public partial UserStoryId Target { get; set; }
+            }
+            """;
+
+        var (result, _, _, compileDiags) = GeneratorHarness.Run(src);
+        Assert.Empty(compileDiags);
+
+        var variantFile = GeneratorHarness.FindGeneratedFile(result, "OptionalSource.RelationVariant");
+        Assert.NotNull(variantFile);
+        var variantSrc = variantFile!.ToString();
+        // Nullable endpoint: guarded yield.
+        Assert.Contains("_source is { } __v_source ? (global::Disruptor.Surface.Runtime.RecordId?)(global::Disruptor.Surface.Runtime.RecordId)__v_source : null", variantSrc);
+        // Non-nullable endpoint keeps the direct cast.
+        Assert.Contains("(global::Disruptor.Surface.Runtime.RecordId?)(global::Disruptor.Surface.Runtime.RecordId)_target", variantSrc);
+    }
+
+    [Fact]
     public void Loader_EmitsEdgeSubselect_ForMultiSourceRelationKind()
     {
         // Bug regression: BuildEdgeWhere previously delegated to a FindSingleSourceTable

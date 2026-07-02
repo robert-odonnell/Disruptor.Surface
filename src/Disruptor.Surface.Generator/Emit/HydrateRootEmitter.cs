@@ -47,9 +47,7 @@ internal static class HydrateRootEmitter
             .Where(t => !graph.IsCollisionLoser(NameCollisionKind.TableName, t.FullName))
             .OrderBy(t => t.Name, StringComparer.Ordinal)
             .ToList();
-        var refRegistryFqn = string.IsNullOrEmpty(root.Namespace)
-            ? $"global::{root.Name}.ReferenceRegistry"
-            : $"global::{root.Namespace}.{root.Name}.ReferenceRegistry";
+        var refRegistryFqn = $"{CSharpText.GlobalName(root.Namespace, root.Name)}.ReferenceRegistry";
 
         var writer = new CodeWriter().Header();
         using (writer.Namespace(root.Namespace))
@@ -69,9 +67,7 @@ internal static class HydrateRootEmitter
                 {
                     var tableName = SurrealNaming.ToTableName(table.Name);
                     var methodName = PascalPluralize(table.Name);
-                    var entityFqn = string.IsNullOrEmpty(table.Namespace)
-                        ? $"global::{table.Name}"
-                        : $"global::{table.Namespace}.{table.Name}";
+                    var entityFqn = CSharpText.GlobalName(table.Namespace, table.Name);
                     var idFqn = $"{entityFqn}Id";
 
                     using (writer.Block($"public {Namespaces.HydrationQueryFqn}<{entityFqn}> {methodName}({Namespaces.IEnumerableFqn}<{idFqn}> ids)"))

@@ -79,7 +79,7 @@ internal static class PartialEmitter
 
             // No type-parameter list: generic [Table] classes never reach the emitters —
             // RelationLinker filters them into GenericTableIssues (CG049).
-            declarationParts.Add($"partial class {table.Name}");
+            declarationParts.Add($"partial class {CSharpText.Identifier(table.Name)}");
 
             var baseTypes = new List<string> {
                 Namespaces.EntityInterface };
@@ -257,7 +257,7 @@ internal static class PartialEmitter
         var singular = SurrealNaming.Singularize(p.Name);
 
         writer.Line($"private readonly {listType} {backing} = new();");
-        writer.Line($"{access} partial {declaredType} {p.Name} => {backing};");
+        writer.Line($"{access} partial {declaredType} {CSharpText.Identifier(p.Name)} => {backing};");
         writer.Line($"public void Add{singular}({elementType} item) => {backing}.Add(item);");
         writer.Line($"public bool Remove{singular}({elementType} item) => {backing}.Remove(item);");
         writer.Line($"public void Clear{p.Name}() => {backing}.Clear();");
@@ -294,7 +294,7 @@ internal static class PartialEmitter
         var idArg = StripNullable(idType);
         var access = FormatAccessibility(p.DeclaredAccessibility);
 
-        using (writer.Block($"{access} partial {idType} {p.Name}"))
+        using (writer.Block($"{access} partial {idType} {CSharpText.Identifier(p.Name)}"))
         {
             writer.Line($"get => _id ??= {idArg}.New();");
             if (p.HasSetter)
@@ -334,11 +334,11 @@ internal static class PartialEmitter
 
         if (!p.HasSetter && !p.HasInitOnlySetter)
         {
-            writer.Line($"{access} partial {type} {p.Name} => {backing};");
+            writer.Line($"{access} partial {type} {CSharpText.Identifier(p.Name)} => {backing};");
             return;
         }
 
-        using (writer.Block($"{access} partial {type} {p.Name}"))
+        using (writer.Block($"{access} partial {type} {CSharpText.Identifier(p.Name)}"))
         {
             writer.Line($"get => {backing};");
             writer.Line($"{(p.HasInitOnlySetter ? "init" : "set")} => {backing} = value;");
@@ -375,7 +375,7 @@ internal static class PartialEmitter
         writer.Line($"private {typeArg}? {backing};");
         writer.Line($"private global::Disruptor.Surface.Runtime.RecordId? {idBacking};");
 
-        using (writer.Block($"{access} partial {declared} {p.Name}"))
+        using (writer.Block($"{access} partial {declared} {CSharpText.Identifier(p.Name)}"))
         {
             if (nullable)
             {
@@ -427,7 +427,7 @@ internal static class PartialEmitter
         var sliceKeyLit = Quote(sliceKey);
         var fetchHintLit = Quote($".Include{p.Name}(...) on the parent query");
 
-        using (writer.Block($"{access} partial {declared} {p.Name}"))
+        using (writer.Block($"{access} partial {declared} {CSharpText.Identifier(p.Name)}"))
         {
             using (writer.Block("get"))
             {
@@ -467,7 +467,7 @@ internal static class PartialEmitter
         writer.Line($"private {typeArg}? {backing};");
         writer.Line($"private global::Disruptor.Surface.Runtime.RecordId? {idBacking};");
 
-        using (writer.Block($"{access} partial {declared} {p.Name}"))
+        using (writer.Block($"{access} partial {declared} {CSharpText.Identifier(p.Name)}"))
         {
             // Getter
             if (!nullable)
@@ -532,7 +532,7 @@ internal static class PartialEmitter
         if (crossAggregate)
         {
             var method = p.RelationRole == RelationRole.ForwardRelation ? "QueryRelatedIds" : "QueryInverseRelatedIds";
-            using (writer.Block($"{access} partial {declared} {p.Name}"))
+            using (writer.Block($"{access} partial {declared} {CSharpText.Identifier(p.Name)}"))
             {
                 using (writer.Block("get"))
                 {
@@ -553,7 +553,7 @@ internal static class PartialEmitter
             ? "QueryOutgoing"
             : "QueryIncoming";
 
-        using (writer.Block($"{access} partial {declared} {p.Name}"))
+        using (writer.Block($"{access} partial {declared} {CSharpText.Identifier(p.Name)}"))
         {
             using (writer.Block("get"))
             {
@@ -615,7 +615,7 @@ internal static class PartialEmitter
     {
         var type = p.Type.FullyQualifiedName;
         var access = FormatAccessibility(p.DeclaredAccessibility);
-        writer.Line($"{access} partial {type} {p.Name} => throw new global::System.NotImplementedException();");
+        writer.Line($"{access} partial {type} {CSharpText.Identifier(p.Name)} => throw new global::System.NotImplementedException();");
     }
 
     private static string ToCamel(string s) =>
@@ -889,7 +889,7 @@ internal static class PartialEmitter
                                 foreach (var im in p.InlineMembers)
                                 {
                                     var subLit = Quote(SurrealNaming.ToFieldName(im.Name));
-                                    writer.Line($"global::Disruptor.Surface.Runtime.ContentValue.Set({objLocal}, {subLit}, {elemLocal}.{im.Name});");
+                                    writer.Line($"global::Disruptor.Surface.Runtime.ContentValue.Set({objLocal}, {subLit}, {elemLocal}.{CSharpText.Identifier(im.Name)});");
                                 }
 
                                 writer.Line($"__list.Add(new global::Disruptor.Surreal.Values.SurrealObjectValue({objLocal}));");
@@ -944,7 +944,7 @@ internal static class PartialEmitter
                 }
 
                 var elemLocal = $"__child_{ToCamel(p.Name)}";
-                using (writer.Block($"foreach (var {elemLocal} in this.{p.Name})"))
+                using (writer.Block($"foreach (var {elemLocal} in this.{CSharpText.Identifier(p.Name)})"))
                 {
                     writer.Line($"if (!ctx.IsTracked((({Namespaces.EntityInterface}){elemLocal}).Id))");
                     using (writer.Indent())
@@ -1118,7 +1118,7 @@ internal static class PartialEmitter
                         // String fast-path mirrors EmitHydrateValueProperty's optimisation:
                         // only non-nullable strings use the empty-string fallback.
                         var trailing = !objectInit && i == p.InlineMembers.Count - 1 ? "" : ",";
-                        var assign = objectInit ? $"{im.Name} = " : $"{im.Name}: ";
+                        var assign = objectInit ? $"{CSharpText.Identifier(im.Name)} = " : $"{CSharpText.Identifier(im.Name)}: ";
                         var nullable = im.Type.IsNullable;
                         var isString = typeFqn is "string" or "global::System.String" or "string?" or "global::System.String?";
                         if (!nullable && isString)
@@ -1208,7 +1208,7 @@ internal static class PartialEmitter
 
     // ──────────────────────────── helpers ────────────────────────────────────
 
-    private static string Quote(string s) => $"\"{s.Replace("\"", "\\\"")}\"";
+    private static string Quote(string s) => CSharpText.Quote(s);
 
     private static string StripNullable(string typeName)
         => typeName.EndsWith("?", StringComparison.Ordinal) ? typeName[..^1] : typeName;
