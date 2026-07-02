@@ -1070,6 +1070,220 @@ public sealed class SurrealSessionTests
         Assert.False(Assert.Single(observer.CapturedIsTracked));
     }
 
+    // ──────────────── 2026-07-02 session-DX: close-reason diagnostics ────────
+
+    [Fact]
+    public void CloseReason_IsNull_WhileSessionIsOpen()
+    {
+        var session = new SurrealSession();
+        Assert.Null(session.CloseReason);
+    }
+
+    [Fact]
+    public void Abandon_StampsAbandonedReason_AndThrowIfClosedNamesIt()
+    {
+        var session = new SurrealSession();
+        session.Abandon();
+
+        Assert.NotNull(session.CloseReason);
+        var reason = session.CloseReason!;
+        Assert.Equal(SessionCloseKind.Abandoned, reason.Kind);
+        Assert.Null(reason.Cause);
+        Assert.Null(reason.EntityId);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => session.Get<StubEntity>(new RecordId("t", "1")));
+        Assert.Contains("Abandon was called", ex.Message);
+        Assert.Contains("one-shot", ex.Message);
+    }
+
+    [Fact]
+    public async Task SaveAsync_WireFailure_StampsSaveFailed_WithEntityIdAndOriginalCause()
+    {
+        var session = new SurrealSession();
+        var entity = new ThrowingWireSaveEntity(new RecordId("designs", "x"));
+        var db = FakeSurreal.Throwing(new IOException("boom"));
+        await using var tx = await db.BeginTransactionAsync();
+
+        // The failing call itself must throw the ORIGINAL exception, unwrapped.
+        var thrown = await Assert.ThrowsAsync<IOException>(() => session.SaveAsync(entity, tx));
+        Assert.Equal("boom", thrown.Message);
+
+        Assert.NotNull(session.CloseReason);
+        var reason = session.CloseReason!;
+        Assert.Equal(SessionCloseKind.SaveFailed, reason.Kind);
+        Assert.Equal(entity.Id, reason.EntityId);
+        Assert.Same(thrown, reason.Cause);
+
+        // Every subsequent call explains itself: operation + id + cause, plus the
+        // one-shot contract.
+        var closedEx = Assert.Throws<InvalidOperationException>(() => session.Get<StubEntity>(entity.Id));
+        Assert.Contains("SaveAsync of designs:x failed: IOException: boom", closedEx.Message);
+        Assert.Contains("Sessions are one-shot", closedEx.Message);
+    }
+
+    [Fact]
+    public async Task DeleteAsync_WireFailure_StampsDeleteFailed()
+    {
+        var session = new SurrealSession();
+        var entity = session.Track(new StubEntity(new RecordId("designs", "x")));
+        var db = FakeSurreal.Throwing(new IOException("boom"));
+        await using var tx = await db.BeginTransactionAsync();
+
+        var thrown = await Assert.ThrowsAsync<IOException>(() => session.DeleteAsync(entity, tx));
+
+        Assert.NotNull(session.CloseReason);
+        var reason = session.CloseReason!;
+        Assert.Equal(SessionCloseKind.DeleteFailed, reason.Kind);
+        Assert.Equal(entity.Id, reason.EntityId);
+        Assert.Same(thrown, reason.Cause);
+    }
+
+    [Fact]
+    public async Task DeleteAsync_RejectBlocker_StampsRejectedDelete_WithCascadeRejectExceptionAsCause()
+    {
+        // The pre-flight Reject is a distinct close reason from a wire failure — no
+        // DELETE was dispatched; the plan itself said no.
+        var registry = new StubReferenceRegistry();
+        registry.Add("b", referencer: "a", field: "b_ref", behavior: ReferenceDeleteBehavior.Reject);
+        var session = new SurrealSession(registry);
+
+        var b = new RefStubEntity(new RecordId("b", "b1"));
+        var a = new RefStubEntity(new RecordId("a", "a1"), ("b_ref", b.Id));
+        ((IHydrationSink)session).Track(b);
+        ((IHydrationSink)session).Track(a);
+
+        var db = FakeSurreal.Throwing(new IOException("should never reach the wire"));
+        await using var tx = await db.BeginTransactionAsync();
+        var thrown = await Assert.ThrowsAsync<CascadeRejectException>(() => session.DeleteAsync(b, tx));
+
+        Assert.NotNull(session.CloseReason);
+        var reason = session.CloseReason!;
+        Assert.Equal(SessionCloseKind.RejectedDelete, reason.Kind);
+        Assert.Equal(b.Id, reason.EntityId);
+        Assert.Same(thrown, reason.Cause);
+
+        var closedEx = Assert.Throws<InvalidOperationException>(() => session.Get<RefStubEntity>(b.Id));
+        Assert.Contains("DeleteAsync of b:b1 was rejected by the pre-flight cascade resolve", closedEx.Message);
+    }
+
+    [Fact]
+    public async Task FetchAsync_WireFailure_StampsFetchFailed()
+    {
+        var session = new SurrealSession();
+        var db = FakeSurreal.Throwing(new IOException("boom"));
+        await using var tx = await db.BeginTransactionAsync();
+
+        var thrown = await Assert.ThrowsAsync<IOException>(
+            () => session.FetchAsync(new SurfaceQuery<StubTarget>("targets"), tx));
+
+        Assert.NotNull(session.CloseReason);
+        var reason = session.CloseReason!;
+        Assert.Equal(SessionCloseKind.FetchFailed, reason.Kind);
+        Assert.Null(reason.EntityId);
+        Assert.Same(thrown, reason.Cause);
+    }
+
+    [Fact]
+    public async Task QueryVariantsOutgoingAsync_WireFailure_StampsQueryFailed_WithEndpointId()
+    {
+        var session = new SurrealSession();
+        var db = FakeSurreal.Throwing(new IOException("boom"));
+        await using var tx = await db.BeginTransactionAsync();
+        var src = new RecordId("constraints", "c");
+
+        var thrown = await Assert.ThrowsAsync<IOException>(
+            () => session.QueryVariantsOutgoingAsync<StubVariant>(src, tx));
+
+        Assert.NotNull(session.CloseReason);
+        var reason = session.CloseReason!;
+        Assert.Equal(SessionCloseKind.QueryFailed, reason.Kind);
+        Assert.Equal(src, reason.EntityId);
+        Assert.Same(thrown, reason.Cause);
+    }
+
+    [Fact]
+    public async Task CloseReason_FirstCloseWins_AbandonAfterFailureKeepsTheFailure()
+    {
+        var session = new SurrealSession();
+        var entity = new ThrowingWireSaveEntity(new RecordId("designs", "x"));
+        var db = FakeSurreal.Throwing(new IOException("boom"));
+        await using var tx = await db.BeginTransactionAsync();
+        await Assert.ThrowsAsync<IOException>(() => session.SaveAsync(entity, tx));
+
+        // A later Abandon (legal on a closed session — idempotent close) must not
+        // overwrite the reason that actually killed the snapshot.
+        session.Abandon();
+        session.Abandon();
+
+        Assert.NotNull(session.CloseReason);
+        var reason = session.CloseReason!;
+        Assert.Equal(SessionCloseKind.SaveFailed, reason.Kind);
+        Assert.Equal(entity.Id, reason.EntityId);
+    }
+
+    // ─────────── 2026-07-02 session-DX: PlanDelete reverse-reference index ───
+
+    [Fact]
+    public async Task DeleteAsync_DiamondCascade_DeletesEachEntityOnce()
+    {
+        // Diamond: a → b1 → c and a → b2 → c, every reference Cascade. Delete c —
+        // a is reachable through BOTH b1 and b2; the cascade set must contain it once
+        // and OnDeleting must fire exactly once per entity. Guards the reverse-index
+        // rewrite against double-visiting a node reachable via multiple paths.
+        var registry = new StubReferenceRegistry();
+        registry.Add("c", referencer: "b1", field: "c_ref", behavior: ReferenceDeleteBehavior.Cascade);
+        registry.Add("c", referencer: "b2", field: "c_ref", behavior: ReferenceDeleteBehavior.Cascade);
+        registry.Add("b1", referencer: "a", field: "b1_ref", behavior: ReferenceDeleteBehavior.Cascade);
+        registry.Add("b2", referencer: "a", field: "b2_ref", behavior: ReferenceDeleteBehavior.Cascade);
+        var session = new SurrealSession(registry);
+
+        var c = new RefStubEntity(new RecordId("c", "c1"));
+        var b1 = new RefStubEntity(new RecordId("b1", "x"), ("c_ref", c.Id));
+        var b2 = new RefStubEntity(new RecordId("b2", "y"), ("c_ref", c.Id));
+        var a = new RefStubEntity(new RecordId("a", "a1"), ("b1_ref", b1.Id), ("b2_ref", b2.Id));
+        ((IHydrationSink)session).Track(c);
+        ((IHydrationSink)session).Track(b1);
+        ((IHydrationSink)session).Track(b2);
+        ((IHydrationSink)session).Track(a);
+
+        var db = FakeSurreal.Null();
+        await using var tx = await db.BeginTransactionAsync();
+        await session.DeleteAsync(c, tx);
+
+        Assert.Equal(1, c.OnDeletingCount);
+        Assert.Equal(1, b1.OnDeletingCount);
+        Assert.Equal(1, b2.OnDeletingCount);
+        Assert.Equal(1, a.OnDeletingCount);
+        Assert.False(session.IsTracked(a.Id));
+        Assert.False(session.IsClosed);
+    }
+
+    [Fact]
+    public async Task DeleteAsync_TwoUnsetFieldsOnOneEntity_SameTarget_BothNulled()
+    {
+        // One referencer holding TWO distinct Unset references at the same target:
+        // both fields must be mirrored to null. Guards the reverse-index build against
+        // collapsing multiple (referencer, field) pairs per target into one.
+        var registry = new StubReferenceRegistry();
+        registry.Add("b", referencer: "a", field: "x_ref", behavior: ReferenceDeleteBehavior.Unset);
+        registry.Add("b", referencer: "a", field: "y_ref", behavior: ReferenceDeleteBehavior.Unset);
+        var session = new SurrealSession(registry);
+
+        var b = new RefStubEntity(new RecordId("b", "b1"));
+        var a = new RefStubEntity(new RecordId("a", "a1"), ("x_ref", b.Id), ("y_ref", b.Id));
+        ((IHydrationSink)session).Track(b);
+        ((IHydrationSink)session).Track(a);
+
+        var db = FakeSurreal.Null();
+        await using var tx = await db.BeginTransactionAsync();
+        await session.DeleteAsync(b, tx);
+
+        Assert.False(a.OnDeletingCalled);
+        var refs = ((IEntity)a).EnumerateReferences().ToList();
+        Assert.All(refs, r => Assert.Null(r.Target));
+        Assert.Equal(2, refs.Count);
+    }
+
     // ──────────────────────────── Phase 4 helpers ────────────────────────────
 
     private static (string Sql, SurrealObject Bindings) ExtractQueryParts(SurrealValue? @params)
@@ -1145,11 +1359,12 @@ public sealed class SurrealSessionTests
 
         public RecordId Id { get; }
         public SurrealSession? Session { get; private set; }
-        public bool OnDeletingCalled { get; private set; }
+        public bool OnDeletingCalled => OnDeletingCount > 0;
+        public int OnDeletingCount { get; private set; }
 
         public void Bind(SurrealSession session) => Session = session;
         public void Initialize(SurrealSession session) { }
-        public void OnDeleting() => OnDeletingCalled = true;
+        public void OnDeleting() => OnDeletingCount++;
         public void MarkAllSlicesLoaded(IHydrationSink sink) { }
 
         IEnumerable<(string FieldName, RecordId? Target)> IEntity.EnumerateReferences()
@@ -1166,6 +1381,29 @@ public sealed class SurrealSessionTests
             {
                 _refs[fieldName] = value;
             }
+        }
+    }
+
+    /// <summary>
+    /// Test-only entity whose SaveAsync dispatches a query through <c>ctx.Transaction</c>
+    /// — paired with <see cref="FakeSurreal.Throwing"/> so close-reason tests exercise a
+    /// realistic wire failure surfacing through the generated-Save-body path.
+    /// </summary>
+    private sealed class ThrowingWireSaveEntity(RecordId id) : IEntity
+    {
+        public RecordId Id { get; } = id;
+        public SurrealSession? Session { get; private set; }
+
+        public void Bind(SurrealSession session) => Session = session;
+        public void Initialize(SurrealSession session) { }
+        public void OnDeleting() { }
+        public void MarkAllSlicesLoaded(IHydrationSink sink) { }
+
+        async Task IEntity.SaveAsync(ISaveContext ctx, CancellationToken ct)
+        {
+            var response = await ctx.Transaction.QueryAsync("RETURN 1;", null, ct);
+            response.EnsureSuccess();
+            ctx.MarkSaved(this);
         }
     }
 
