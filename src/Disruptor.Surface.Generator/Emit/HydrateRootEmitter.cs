@@ -121,8 +121,10 @@ internal static class HydrateRootEmitter
         spc.AddSource($"{root.FullName}.Hydrate.g.cs", writer.ToSourceText());
     }
 
+    // Routed through SurrealNaming so the Humanizer call runs culture-invariant like
+    // every other baked identifier.
     private static string PascalPluralize(string typeName)
-        => Humanizer.InflectorExtensions.Pluralize(typeName, inputIsKnownToBeSingular: false);
+        => SurrealNaming.PascalPluralize(typeName);
 
     private static string FormatTypeDeclaration(string accessibility, string typeName)
     {

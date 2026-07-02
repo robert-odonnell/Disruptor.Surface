@@ -685,7 +685,7 @@ public sealed class ModelGenerator : IIncrementalGenerator
         }
     }
 
-    private static TypeRef UnwrapTask(TypeRef t) => t.FullyQualifiedName.StartsWith("global::System.Threading.Tasks.Task<") && t.TypeArguments.Count > 0
+    private static TypeRef UnwrapTask(TypeRef t) => t.FullyQualifiedName.StartsWith("global::System.Threading.Tasks.Task<", StringComparison.Ordinal) && t.TypeArguments.Count > 0
         ? t.TypeArguments[0]
         : t;
 
@@ -749,12 +749,12 @@ public sealed class ModelGenerator : IIncrementalGenerator
     private static string StripGlobalAndNullable(string fqn)
     {
         const string prefix = "global::";
-        if (fqn.StartsWith(prefix))
+        if (fqn.StartsWith(prefix, StringComparison.Ordinal))
         {
             fqn = fqn[prefix.Length..];
         }
 
-        if (fqn.EndsWith("?"))
+        if (fqn.EndsWith("?", StringComparison.Ordinal))
         {
             fqn = fqn[..^1];
         }

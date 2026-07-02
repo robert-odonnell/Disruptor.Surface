@@ -869,8 +869,8 @@ internal static class RelationLinker
         var markerNamespace = lastDot >= 0 ? markerFullName[..lastDot] : string.Empty;
         var markerSimpleName = lastDot >= 0 ? markerFullName[(lastDot + 1)..] : markerFullName;
 
-        if (!markerSimpleName.StartsWith("I")
-            || !markerSimpleName.EndsWith("RecordId")
+        if (!markerSimpleName.StartsWith("I", StringComparison.Ordinal)
+            || !markerSimpleName.EndsWith("RecordId", StringComparison.Ordinal)
             || markerSimpleName.Length <= "IRecordId".Length)
         {
             return null;
@@ -1099,12 +1099,12 @@ internal static class RelationLinker
     private static string StripGlobalAndNullable(string fqn)
     {
         const string prefix = "global::";
-        if (fqn.StartsWith(prefix))
+        if (fqn.StartsWith(prefix, StringComparison.Ordinal))
         {
             fqn = fqn[prefix.Length..];
         }
 
-        if (fqn.EndsWith("?"))
+        if (fqn.EndsWith("?", StringComparison.Ordinal))
         {
             fqn = fqn[..^1];
         }
@@ -1152,7 +1152,7 @@ internal static class RelationLinker
     private static string Strip(string fqn)
     {
         const string prefix = "global::";
-        if (fqn.StartsWith(prefix))
+        if (fqn.StartsWith(prefix, StringComparison.Ordinal))
         {
             fqn = fqn[prefix.Length..];
         }
@@ -1263,7 +1263,7 @@ internal static class RelationLinker
     }
 
     private static string StripAttribute(string name)
-        => name.EndsWith("Attribute") ? name[..^"Attribute".Length] : name;
+        => name.EndsWith("Attribute", StringComparison.Ordinal) ? name[..^"Attribute".Length] : name;
 
     private static string QualifyName(string ns, string name)
         => string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}";

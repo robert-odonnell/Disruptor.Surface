@@ -478,12 +478,12 @@ internal static class AggregateLoaderEmitter
     private static string StripGlobalAndNullable(string fqn)
     {
         const string prefix = "global::";
-        if (fqn.StartsWith(prefix))
+        if (fqn.StartsWith(prefix, StringComparison.Ordinal))
         {
             fqn = fqn[prefix.Length..];
         }
 
-        if (fqn.EndsWith("?"))
+        if (fqn.EndsWith("?", StringComparison.Ordinal))
         {
             fqn = fqn[..^1];
         }

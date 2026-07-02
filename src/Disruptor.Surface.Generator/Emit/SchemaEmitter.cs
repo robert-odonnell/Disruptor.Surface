@@ -132,7 +132,7 @@ internal static class SchemaEmitter
     private static void WriteRawStringContent(CodeWriter writer, string content)
     {
         var normalised = content.Replace("\r\n", "\n").Replace('\r', '\n');
-        if (normalised.EndsWith("\n"))
+        if (normalised.EndsWith("\n", StringComparison.Ordinal))
         {
             normalised = normalised[..^1];
         }
@@ -427,7 +427,7 @@ internal static class SchemaEmitter
     internal static (string? Type, string? Default) MapScalarType(TypeRef type)
     {
         var fqn = StripGlobal(type.FullyQualifiedName);
-        if (fqn.EndsWith("?"))
+        if (fqn.EndsWith("?", StringComparison.Ordinal))
         {
             fqn = fqn[..^1];
         }
@@ -699,7 +699,7 @@ internal static class SchemaEmitter
             return exactMatch;
         }
 
-        if (simpleName.EndsWith("Id"))
+        if (simpleName.EndsWith("Id", StringComparison.Ordinal))
         {
             var stripped = simpleName[..^"Id".Length];
             var strippedMatch = graph.Tables.FirstOrDefault(t => t.Name == stripped);
@@ -736,5 +736,5 @@ internal static class SchemaEmitter
     }
 
     private static string StripGlobal(string fqn) =>
-        fqn.StartsWith("global::") ? fqn[8..] : fqn;
+        fqn.StartsWith("global::", StringComparison.Ordinal) ? fqn[8..] : fqn;
 }

@@ -89,11 +89,11 @@ internal static class QueryRootEmitter
     /// <summary>
     /// Pascal-cased pluralisation of the C# type name (e.g. <c>Constraint</c> → <c>Constraints</c>,
     /// <c>Details</c> stays <c>Details</c>, <c>AcceptanceCriteria</c> stays
-    /// <c>AcceptanceCriteria</c>). Mirrors what <see cref="SurrealNaming.ToTableName"/> does
-    /// minus the snake-casing — the query-root property names must stay valid C# identifiers.
+    /// <c>AcceptanceCriteria</c>). Routed through <see cref="SurrealNaming"/> so the
+    /// Humanizer call runs culture-invariant like every other baked identifier.
     /// </summary>
     private static string PascalPluralize(string typeName)
-        => Humanizer.InflectorExtensions.Pluralize(typeName, inputIsKnownToBeSingular: false);
+        => SurrealNaming.PascalPluralize(typeName);
 
     private static string FormatTypeDeclaration(string accessibility, string typeName)
     {

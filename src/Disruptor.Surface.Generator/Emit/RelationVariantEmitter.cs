@@ -1023,7 +1023,7 @@ internal static class RelationVariantEmitter
         s.Length == 0 ? s : char.ToLowerInvariant(s[0]) + s[1..];
 
     private static string StripNullable(string typeName)
-        => typeName.EndsWith("?") ? typeName[..^1] : typeName;
+        => typeName.EndsWith("?", StringComparison.Ordinal) ? typeName[..^1] : typeName;
 
     private static string Quote(string s) => $"\"{s.Replace("\"", "\\\"")}\"";
 
