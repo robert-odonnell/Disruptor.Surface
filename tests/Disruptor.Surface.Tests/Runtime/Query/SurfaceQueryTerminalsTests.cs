@@ -344,7 +344,67 @@ public sealed class SurfaceQueryTerminalsTests
         Assert.Equal(["childA", "childB"], hydratedChildren);
     }
 
+    // ─────────── ExecuteIntoSessionAsync fail-closed boundary (2026-07-02) ───────────
+
+    [Fact]
+    public async Task ExecuteIntoSessionAsync_HydrationFailureMidLoop_ClosesSuppliedSession_AndRethrowsUnwrapped()
+    {
+        // Public ExecuteIntoSessionAsync mutates the CALLER's session, so it carries the
+        // same fail-closed boundary as SurrealSession.FetchAsync: a mid-loop hydration
+        // failure must not leave the supplied session open half old state, half new.
+        // The close reason is truthful (HydrationFailed, not Abandoned) and the original
+        // exception propagates unwrapped as well as riding CloseReason.Cause.
+        var session = new SurrealSession();
+        var (db, conn) = FakeSurreal.NullWithRecording();
+        conn.Responder = (method, _, _) => method == "query"
+            ? WrapAsQueryResponse(new SurrealListValue([NamedRow("symbols", "a", "alpha")]))
+            : SurrealValue.None;
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => new SurfaceQuery<ThrowingHydrateEntity>("symbols").ExecuteIntoSessionAsync(session, db));
+        Assert.Equal("hydrate boom", thrown.Message);
+
+        Assert.True(session.IsClosed);
+        var reason = session.CloseReason!;
+        Assert.Equal(SessionCloseKind.HydrationFailed, reason.Kind);
+        Assert.Same(thrown, reason.Cause);
+    }
+
+    [Fact]
+    public async Task ExecuteIntoSessionAsync_WireFailure_ClosesSuppliedSession_WithHydrationFailed()
+    {
+        var session = new SurrealSession();
+        var db = FakeSurreal.Throwing(new IOException("boom"));
+        await using var tx = await db.BeginTransactionAsync();
+
+        var thrown = await Assert.ThrowsAsync<IOException>(
+            () => new SurfaceQuery<TestEntity>("symbols").ExecuteIntoSessionAsync(session, tx));
+        Assert.Equal("boom", thrown.Message);
+
+        Assert.True(session.IsClosed);
+        var reason = session.CloseReason!;
+        Assert.Equal(SessionCloseKind.HydrationFailed, reason.Kind);
+        Assert.Same(thrown, reason.Cause);
+    }
+
     // ─────────────────────── Helpers ───────────────────────
+
+    /// <summary>
+    /// Test stand-in for an entity whose generated Hydrate body throws mid-hydration —
+    /// drives the ExecuteIntoSessionAsync fail-closed boundary tests.
+    /// </summary>
+    private sealed class ThrowingHydrateEntity : IEntity
+    {
+        public RecordId Id => default;
+        public SurrealSession? Session => null;
+        public void Bind(SurrealSession session) { }
+        public void Initialize(SurrealSession session) { }
+        public void OnDeleting() { }
+        public void MarkAllSlicesLoaded(IHydrationSink sink) { }
+
+        void IEntity.Hydrate(SurrealValue row, IHydrationSink sink)
+            => throw new InvalidOperationException("hydrate boom");
+    }
 
     /// <summary>
     /// Test stand-in for a generated entity: minimal IEntity shape plus a Hydrate body

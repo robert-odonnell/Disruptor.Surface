@@ -242,6 +242,16 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
         CloseReason = reason;
     }
 
+    /// <summary>
+    /// Fail-close entry point for same-assembly query surfaces that mutate a
+    /// caller-supplied session (<see cref="SurfaceQuery{T}.ExecuteIntoSessionAsync(SurrealSession, SurrealClient, CancellationToken)"/>):
+    /// stamps the truthful close reason — never <see cref="SessionCloseKind.Abandoned"/>,
+    /// which would lie about what killed the snapshot — and flips the session closed.
+    /// First close wins, same as every internal <see cref="Close"/> site.
+    /// </summary>
+    internal void CloseAsFailed(SessionCloseKind kind, Exception cause, RecordId? entityId = null)
+        => Close(new SessionCloseReason(kind, entityId, cause));
+
     private void ThrowIfClosed()
     {
         if (closed)
