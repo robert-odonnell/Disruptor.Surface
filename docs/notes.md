@@ -174,6 +174,10 @@ The Sample project's classes (`Design`, `Constraint`, `Epic`, `Feature`, `UserSt
 
 Newest first. One or two lines per preview. "Substantive" means architecture / behaviour / new public surface; polish (renames, doc edits, formatting) is omitted.
 
+### unreleased — session-integrity fixes from the 2026-07-02 review (§4/§6) (DONE 2026-07-02)
+
+Runtime session-core fixes, no version bump. The generated `IReferenceRegistry` now registers `[Parent]` fields with `Reject`, mirroring the schema's hard-coded `REFERENCE ON DELETE REJECT` — `DeleteAsync` on a parent with tracked children throws the pre-flight `CascadeRejectException` naming the children instead of dispatching a doomed DELETE ("library predicts; substrate enforces"). Variant re-query (`HydrateOneVariant`) re-hydrates and returns the already-tracked instance (was: detached unbound duplicate returned, tracked payload left stale). `FetchAsync` joins the fail-closed family and calls `EnsureSuccess()` so errors from every statement of a multi-statement response surface. `CleanupLocalState` purges `loadedAtStart` + `LoadedSlices` and drops tracked ghost variant entities whose endpoints include a deleted id (endpoint-tuple read extracted into `TryGetVariantEdge`, shared by `RecordVariantEdge`/`DropVariantEdge`). `Track` is atomic w.r.t. throwing user `OnCreate*` hooks (Initialize now precedes the identity-map insert + command-log append); `DeleteAsync` gained SaveAsync's cross-session guard; `AdoptIfUnbound` throws for a child bound to a different session instead of silently no-oping. `HydrationValue` int/short/byte narrowing is `checked` and names the field/type; `default(RecordId).IsIdempotent` is null-safe (false). Doc drift fixed on `ReadOrDefault` (reflection walk is gone), `RecordId.Idempotent`/`Resolve` (nothing auto-resolves the sentinel), and `IEntity.OnDeleting` (notification hook, not a queue-child-deletes window). **359/359 green** (342 prior + 17 net new).
+
 ### preview.59 hardening — name-collision diagnostics, nested-type rejection, partial-decl dedupe, invariant naming (DONE 2026-07-02)
 
 Fixes for review findings §2–§3 of `review-2026-07-02.md`; no version bump.
