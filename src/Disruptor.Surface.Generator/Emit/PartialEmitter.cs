@@ -822,10 +822,49 @@ internal static class PartialEmitter
     /// </summary>
     private static void EmitSaveAsync(CodeWriter writer, TableModel table)
     {
+        // Library-managed value overlays — validated by CG052–CG055 before emit, so by
+        // this point each is a unique, correctly-typed scalar [Property].
+        var createdAtProp = table.Properties.FirstOrDefault(p => p.AutoValue == AutoValueKind.CreatedAt);
+        var updatedAtProp = table.Properties.FirstOrDefault(p => p.AutoValue == AutoValueKind.UpdatedAt);
+        var versionProp = table.Properties.FirstOrDefault(p => p.AutoValue == AutoValueKind.Version);
+
         using (writer.Block($"async global::System.Threading.Tasks.Task {Namespaces.EntityInterface}.SaveAsync(global::Disruptor.Surface.Runtime.ISaveContext ctx, global::System.Threading.CancellationToken ct)"))
         {
             writer.Line($"var __id = (({Namespaces.EntityInterface})this).Id;");
             writer.Line("var __isNew = !ctx.IsTracked(__id);");
+
+            // Audit stamping + version seed — write the backing fields BEFORE the
+            // content build so the standard scalar Set lines below pick the values up.
+            // One ctx.UtcNow read per dispatch: CREATE stamps created + updated with
+            // the same instant; UPDATE refreshes only updated ([CreatedAt] keeps its
+            // loaded value). [Version] seeds to 1 on CREATE; the UPDATE-side increment
+            // is deferred until the guarded dispatch succeeds (see below).
+            if (createdAtProp is not null || updatedAtProp is not null)
+            {
+                writer.Line("var __now = ctx.UtcNow;");
+            }
+
+            if (createdAtProp is not null || versionProp is not null)
+            {
+                writer.Line("if (__isNew)");
+                using (writer.BracedBlock())
+                {
+                    if (createdAtProp is not null)
+                    {
+                        writer.Line($"_{ToCamel(createdAtProp.Name)} = {AuditInstantExpr(createdAtProp)};");
+                    }
+
+                    if (versionProp is not null)
+                    {
+                        writer.Line($"_{ToCamel(versionProp.Name)} = 1;");
+                    }
+                }
+            }
+
+            if (updatedAtProp is not null)
+            {
+                writer.Line($"_{ToCamel(updatedAtProp.Name)} = {AuditInstantExpr(updatedAtProp)};");
+            }
 
             // Forward dependency walk: [Reference] + [Parent], skip relation-role properties.
             // Backing fields hold the entity ref directly under the new pure-setter model, so
@@ -898,6 +937,13 @@ internal static class PartialEmitter
                             writer.Line($"__content[{fieldLit}] = new global::Disruptor.Surreal.Values.SurrealListValue(__list);");
                         }
                     }
+                    else if (p.AutoValue == AutoValueKind.Version)
+                    {
+                        // [Version] — CREATE dispatches the seeded value (1); UPDATE
+                        // dispatches n+1 while the backing field still holds n (the
+                        // in-memory bump waits for the guarded dispatch to succeed).
+                        writer.Line($"global::Disruptor.Surface.Runtime.ContentValue.Set(__content, {fieldLit}, __isNew ? {backing} : {backing} + 1);");
+                    }
                     else
                     {
                         // Scalar [Property] — typed Set picks the right SurrealValue variant
@@ -925,10 +971,54 @@ internal static class PartialEmitter
                 writer.Line("await ctx.Transaction.CreateAsync(global::Disruptor.Surface.Runtime.RecordIdSdkBridge.ToSdk(__id), __content, ct);");
             }
 
-            writer.Line("else");
-            using (writer.Indent())
+            if (versionProp is null)
             {
-                writer.Line("await ctx.Transaction.UpsertAsync(global::Disruptor.Surface.Runtime.RecordIdSdkBridge.ToSdk(__id), __content, ct);");
+                writer.Line("else");
+                using (writer.Indent())
+                {
+                    writer.Line("await ctx.Transaction.UpsertAsync(global::Disruptor.Surface.Runtime.RecordIdSdkBridge.ToSdk(__id), __content, ct);");
+                }
+            }
+            else
+            {
+                // [Version]-guarded UPDATE. The plain path uses the SDK's typed
+                // UpsertAsync, but the guard needs a WHERE clause, so this goes through
+                // tx.QueryAsync with typed CBOR bindings (same "UPDATE $_record_id
+                // CONTENT $_content" shape the SDK's own UpdateAsync issues, plus the
+                // version guard). A non-matching WHERE returns an empty result set —
+                // no row carried the expected version, i.e. a competing writer bumped
+                // it since this session loaded. Fail closed: throw before MarkSaved;
+                // the throw propagates through SurrealSession.SaveAsync's catch, which
+                // closes the session. Only a confirmed match bumps the in-memory value.
+                var versionBacking = $"_{ToCamel(versionProp.Name)}";
+                var versionField = SurrealNaming.ToFieldName(versionProp.Name);
+                writer.Line("else");
+                using (writer.BracedBlock())
+                {
+                    writer.Line($"var __expectedVersion = {versionBacking};");
+                    writer.Line("var __versionBindings = new global::Disruptor.Surreal.Values.SurrealObject");
+                    writer.Line("{");
+                    using (writer.Indent())
+                    {
+                        writer.Line("[\"_record_id\"] = new global::Disruptor.Surreal.Values.SurrealRecordIdValue(global::Disruptor.Surface.Runtime.RecordIdSdkBridge.ToSdk(__id)),");
+                        writer.Line("[\"_content\"] = new global::Disruptor.Surreal.Values.SurrealObjectValue(__content),");
+                    }
+
+                    writer.Line("};");
+                    writer.Line("global::Disruptor.Surface.Runtime.ContentValue.Set(__versionBindings, \"_expected_version\", __expectedVersion);");
+                    writer.Line($"const string __versionSql = \"UPDATE $_record_id CONTENT $_content WHERE {versionField} = $_expected_version;\";");
+                    writer.Line("var __versionResponse = await ctx.Transaction.QueryAsync(__versionSql, __versionBindings, ct);");
+                    writer.Line("__versionResponse.EnsureSuccess();");
+                    writer.Line("var __versionResult = __versionResponse.Count > 0 ? __versionResponse.Take(0) : global::Disruptor.Surreal.Values.SurrealValue.None;");
+                    writer.Line("var __versionMatched = __versionResult is global::Disruptor.Surreal.Values.SurrealObjectValue or global::Disruptor.Surreal.Values.SurrealListValue { List.Count: > 0 };");
+                    writer.Line("if (!__versionMatched)");
+                    using (writer.Indent())
+                    {
+                        writer.Line("throw new global::Disruptor.Surface.Runtime.SurrealVersionConflictException(__id, __expectedVersion);");
+                    }
+
+                    writer.Line($"{versionBacking} = __expectedVersion + 1;");
+                }
             }
 
             writer.Line("ctx.MarkSaved(this);");
@@ -963,6 +1053,18 @@ internal static class PartialEmitter
             // expect from any client that doesn't re-implement a write buffer in front of it.
         }
     }
+
+    /// <summary>
+    /// The expression assigning the per-dispatch <c>__now</c> instant (a
+    /// <c>DateTimeOffset</c> read from <c>ISaveContext.UtcNow</c>) into an audit
+    /// backing field. <c>DateTime</c>-typed audit fields store <c>UtcDateTime</c> —
+    /// deterministic and Kind=Utc, matching the write path's instant contract
+    /// (<c>ContentValue.ToInstant</c> treats Utc as identity).
+    /// </summary>
+    private static string AuditInstantExpr(PropertyModel p)
+        => StripNullable(p.Type.FullyQualifiedName) is "global::System.DateTime" or "System.DateTime"
+            ? "__now.UtcDateTime"
+            : "__now";
 
     // ──────────────────────────── Hydrate emission ──────────────────────────
 

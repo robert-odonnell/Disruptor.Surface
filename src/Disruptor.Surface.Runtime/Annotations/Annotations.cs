@@ -33,6 +33,18 @@ public sealed class ChildrenAttribute : Attribute;
 [AttributeUsage(AttributeTargets.Property, AllowMultiple = true)]
 public sealed class ReferenceAttribute : Attribute;
 
+/// <summary>Audit-column marker — pairs with <see cref="PropertyAttribute"/> on a non-nullable <c>DateTimeOffset</c> or <c>DateTime</c> property: <c>[CreatedAt, Property] public partial DateTimeOffset CreatedAtUtc { get; }</c>. The emitted SaveAsync stamps the field with the save instant on CREATE dispatch and never touches it again (UPDATE keeps the loaded value). Get-only is the recommended shape — the library writes the backing field directly. At most one per [Table] (CG054).</summary>
+[AttributeUsage(AttributeTargets.Property)]
+public sealed class CreatedAtAttribute : Attribute;
+
+/// <summary>Audit-column marker — pairs with <see cref="PropertyAttribute"/> on a non-nullable <c>DateTimeOffset</c> or <c>DateTime</c> property. The emitted SaveAsync stamps the field with the save instant on EVERY dispatch (CREATE sets it to the same instant as <see cref="CreatedAtAttribute"/>; UPDATE refreshes it). Get-only is the recommended shape. At most one per [Table] (CG054). The instant source is <see cref="Disruptor.Surface.Runtime.ISaveContext.UtcNow"/> — injectable for tests.</summary>
+[AttributeUsage(AttributeTargets.Property)]
+public sealed class UpdatedAtAttribute : Attribute;
+
+/// <summary>Optimistic-concurrency marker — pairs with <see cref="PropertyAttribute"/> on a non-nullable <c>int</c> or <c>long</c> property: <c>[Version, Property] public partial int Version { get; }</c>. CREATE dispatches the field as <c>1</c>; UPDATE dispatches <c>UPDATE … CONTENT {{ …, version: n+1 }} WHERE version = $expected</c> and throws <see cref="Disruptor.Surface.Runtime.SurrealVersionConflictException"/> when the guard matches no row (a competing writer bumped the version since load). On success the in-memory value bumps to <c>n+1</c>. Get-only is the recommended shape. At most one per [Table] (CG054).</summary>
+[AttributeUsage(AttributeTargets.Property)]
+public sealed class VersionAttribute : Attribute;
+
 /// <summary>Abstract base for user-defined entity index attributes. Derive directly and apply the resulting parameterless attribute to one or more persisted fields on the same [Table].</summary>
 [AttributeUsage(AttributeTargets.Property, AllowMultiple = true)]
 public abstract class IndexAttribute : Attribute;

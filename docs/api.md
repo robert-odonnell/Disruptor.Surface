@@ -26,6 +26,9 @@ The doc is organised top-down: packages → modeling attributes → what gets em
 | `[Inline]` | with `[Reference]` | Hydrates the referenced record inline with its owner. Without `[Inline]`, only the referenced id is hydrated. |
 | `[Parent]` | partial property | Parent link for aggregate hierarchy. |
 | `[Children]` | partial get-only collection | Reverse lookup over child records. |
+| `[CreatedAt]` | with `[Property]` | Audit column: the emitted `SaveAsync` stamps the field with the save instant on CREATE dispatch only; UPDATE keeps the loaded value. Non-nullable `DateTimeOffset` or `DateTime`; get-only recommended (the library writes the backing field). At most one per table. |
+| `[UpdatedAt]` | with `[Property]` | Audit column: stamped with the save instant on every dispatch — CREATE stamps it to the same instant as `[CreatedAt]`. Same shape rules as `[CreatedAt]`. Instant source is `ISaveContext.UtcNow` (injectable). |
+| `[Version]` | with `[Property]` | Optimistic-concurrency counter: CREATE dispatches `1`; UPDATE dispatches `n+1` guarded by `WHERE version = $expected` and throws `SurrealVersionConflictException` when the guard matches no row; on success the in-memory value bumps to `n+1`. Non-nullable `int` or `long`; get-only recommended. At most one per table. |
 | `IndexAttribute` | base class for user-defined property attributes | Standard entity index marker. Derive a parameterless attribute and apply it to one or more persisted fields. |
 | `UniqueIndexAttribute` | base class for user-defined property attributes | Unique entity index marker. Same grouping rules as `IndexAttribute`, but generated DDL includes `UNIQUE`. |
 | `[Reject]` | with `[Reference]` | Schema-level: SurrealDB blocks deletion of the target while this reference points at it. Default behavior. |
@@ -77,6 +80,32 @@ V1 rules:
 - Composite fields for one index must live in the same partial type declaration so that order is stable.
 - Unique indexes over nullable fields are rejected in this first cut.
 - Schema names are `idx_{table}_{attribute}` or `uq_{table}_{attribute}`, stripping the `Attribute` suffix and snake-casing both parts.
+
+### Audit columns and optimistic concurrency
+
+`[CreatedAt]` / `[UpdatedAt]` / `[Version]` are library-managed value overlays on ordinary scalar `[Property]` fields — the user picks the names; the emitted `SaveAsync` writes the backing fields, so get-only declarations are the natural shape:
+
+```csharp
+[Table]
+public partial class Document
+{
+    [Id] public partial DocumentId Id { get; set; }
+    [Property] public partial string Title { get; set; }
+
+    [CreatedAt, Property] public partial DateTimeOffset CreatedAtUtc { get; }
+    [UpdatedAt, Property] public partial DateTimeOffset UpdatedAtUtc { get; }
+    [Version, Property]   public partial int Version { get; }
+}
+```
+
+Semantics per dispatch of the emitted `SaveAsync`:
+
+- **CREATE** (entity not yet in the DB): created and updated are stamped with the *same* instant (one `ISaveContext.UtcNow` read per dispatch); version dispatches as `1`.
+- **UPDATE**: only updated refreshes — created keeps its loaded value. The whole-entity content dispatches as `UPDATE record:id CONTENT { …, version: n+1 } WHERE version = $expected`. If the guard matches no row, another writer bumped the version since this session loaded: the emitted body throws `SurrealVersionConflictException` (carrying `EntityId` + `ExpectedVersion`) before `MarkSaved`, the session fail-closes, and the caller reloads + retries. Only a confirmed match bumps the in-memory `Version` to `n+1`.
+
+The version guard complements the substrate's `SurrealConflictException` (MVCC, concurrent *in-flight* transactions at COMMIT): `[Version]` covers the human-scale lost-update window where the two writers' transactions never overlap.
+
+Rules (each backed by a diagnostic): must be combined with `[Property]` (CG052 — the field reuses the standard scalar schema/hydrate/save paths, unlike `[Id]` which is a standalone role); audit fields are non-nullable `DateTimeOffset`/`DateTime` and version is non-nullable `int`/`long` (CG053); at most one property per marker per table (CG054); the three markers are mutually exclusive on one property (CG055). `DateTime`-typed audit fields store `UtcDateTime` (Kind=Utc, host-independent). The instant source is `ISaveContext.UtcNow` — a default interface member returning `DateTimeOffset.UtcNow` that test fakes override for deterministic clocks.
 
 ## Generated Entity API
 
@@ -1133,6 +1162,11 @@ public interface ISaveContext
 {
     Disruptor.Surreal.SurrealTransaction Transaction { get; }
 
+    // Instant source for [CreatedAt]/[UpdatedAt] stamping. Default interface member
+    // (DateTimeOffset.UtcNow) — the session's private implementation inherits it;
+    // test fakes override it to pin the clock.
+    DateTimeOffset UtcNow => DateTimeOffset.UtcNow;
+
     // True iff `id` is known to exist in the DB — either loaded from a prior Hydrate
     // (loadedAtStart) or already CREATEd in this Save pass. NOT a check on the
     // in-memory identity map: a freshly-constructed entity that's been bound for Save
@@ -1222,3 +1256,8 @@ The generator emits diagnostics for invalid model shapes. Most are errors (compi
 | `CG049` | `[Table]` on a generic type; the physical table name ignores type arguments (closed constructions would share one table) and the generated accessors can't name an open generic — make the table non-generic. |
 | `CG050` | Element-collection `[Property]` element type is not supported (not a mappable scalar; nullable element; or not constructible from its public mappable properties). |
 | `CG051` | Element-collection `[Property]` declares a setter; element collections are get-only (the generator emits a read-only view plus `Add{Singular}`/`Remove{Singular}`/`Clear{Name}` mutators). |
+| `CG052` | `[CreatedAt]` / `[UpdatedAt]` / `[Version]` without a scalar `[Property]` role on the same member; the markers overlay a persisted scalar column. |
+| `CG053` | `[CreatedAt]` / `[UpdatedAt]` / `[Version]` property has an unsupported type — the audit pair needs a non-nullable `DateTime`/`DateTimeOffset`, version a non-nullable `int`/`long`. |
+| `CG054` | More than one `[CreatedAt]` (or `[UpdatedAt]`, or `[Version]`) property on one table. |
+| `CG055` | One property carries more than one of `[CreatedAt]`/`[UpdatedAt]`/`[Version]`; the markers prescribe contradictory write behaviors for the same field. |
+| `CG056` | Relation-variant payload `[Property]` type has no SurrealDB scalar mapping; the field is omitted from the emitted DDL and from the dispatched edge content (in-memory-only state). Warning — the entity-table equivalent is the CG025 error. |

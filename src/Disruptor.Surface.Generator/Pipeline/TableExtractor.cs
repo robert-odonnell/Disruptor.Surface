@@ -73,7 +73,9 @@ internal static class TableExtractor
         var kinds = ResolvePropertyKinds(attrs);
         var (role, kindFullName) = ResolveRelationRole(attrs);
         var indexes = ResolveIndexAnnotations(attrs, p);
-        if (kinds == PropertyKind.None && role == RelationRole.None && indexes.Count == 0)
+        var autoValue = ResolveAutoValueKinds(attrs);
+        if (kinds == PropertyKind.None && role == RelationRole.None && indexes.Count == 0
+            && autoValue == AutoValueKind.None)
         {
             return null;
         }
@@ -104,7 +106,29 @@ internal static class TableExtractor
             InlineMembers: inlineMembers,
             InlineConstruction: inlineConstruction,
             Indexes: indexes,
-            IsInline: isInline);
+            IsInline: isInline,
+            AutoValue: autoValue);
+    }
+
+    /// <summary>
+    /// Resolves the library-managed value overlays ([CreatedAt] / [UpdatedAt] /
+    /// [Version]) carried by the property. Collected as flags — a property carrying
+    /// more than one is malformed and fails closed with CG055 at validation.
+    /// </summary>
+    private static AutoValueKind ResolveAutoValueKinds(ImmutableArray<AttributeData> attrs)
+    {
+        var kinds = AutoValueKind.None;
+        foreach (var attr in attrs)
+        {
+            kinds |= AttributeFullName(attr) switch
+            {
+                AnnotationsMetadata.CreatedAt => AutoValueKind.CreatedAt,
+                AnnotationsMetadata.UpdatedAt => AutoValueKind.UpdatedAt,
+                AnnotationsMetadata.Version   => AutoValueKind.Version,
+                _ => AutoValueKind.None,
+            };
+        }
+        return kinds;
     }
 
     private static bool HasAttribute(ImmutableArray<AttributeData> attrs, string fullName)

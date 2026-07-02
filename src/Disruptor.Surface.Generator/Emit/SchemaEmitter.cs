@@ -558,6 +558,11 @@ internal static class SchemaEmitter
             var (fieldType, fieldDefault) = MapScalarType(p.Type);
             if (fieldType is null)
             {
+                // Unmapped payload type — flagged as CG056 (warning) at validation; the
+                // save/hydrate emit skips the field too, so it's in-memory-only state.
+                sb.Append("// SCHEMA: payload type '").Append(p.Type.FullyQualifiedName)
+                  .Append("' on ").Append(edgeName).Append('.').Append(p.FieldName)
+                  .AppendLine(" not mapped; field omitted (CG056).");
                 continue;
             }
 

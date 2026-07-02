@@ -341,4 +341,44 @@ internal static class Diagnostics
         category: Category,
         defaultSeverity: DiagnosticSeverity.Error,
         isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor AutoValueRequiresProperty = new(
+        id: "CG052",
+        title: "[CreatedAt]/[UpdatedAt]/[Version] must be combined with [Property]",
+        messageFormat: "'{0}.{1}' carries [{2}] but is not a scalar [Property] field; the marker overlays a persisted scalar column (schema DDL, hydrate and save all reuse the standard [Property] paths) — declare it as '[{2}, Property] public partial {3} {1} {{ get; }}'",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor AutoValueTypeInvalid = new(
+        id: "CG053",
+        title: "[CreatedAt]/[UpdatedAt]/[Version] property has an unsupported type",
+        messageFormat: "[{2}] property '{0}.{1}' must be typed {3}; found '{4}'. The library writes this field itself, so the type is part of the contract.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor AutoValueDuplicatedOnTable = new(
+        id: "CG054",
+        title: "At most one [CreatedAt]/[UpdatedAt]/[Version] property per table",
+        messageFormat: "[Table] '{0}' declares {2} [{1}] properties; at most one is allowed — the emitted SaveAsync writes exactly one field per marker",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor AutoValueMarkersConflict = new(
+        id: "CG055",
+        title: "Property carries more than one of [CreatedAt]/[UpdatedAt]/[Version]",
+        messageFormat: "'{0}.{1}' carries multiple library-managed value markers ({2}); each marker prescribes a different write behavior for the same field (created: stamp-on-CREATE-only, updated: stamp-every-save, version: guarded increment), so they are mutually exclusive — pick one per property",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor VariantPayloadTypeNotMappable = new(
+        id: "CG056",
+        title: "Relation-variant payload [Property] type is not schema-mappable",
+        messageFormat: "[Property] '{0}.{1}' has type '{2}' which is not schema-mappable; the field will be omitted from the emitted DDL and from the dispatched edge content — it becomes in-memory-only state that never round-trips. Map the type to one of: string, int/long, bool, float/double, decimal, DateTime/DateTimeOffset, Guid, Ulid to persist it.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Warning,
+        isEnabledByDefault: true);
 }

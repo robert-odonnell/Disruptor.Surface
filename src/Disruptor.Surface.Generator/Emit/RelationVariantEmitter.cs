@@ -546,8 +546,15 @@ internal static class RelationVariantEmitter
             EmitHydrateEndpoint(writer, variant.Out!, fieldName: "out", typedIdNamespaces, unionLookup, tablesByFullName);
 
             // [Property] payload members: same scalar-read shape as PartialEmitter.
+            // Unmapped payload types (CG056) are never persisted, so there's nothing
+            // to read back — skip them (mirrors the SaveAsync-side content omission).
             foreach (var p in variant.PayloadProperties)
             {
+                if (!SchemaEmitter.IsMappableScalar(p.Type))
+                {
+                    continue;
+                }
+
                 EmitHydratePayload(writer, p);
             }
         }
@@ -812,7 +819,14 @@ internal static class RelationVariantEmitter
         IReadOnlyDictionary<string, UnionEndpointModel> unionLookup)
     {
         var edgeName = SurrealNaming.ToEdgeName(forward.Name);
-        var hasPayload = variant.PayloadProperties.Count > 0;
+        // Unmapped payload types (CG056 warning) are in-memory-only: they get a plain
+        // backing property but never touch the wire — ContentValue.Set has no overload
+        // for them, so emitting the call was a raw CS1503 in the .g.cs. Skipping them
+        // here matches SchemaEmitter's DDL omission and EmitHydrate's read-side skip.
+        var persistedPayload = variant.PayloadProperties
+            .Where(p => SchemaEmitter.IsMappableScalar(p.Type))
+            .ToList();
+        var hasPayload = persistedPayload.Count > 0;
 
         using (writer.Block($"async global::System.Threading.Tasks.Task {Namespaces.EntityInterface}.SaveAsync(global::Disruptor.Surface.Runtime.ISaveContext ctx, global::System.Threading.CancellationToken ct)"))
         {
@@ -859,7 +873,7 @@ internal static class RelationVariantEmitter
             // Per-payload field: same ContentValue.Set helper as the typed-CBOR scalar path
             // on entity SaveAsync. Nullable values are omitted when null so the schema
             // DEFAULT applies.
-            foreach (var p in variant.PayloadProperties)
+            foreach (var p in persistedPayload)
             {
                 var backing = $"_{ToCamel(p.Name)}";
                 var fieldLit = Quote(p.FieldName);
@@ -880,7 +894,7 @@ internal static class RelationVariantEmitter
             // payloads).
             if (hasPayload)
             {
-                foreach (var p in variant.PayloadProperties)
+                foreach (var p in persistedPayload)
                 {
                     var backing = $"_{ToCamel(p.Name)}";
                     var bindLit = Quote($"_p_{p.FieldName}");
@@ -893,7 +907,7 @@ internal static class RelationVariantEmitter
             // (validated by SurrealNaming.ToFieldName). Both are safe to inline in SurrealQL.
             if (hasPayload)
             {
-                var updateClause = string.Join(", ", variant.PayloadProperties.Select(p => $"{p.FieldName} = $_p_{p.FieldName}"));
+                var updateClause = string.Join(", ", persistedPayload.Select(p => $"{p.FieldName} = $_p_{p.FieldName}"));
                 writer.Line($"const string __sql = \"INSERT RELATION INTO {edgeName} $_content ON DUPLICATE KEY UPDATE {updateClause};\";");
             }
             else
