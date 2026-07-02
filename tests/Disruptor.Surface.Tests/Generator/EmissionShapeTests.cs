@@ -183,6 +183,115 @@ public sealed class EmissionShapeTests
     }
 
     [Fact]
+    public void PrimitiveElementCollection_EmitsArraySchema_And_CompilableRoundTrip()
+    {
+        // `IReadOnlyList<string>` used to walk string's members and emit
+        // `new string(this[]: …, Length: …)` (CS0443); `List<int>` fell to the scalar
+        // save path with no matching ContentValue.Set overload (CS1503). Primitive
+        // element collections are now first-class: array<T> schema, list-typed
+        // ContentValue.Set on save, HydrationValue list read on hydrate.
+        var src = """
+            using Disruptor.Surface.Annotations;
+            using System.Collections.Generic;
+            namespace M;
+
+            [Table] public partial class Root {
+                [Id] public partial RootId Id { get; set; }
+                [Property] public partial IReadOnlyList<string> Tags { get; }
+                [Property] public partial List<int> Weights { get; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (result, _, _, compileDiags) = GeneratorHarness.Run(src);
+        Assert.Empty(compileDiags);
+
+        var schema = GeneratorHarness.FindGeneratedFile(result, "Schema.g.cs");
+        Assert.NotNull(schema);
+        var schemaSrc = schema!.ToString();
+        Assert.Contains("DEFINE FIELD IF NOT EXISTS tags ON roots TYPE array<string> DEFAULT [];", schemaSrc);
+        Assert.Contains("DEFINE FIELD IF NOT EXISTS weights ON roots TYPE array<int> DEFAULT [];", schemaSrc);
+
+        var rootFile = GeneratorHarness.FindGeneratedFile(result, "M.Root.g.cs");
+        Assert.NotNull(rootFile);
+        var rootSrc = rootFile!.ToString();
+        // Save: list overloads of ContentValue.Set take the backing List<T> directly.
+        Assert.Contains("global::Disruptor.Surface.Runtime.ContentValue.Set(__content, \"tags\", _tags);", rootSrc);
+        // Hydrate: typed list read + repopulate of the readonly backing list.
+        Assert.Contains("HydrationValue.ReadOrDefault<global::System.Collections.Generic.List<string>>(__obj, \"tags\")", rootSrc);
+        Assert.Contains("_weights.AddRange(", rootSrc);
+    }
+
+    [Fact]
+    public void PocoElementCollection_HydratesViaObjectInitializer()
+    {
+        // A parameterless-ctor POCO with settable mappable properties has no positional
+        // constructor to name — hydrate uses an object initializer instead (previously
+        // the ctor named-argument form produced CS1739 for this shape).
+        var src = """
+            using Disruptor.Surface.Annotations;
+            using System.Collections.Generic;
+            namespace M;
+
+            public sealed class Step {
+                public string Label { get; set; } = "";
+                public int Order { get; set; }
+            }
+
+            [Table] public partial class Root {
+                [Id] public partial RootId Id { get; set; }
+                [Property] public partial IReadOnlyList<Step> Steps { get; }
+            }
+            """;
+
+        var (result, _, runDiags, compileDiags) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id == "CG050");
+        Assert.Empty(compileDiags);
+
+        var rootFile = GeneratorHarness.FindGeneratedFile(result, "M.Root.g.cs");
+        Assert.NotNull(rootFile);
+        var rootSrc = rootFile!.ToString();
+        Assert.Contains("Label = global::Disruptor.Surface.Runtime.HydrationValue.ReadString(", rootSrc);
+        Assert.Contains("Order = global::Disruptor.Surface.Runtime.HydrationValue.ReadOrDefault<int>(", rootSrc);
+    }
+
+    [Fact]
+    public void RecordElementCollection_IgnoresComputedUnmappableMembers()
+    {
+        // A get-only computed member of an unmappable type is derived state — it is
+        // excluded from persistence rather than failing the element type.
+        var src = """
+            using Disruptor.Surface.Annotations;
+            using System;
+            using System.Collections.Generic;
+            namespace M;
+
+            public sealed record Scenario(string Kind, string Description)
+            {
+                public TimeSpan Budget => TimeSpan.Zero;
+            }
+
+            [Table] public partial class Root {
+                [Id] public partial RootId Id { get; set; }
+                [Property] public partial IReadOnlyList<Scenario> Scenarios { get; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var (result, _, runDiags, compileDiags) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id == "CG050");
+        Assert.Empty(compileDiags);
+
+        var schema = GeneratorHarness.FindGeneratedFile(result, "Schema.g.cs");
+        Assert.NotNull(schema);
+        var schemaSrc = schema!.ToString();
+        Assert.Contains("scenarios.*.kind", schemaSrc);
+        Assert.DoesNotContain("scenarios.*.budget", schemaSrc);
+    }
+
+    [Fact]
     public void Loader_EmitsEdgeSubselect_ForMultiSourceRelationKind()
     {
         // Bug regression: BuildEdgeWhere previously delegated to a FindSingleSourceTable

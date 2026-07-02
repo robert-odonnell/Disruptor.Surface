@@ -123,6 +123,66 @@ public static class ContentValue
                 obj[key] = new SurrealRecordIdValue(v.ToSdk());
             }
         }
+
+        // ── Primitive-element collections ─────────────────────────────────────────
+        //
+        // The generator's element-collection [Property] save path calls the same
+        // `ContentValue.Set(__content, field, _backing)` shape it uses for scalars;
+        // these overloads catch the List<T> backing fields (via IReadOnlyList<T>) and
+        // wrap them as SurrealListValue with the same per-scalar conversions as the
+        // scalar Set overloads (DateTime → deterministic instant, Guid → "D" string,
+        // Ulid → Crockford base32 string). The list itself is always written (an empty
+        // collection round-trips as [], matching the schema's `array<T> DEFAULT []`).
+        // Null string elements are skipped — the generator only admits non-nullable
+        // element types (CG050), so a null element is already a nullability violation
+        // and skipping mirrors how nullable scalar Sets omit null values.
+
+        public void Set(string key, IReadOnlyList<string> values)
+        {
+            var list = new SurrealList(values.Count);
+            foreach (var v in values)
+            {
+                if (v is not null)
+                {
+                    list.Add(v);
+                }
+            }
+
+            obj[key] = new SurrealListValue(list);
+        }
+
+        public void Set(string key, IReadOnlyList<bool> values) => obj[key] = ToListValue(values, static v => v);
+
+        public void Set(string key, IReadOnlyList<int> values) => obj[key] = ToListValue(values, static v => v);
+
+        public void Set(string key, IReadOnlyList<long> values) => obj[key] = ToListValue(values, static v => v);
+
+        public void Set(string key, IReadOnlyList<float> values) => obj[key] = ToListValue(values, static v => (double)v);
+
+        public void Set(string key, IReadOnlyList<double> values) => obj[key] = ToListValue(values, static v => v);
+
+        public void Set(string key, IReadOnlyList<decimal> values) => obj[key] = ToListValue(values, static v => v);
+
+        public void Set(string key, IReadOnlyList<DateTime> values) => obj[key] = ToListValue(values, static v => ToInstant(v));
+
+        public void Set(string key, IReadOnlyList<DateTimeOffset> values) => obj[key] = ToListValue(values, static v => v);
+
+        /// <summary>Guid elements serialise as canonical 36-char "D" strings — same rationale as the scalar overload.</summary>
+        public void Set(string key, IReadOnlyList<Guid> values) => obj[key] = ToListValue(values, static v => v.ToString("D"));
+
+        /// <summary>Ulid elements serialise as 26-char Crockford base32 strings — same rationale as the scalar overload.</summary>
+        public void Set(string key, IReadOnlyList<Ulid> values) => obj[key] = ToListValue(values, static v => v.ToString());
+    }
+
+    private static SurrealListValue ToListValue<T>(IReadOnlyList<T> values, Func<T, SurrealValue> convert)
+    {
+        var list = new SurrealList(values.Count);
+        foreach (var v in values)
+        {
+            list.Add(convert(v));
+        }
+
+        return new SurrealListValue(list);
     }
 
     /// <summary>

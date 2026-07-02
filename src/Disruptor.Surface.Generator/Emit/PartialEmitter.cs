@@ -1002,9 +1002,18 @@ internal static class PartialEmitter
             {
                 if (p.Kinds.HasFlag(PropertyKind.Property))
                 {
-                    if (IsElementCollection(p.Type) && p.InlineMembers.Count > 0)
+                    if (IsElementCollection(p.Type))
                     {
-                        EmitHydrateElementCollection(writer, p);
+                        // Element collections repopulate the generated readonly backing
+                        // list (Clear + Add) — assigning it like a scalar would be CS0191.
+                        if (p.InlineMembers.Count > 0)
+                        {
+                            EmitHydrateElementCollection(writer, p);
+                        }
+                        else
+                        {
+                            EmitHydratePrimitiveElementCollection(writer, p);
+                        }
                     }
                     else
                     {
@@ -1061,13 +1070,13 @@ internal static class PartialEmitter
     }
 
     /// <summary>
-    /// Hydrates an element-collection [Property] of records (the
+    /// Hydrates an element-collection [Property] of records / POCOs (the
     /// <c>IReadOnlyList&lt;Scenario&gt;</c> shape): clears the backing list, walks the
-    /// SurrealListValue elements, constructs each <c>T</c> via its primary constructor
-    /// using the public scalar properties discovered at codegen time. Pure typed code,
-    /// no reflection. Primitive-element collections take the
-    /// <see cref="EmitHydrateValueProperty"/> path instead (HydrationValue's typed
-    /// converter handles primitive element types).
+    /// SurrealListValue elements, constructs each <c>T</c> per the construction shape
+    /// resolved at extraction time — named constructor arguments for the
+    /// positional-record shape, an object initializer for the parameterless-ctor POCO
+    /// shape. Pure typed code, no reflection. Primitive-element collections take
+    /// <see cref="EmitHydratePrimitiveElementCollection"/> instead.
     /// </summary>
     private static void EmitHydrateElementCollection(CodeWriter writer, PropertyModel p)
     {
@@ -1083,6 +1092,7 @@ internal static class PartialEmitter
         var arrLocal = $"__sl_{ToCamel(p.Name)}";
         var elemLocal = $"__el_{ToCamel(p.Name)}";
         var elemObjLocal = $"__eo_{ToCamel(p.Name)}";
+        var objectInit = p.InlineConstruction == InlineConstructionKind.ObjectInitializer;
 
         using (writer.Block($"if (__obj.Object.TryGetValue({fieldLit}, out var {arrLocal}) && {arrLocal} is global::Disruptor.Surreal.Values.SurrealListValue {arrLocal}Cast)"))
         {
@@ -1090,7 +1100,14 @@ internal static class PartialEmitter
             using (writer.Block($"foreach (var {elemLocal} in {arrLocal}Cast.List)"))
             {
                 writer.Line($"if ({elemLocal} is not global::Disruptor.Surreal.Values.SurrealObjectValue {elemObjLocal}) continue;");
-                writer.Line($"{backing}.Add(new {elementType}(");
+                writer.Line(objectInit
+                    ? $"{backing}.Add(new {elementType}"
+                    : $"{backing}.Add(new {elementType}(");
+                if (objectInit)
+                {
+                    writer.Line("{");
+                }
+
                 using (writer.Indent())
                 {
                     for (var i = 0; i < p.InlineMembers.Count; i++)
@@ -1100,22 +1117,53 @@ internal static class PartialEmitter
                         var typeFqn = im.Type.FullyQualifiedName;
                         // String fast-path mirrors EmitHydrateValueProperty's optimisation:
                         // only non-nullable strings use the empty-string fallback.
-                        var trailing = i == p.InlineMembers.Count - 1 ? "" : ",";
+                        var trailing = !objectInit && i == p.InlineMembers.Count - 1 ? "" : ",";
+                        var assign = objectInit ? $"{im.Name} = " : $"{im.Name}: ";
                         var nullable = im.Type.IsNullable;
                         var isString = typeFqn is "string" or "global::System.String" or "string?" or "global::System.String?";
                         if (!nullable && isString)
                         {
-                            writer.Line($"{im.Name}: global::Disruptor.Surface.Runtime.HydrationValue.ReadString({elemObjLocal}, {subLit}){trailing}");
+                            writer.Line($"{assign}global::Disruptor.Surface.Runtime.HydrationValue.ReadString({elemObjLocal}, {subLit}){trailing}");
                         }
                         else
                         {
                             var deserialiseAs = nullable && !isString ? typeFqn : StripNullable(typeFqn);
-                            writer.Line($"{im.Name}: global::Disruptor.Surface.Runtime.HydrationValue.ReadOrDefault<{deserialiseAs}>({elemObjLocal}, {subLit}){trailing}");
+                            writer.Line($"{assign}global::Disruptor.Surface.Runtime.HydrationValue.ReadOrDefault<{deserialiseAs}>({elemObjLocal}, {subLit}){trailing}");
                         }
                     }
                 }
 
-                writer.Line("));");
+                writer.Line(objectInit ? "});" : "));");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Hydrates a primitive-element collection [Property] (<c>IReadOnlyList&lt;string&gt;</c>,
+    /// <c>List&lt;int&gt;</c>, …): reads the row's array through
+    /// <see cref="Disruptor.Surface.Runtime.HydrationValue"/>'s typed list conversion,
+    /// then repopulates the generated readonly backing list (Clear + AddRange) — the
+    /// scalar assignment path would be CS0191 against the readonly field.
+    /// </summary>
+    private static void EmitHydratePrimitiveElementCollection(CodeWriter writer, PropertyModel p)
+    {
+        var backing = $"_{ToCamel(p.Name)}";
+        var fieldLit = Quote(SurrealNaming.ToFieldName(p.Name));
+        if (p.Type.TypeArguments.Count == 0)
+        {
+            writer.Line($"throw new global::System.NotSupportedException(\"Hydrate: collection element type for property '{p.Name}' could not be resolved at codegen time.\");");
+            return;
+        }
+
+        var elementType = StripNullable(p.Type.TypeArguments[0].FullyQualifiedName);
+        var valsLocal = $"__vals_{ToCamel(p.Name)}";
+        using (writer.BracedBlock())
+        {
+            writer.Line($"var {valsLocal} = global::Disruptor.Surface.Runtime.HydrationValue.ReadOrDefault<global::System.Collections.Generic.List<{elementType}>>(__obj, {fieldLit});");
+            using (writer.Block($"if ({valsLocal} is not null)"))
+            {
+                writer.Line($"{backing}.Clear();");
+                writer.Line($"{backing}.AddRange({valsLocal});");
             }
         }
     }

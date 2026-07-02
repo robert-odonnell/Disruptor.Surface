@@ -935,6 +935,120 @@ public sealed class DiagnosticsTests
     }
 
     [Fact]
+    public void CG050_ElementCollectionOfUnmappableElement_IsRejected()
+    {
+        // List<Uri> used to fall to the scalar save path (no ContentValue.Set overload
+        // → CS1503 in the .g.cs) with no diagnostic. CG050 rejects at the model boundary.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using System;
+            using System.Collections.Generic;
+            namespace M;
+
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Property] public partial IReadOnlyList<Uri> Links { get; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG050");
+        Assert.NotNull(diag);
+        Assert.Contains("M.Bad", diag!.GetMessage());
+        Assert.Contains("Links", diag.GetMessage());
+        Assert.Contains("Uri", diag.GetMessage());
+    }
+
+    [Fact]
+    public void CG050_NullableElementCollection_IsRejected()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using System.Collections.Generic;
+            namespace M;
+
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Property] public partial IReadOnlyList<int?> Counts { get; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG050");
+        Assert.NotNull(diag);
+        Assert.Contains("nullable element types", diag!.GetMessage());
+    }
+
+    [Fact]
+    public void CG050_UnconstructibleElementType_IsRejected()
+    {
+        // The element type has a writable member the schema can't persist (Uri) —
+        // saving would silently drop data on round-trip, so extraction refuses to
+        // resolve inline members and CG050 fires (previously: broken construction
+        // code in the .g.cs).
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using System;
+            using System.Collections.Generic;
+            namespace M;
+
+            public sealed class Attachment {
+                public string Name { get; set; } = "";
+                public Uri? Target { get; set; }
+            }
+
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Property] public partial IReadOnlyList<Attachment> Attachments { get; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG050");
+    }
+
+    [Fact]
+    public void CG050_DoesNotFire_OnSupportedElementShapes()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using System.Collections.Generic;
+            namespace M;
+
+            public sealed record Scenario(string Kind, string Description);
+
+            [Table] public partial class Holder {
+                [Id] public partial HolderId Id { get; set; }
+                [Property] public partial IReadOnlyList<Scenario> Scenarios { get; }
+                [Property] public partial IReadOnlyList<string> Tags { get; }
+                [Property] public partial List<int> Weights { get; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id is "CG050" or "CG051");
+    }
+
+    [Fact]
+    public void CG051_ElementCollectionWithSetter_IsRejected()
+    {
+        // The emitted impl is a getter-only view over a generated backing list, so a
+        // user-declared setter used to surface as a bare CS9252 in the .g.cs.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using System.Collections.Generic;
+            namespace M;
+
+            [Table] public partial class Bad {
+                [Id] public partial BadId Id { get; set; }
+                [Property] public partial IReadOnlyList<string> Tags { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG051");
+        Assert.NotNull(diag);
+        Assert.Contains("M.Bad", diag!.GetMessage());
+        Assert.Contains("Tags", diag.GetMessage());
+        Assert.Contains("AddTag", diag.GetMessage());
+    }
+
+    [Fact]
     public void CG048_DoesNotFire_OnClassDeclarations()
     {
         const string src = """

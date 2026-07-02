@@ -84,6 +84,7 @@ internal static class TableExtractor
         // (delete behavior on [Parent]) can fire.
         var (deletePolicy, hasExplicit, hasMultiple) = ResolveReferenceDelete(attrs);
         var isInline = HasAttribute(attrs, AnnotationsMetadata.Inline);
+        var (inlineMembers, inlineConstruction) = ResolveInlineMembers(p.Type);
 
         return new PropertyModel(
             Name: p.Name,
@@ -100,7 +101,8 @@ internal static class TableExtractor
             IsPartial: PartialDeclaration.IsMember(p),
             IsStatic: p.IsStatic,
             DeclaredAccessibility: p.DeclaredAccessibility.ToString(),
-            InlineMembers: ResolveInlineMembers(p.Type),
+            InlineMembers: inlineMembers,
+            InlineConstruction: inlineConstruction,
             Indexes: indexes,
             IsInline: isInline);
     }
@@ -119,18 +121,35 @@ internal static class TableExtractor
 
     /// <summary>
     /// For an inline-element collection property (<c>IReadOnlyList&lt;T&gt;</c> /
-    /// <c>IList&lt;T&gt;</c> / <c>List&lt;T&gt;</c>) where <c>T</c> is a record / POCO with
-    /// public instance properties, walks <c>T</c>'s members so the schema emitter can
-    /// produce <c>scenarios.*.kind</c>-style sub-field DDL and <see cref="PartialEmitter"/>
-    /// can emit typed Hydrate / Save bodies. Returns empty for primitive-element
-    /// collections (<c>IReadOnlyList&lt;int&gt;</c>) and anything that isn't a
-    /// supported collection shape.
+    /// <c>IList&lt;T&gt;</c> / <c>List&lt;T&gt;</c>) where <c>T</c> is a record / POCO,
+    /// resolves the persistable members of <c>T</c> plus the construction shape the
+    /// generated Hydrate body uses to rebuild elements, so the schema emitter can produce
+    /// <c>scenarios.*.kind</c>-style sub-field DDL and <see cref="Emit.PartialEmitter"/>
+    /// can emit typed Hydrate / Save bodies.
+    /// <para>
+    /// Persistable members are public, instance, non-indexer, readable properties with a
+    /// SurrealDB-mappable scalar type (this excludes <c>string</c>'s <c>Length</c>-style
+    /// helpers only via the primitive short-circuit below; on element records it excludes
+    /// indexers and lets get-only computed members of unmappable types pass as ignored).
+    /// The member set must then be constructible: either a public constructor matches it
+    /// positionally (name + type per parameter — the positional-record shape), or the
+    /// type has a public parameterless constructor and every member is settable (POCO
+    /// shape). Anything else returns empty/<see cref="InlineConstructionKind.None"/> and
+    /// is rejected with CG050 at validation — previously the naive member walk emitted
+    /// un-compilable construction code (CS0443/CS1739/CS1503 in the <c>.g.cs</c>).
+    /// </para>
+    /// <para>
+    /// Primitive/scalar element types (<c>IReadOnlyList&lt;string&gt;</c>,
+    /// <c>List&lt;int&gt;</c>, …) return empty with <see cref="InlineConstructionKind.None"/>:
+    /// they take the direct <c>array&lt;T&gt;</c> schema/save/hydrate path instead of the
+    /// per-member inline expansion.
+    /// </para>
     /// </summary>
-    private static EquatableArray<InlineMember> ResolveInlineMembers(ITypeSymbol type)
+    private static (EquatableArray<InlineMember> Members, InlineConstructionKind Construction) ResolveInlineMembers(ITypeSymbol type)
     {
         if (type is not INamedTypeSymbol { Arity: 1 } named)
         {
-            return [];
+            return ([], InlineConstructionKind.None);
         }
 
         var def = named.ConstructedFrom;
@@ -138,11 +157,24 @@ internal static class TableExtractor
         var isCollection = ns == "System.Collections.Generic" && def.Name is "IReadOnlyList" or "IList" or "List";
         if (!isCollection)
         {
-            return [];
+            return ([], InlineConstructionKind.None);
         }
 
         var element = named.TypeArguments[0];
-        var members = new List<InlineMember>();
+
+        // Primitive-element collections take the array<T> direct path — walking string's
+        // members here used to produce `new string(this[]: …, Length: …)` (CS0443).
+        if (Emit.SchemaEmitter.IsMappableScalar(TypeRefBuilder.Build(element)))
+        {
+            return ([], InlineConstructionKind.None);
+        }
+
+        if (element is not INamedTypeSymbol elementNamed)
+        {
+            return ([], InlineConstructionKind.None);
+        }
+
+        var members = new List<IPropertySymbol>();
         foreach (var member in element.GetMembers())
         {
             // Public instance properties only — covers both classic class properties
@@ -152,24 +184,85 @@ internal static class TableExtractor
                 continue;
             }
 
-            if (prop.DeclaredAccessibility != Accessibility.Public)
-            {
-                continue;
-            }
-
-            if (prop.IsStatic)
+            if (prop.IsIndexer || prop.IsStatic || prop.DeclaredAccessibility != Accessibility.Public)
             {
                 continue;
             }
 
             if (prop.GetMethod is null)
             {
+                // Set-only property — can't be read at save time, so the element type
+                // can't round-trip. Fail closed (CG050 fires at validation).
+                return ([], InlineConstructionKind.None);
+            }
+
+            if (!Emit.SchemaEmitter.IsMappableScalar(TypeRefBuilder.Build(prop.Type)))
+            {
+                if (prop.SetMethod is not null)
+                {
+                    // A writable member we can't persist — saving would silently drop
+                    // data on round-trip. Fail closed (CG050).
+                    return ([], InlineConstructionKind.None);
+                }
+
+                // Get-only computed member of an unmappable type (e.g. `Uri Link =>`)
+                // — safely ignorable; it's derived, not stored.
                 continue;
             }
 
-            members.Add(new InlineMember(prop.Name, TypeRefBuilder.Build(prop.Type)));
+            members.Add(prop);
         }
-        return members.ToEquatableArray();
+
+        if (members.Count == 0)
+        {
+            return ([], InlineConstructionKind.None);
+        }
+
+        // Constructibility. Preferred shape: a public constructor whose parameters match
+        // the member set positionally by (name, type) — what a positional record gives us.
+        foreach (var ctor in elementNamed.InstanceConstructors)
+        {
+            if (ctor.DeclaredAccessibility != Accessibility.Public || ctor.Parameters.Length != members.Count)
+            {
+                continue;
+            }
+
+            var ordered = new List<InlineMember>(members.Count);
+            var allMatched = true;
+            foreach (var param in ctor.Parameters)
+            {
+                var match = members.Find(m =>
+                    string.Equals(m.Name, param.Name, StringComparison.Ordinal)
+                    && SymbolEqualityComparer.Default.Equals(m.Type, param.Type));
+                if (match is null)
+                {
+                    allMatched = false;
+                    break;
+                }
+
+                ordered.Add(new InlineMember(match.Name, TypeRefBuilder.Build(match.Type)));
+            }
+
+            if (allMatched)
+            {
+                return (ordered.ToEquatableArray(), InlineConstructionKind.PositionalConstructor);
+            }
+        }
+
+        // Fallback shape: parameterless public constructor + every member settable
+        // (set or init) — hydrate uses an object initializer.
+        var hasParameterlessCtor = elementNamed.InstanceConstructors.Any(c =>
+            c.DeclaredAccessibility == Accessibility.Public && c.Parameters.Length == 0);
+        if (hasParameterlessCtor
+            && members.All(m => m.SetMethod is { DeclaredAccessibility: Accessibility.Public }))
+        {
+            var declared = members
+                .Select(m => new InlineMember(m.Name, TypeRefBuilder.Build(m.Type)))
+                .ToEquatableArray();
+            return (declared, InlineConstructionKind.ObjectInitializer);
+        }
+
+        return ([], InlineConstructionKind.None);
     }
 
     private static (ReferenceDeletePolicy Policy, bool HasExplicit, bool HasMultiple) ResolveReferenceDelete(ImmutableArray<AttributeData> attrs)

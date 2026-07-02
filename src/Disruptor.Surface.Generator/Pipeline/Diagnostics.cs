@@ -325,4 +325,20 @@ internal static class Diagnostics
         category: Category,
         defaultSeverity: DiagnosticSeverity.Error,
         isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ElementCollectionElementNotSupported = new(
+        id: "CG050",
+        title: "Element-collection [Property] element type is not supported",
+        messageFormat: "Element-collection [Property] '{0}.{1}' has element type '{2}' which is not supported: {3}",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ElementCollectionMustBeGetOnly = new(
+        id: "CG051",
+        title: "Element-collection [Property] must be get-only",
+        messageFormat: "Element-collection [Property] '{0}.{1}' declares a setter; element collections are get-only — the generator emits a read-only view over a generated backing list plus Add{2}(...)/Remove{2}(...)/Clear{1}() mutators, so a user-declared setter has no generated implementation to pair with (it would surface as CS9252 in the .g.cs). Remove the setter and mutate through the generated helpers.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
 }

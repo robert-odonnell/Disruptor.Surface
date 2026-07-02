@@ -30,6 +30,8 @@ namespace Disruptor.Surface.Generator.Emit;
 ///   <item>Inline-element collection <c>[Property]</c> (<c>IReadOnlyList&lt;T&gt;</c> /
 ///         <c>IList&lt;T&gt;</c> / <c>List&lt;T&gt;</c> of records) → <c>TYPE array&lt;object&gt;
 ///         DEFAULT []</c> plus per-member <c>field.*.member</c> sub-field DDL.</item>
+///   <item>Primitive-element collection <c>[Property]</c> (<c>IReadOnlyList&lt;string&gt;</c>,
+///         <c>List&lt;int&gt;</c>, …) → <c>TYPE array&lt;{scalar}&gt; DEFAULT []</c>.</item>
 ///   <item><c>[Reference]</c> → <c>TYPE record&lt;target&gt;</c> (or <c>option&lt;record&lt;…&gt;&gt;</c> when nullable),
 ///         plus <c>REFERENCE ON DELETE {behavior}</c> matching the <c>[Reject]</c>/<c>[Unset]</c>/
 ///         <c>[Cascade]</c>/<c>[Ignore]</c> attribute.</item>
@@ -394,6 +396,21 @@ internal static class SchemaEmitter
                 sb.AppendLine(";");
             }
             return;
+        }
+
+        // Primitive-element collection — array<T> with the element's scalar mapping.
+        // Unsupported element shapes fall through to the "not mapped" comment below;
+        // CG050 has already failed the build for those.
+        if (IsElementCollection(p.Type) && p.Type.TypeArguments.Count == 1)
+        {
+            var element = p.Type.TypeArguments[0];
+            if (!element.IsNullable && MapScalarType(element).Type is { } elementType)
+            {
+                sb.Append("DEFINE FIELD IF NOT EXISTS ").Append(fieldName)
+                  .Append(" ON ").Append(tableName)
+                  .Append(" TYPE array<").Append(elementType).AppendLine("> DEFAULT [];");
+                return;
+            }
         }
 
         var (surrealType, defaultExpr) = MapScalarType(p.Type);
