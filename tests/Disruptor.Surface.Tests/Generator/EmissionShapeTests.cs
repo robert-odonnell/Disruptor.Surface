@@ -1473,9 +1473,11 @@ public sealed class EmissionShapeTests
             [CompositionRoot] public partial class Workspace { }
             """;
 
-        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
 
-        Assert.Contains(runDiags, d => d.Id == "CG029");
+        // Reported from the located-diagnostics path (ModelValidation.Validate) since
+        // 2026-07-02 — points at the variant class declaration, not Location.None.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG029"), src, "public class EpicRestriction");
     }
 
     [Fact]
@@ -1493,7 +1495,17 @@ public sealed class EmissionShapeTests
         Assert.Contains("global::Disruptor.Surface.Runtime.IEntity", src);
         // Per-kind id type — RestrictsId, not EpicRestrictionId.
         Assert.Contains("private global::M.RestrictsId? _id;", src);
-        Assert.Contains("global::M.RestrictsId.New()", src);
+        // Deterministic edge ids (2026-07-02): the lazy mint goes through __MintId,
+        // which derives the id from (in, edge, out) via RecordId.ForEdge when both
+        // endpoints are resolvable — so the id the session holds matches the row the
+        // UNIQUE(in,out) duplicate path updates. Random New() remains only as the
+        // unset-endpoint fallback (the save path still fails before dispatch then).
+        Assert.Contains("_id ??= __MintId();", src);
+        Assert.Contains("global::Disruptor.Surface.Runtime.RecordId.ForEdge(\"restricts\", __inId, __outId).Value", src);
+        Assert.Contains(": global::M.RestrictsId.New();", src);
+        // Entity-typed endpoints try-resolve via the cached id backing field, falling
+        // back to the entity ref's Id — never throwing (unset endpoints yield null).
+        Assert.Contains("var __in = _sourceId ?? (_source is { } __v_source ? ((global::Disruptor.Surface.Runtime.IEntity)__v_source).Id : (global::Disruptor.Surface.Runtime.RecordId?)null);", src);
     }
 
     [Fact]
@@ -2088,9 +2100,11 @@ public sealed class EmissionShapeTests
             [CompositionRoot] public partial class Workspace { }
             """;
 
-        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
 
-        Assert.Contains(runDiags, d => d.Id == "CG030");
+        // Reported from the located-diagnostics path since 2026-07-02 — points at the
+        // first colliding variant's declaration; the message names every participant.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG030"), src, "public partial class FirstVariant");
         // Dispatcher is suppressed when the collision fires.
         Assert.Null(GeneratorHarness.FindGeneratedFile(result, "RestrictsHydration.g.cs"));
     }
@@ -2245,8 +2259,11 @@ public sealed class EmissionShapeTests
             [CompositionRoot] public partial class Workspace { }
             """;
 
-        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
-        Assert.Contains(runDiags, d => d.Id == "CG031");
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
+
+        // Reported from the located-diagnostics path since 2026-07-02 — resolves to
+        // the mismatched endpoint property via the member-location map.
+        AssertLocationAt(runDiags.First(d => d.Id == "CG031"), src, "[Out] public partial IForRestricts Target");
     }
 
     // ─── shared-shape relation interface (preview.55): user-declared interface +
@@ -2868,5 +2885,37 @@ public sealed class EmissionShapeTests
 
         var (_, _, runDiags, _) = GeneratorHarness.Run(src);
         Assert.Contains(runDiags, d => d.Id == "CG032");
+    }
+
+    // ─────────────────────────── location assertion helpers ─────────────────────
+    //
+    // Mirrors DiagnosticsTests: fixtures compiled under FixturePath so the reported
+    // path is observable; line assertions anchor to a unique snippet of the fixture
+    // source rather than hard-coded numbers.
+
+    private const string FixturePath = "Fixture.cs";
+
+    private static void AssertLocationAt(Diagnostic diagnostic, string src, string snippet)
+    {
+        var lineSpan = diagnostic.Location.GetLineSpan();
+        Assert.Equal(FixturePath, lineSpan.Path);
+        Assert.Equal(LineOf(src, snippet), lineSpan.StartLinePosition.Line);
+    }
+
+    /// <summary>Zero-based line index of the first line containing <paramref name="snippet"/>.</summary>
+    private static int LineOf(string src, string snippet)
+    {
+        var index = src.IndexOf(snippet, StringComparison.Ordinal);
+        Assert.True(index >= 0, $"Snippet not found in fixture: {snippet}");
+        var line = 0;
+        for (var i = 0; i < index; i++)
+        {
+            if (src[i] == '\n')
+            {
+                line++;
+            }
+        }
+
+        return line;
     }
 }

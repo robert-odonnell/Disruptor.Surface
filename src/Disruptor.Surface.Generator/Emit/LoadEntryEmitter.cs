@@ -11,10 +11,11 @@ namespace Disruptor.Surface.Generator.Emit;
 /// to the same <c>{Root}AggregateLoader.PopulateAsync</c> the legacy path uses, so a
 /// caller can switch between the two without behavioural drift.
 /// <para>
-/// Filtered loads (queries with <c>Include*</c> calls present) throw
-/// <see cref="NotImplementedException"/> — the compiler-driven traversal-into-session
-/// pipeline lands in PR6. Until then, traversal results flow only through
-/// <c>Query&lt;T&gt;.ExecuteAsync</c>.
+/// Filtered loads (queries with <c>Include*</c> calls present) are supported: they
+/// route through <c>Query&lt;T&gt;.ExecuteIntoSessionAsync</c>, which compiles the
+/// include tree and tracks the hydrated rows into the fresh session. Unfiltered
+/// pinned-id loads take the aggregate-loader fast path
+/// (<c>{Root}AggregateLoader.PopulateAsync</c>).
 /// </para>
 /// <para>
 /// Skipped when no <c>[CompositionRoot]</c> is declared (the emitted body needs

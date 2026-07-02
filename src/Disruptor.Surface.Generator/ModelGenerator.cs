@@ -224,8 +224,9 @@ public sealed class ModelGenerator : IIncrementalGenerator
 
         // Per-variant relation classes — emits IEntity scaffolding, [In]/[Out]/[Property]
         // backing fields, Hydrate / SaveAsync. Per-kind sidecars (variant marker interface,
-        // hydration dispatcher) emit alongside. (CG029/CG030/CG031 are still reported from
-        // inside the emitter itself.)
+        // hydration dispatcher) emit alongside. CG029/CG030/CG031 report from the located
+        // diagnostics output (ModelValidation.Validate); the emitter keeps only the
+        // matching fail-closed skips.
         RelationVariantEmitter.Emit(spc, graph);
 
         // Per-shared-shape interface: emit a partial fragment carrying a typed

@@ -24,13 +24,27 @@ public readonly record struct RecordId(string Table, string Value) : IRecordId, 
         => new(table, RecordIdFormat.HashText(text, prefix));
 
     /// <summary>
-    /// Deferred edge-id strategy: the <c>Value</c> is left empty as a sentinel. Nothing
-    /// resolves the sentinel automatically today — the emitted relation-variant
-    /// <c>SaveAsync</c> bodies mint Ulid-backed edge ids of their own, and a sentinel
-    /// that reaches dispatch un-resolved is sent without an explicit id, so the
-    /// substrate mints a random row id (i.e. NOT idempotent in practice). Callers who
-    /// want content-addressed edge ids call <see cref="Resolve"/> themselves before
-    /// dispatch; no automatic plumbing exists.
+    /// Deterministic edge-row id derived from the <c>(source, edge table, target)</c>
+    /// triple: the value is <see cref="RecordIdFormat.HashText"/> of
+    /// <c>{source}|{edgeTable}|{target}</c>, so the same triple always lands on the
+    /// same row. This is the derivation the emitted relation-variant id anchor uses
+    /// when the variant has no user-assigned (or hydrated) id at save time — re-saving
+    /// the same endpoint pair replays onto the same edge row, so the id the session
+    /// records via <c>MarkSaved</c> matches the row the substrate's
+    /// <c>UNIQUE (in, out)</c> duplicate path actually updated.
+    /// </summary>
+    public static RecordId ForEdge(string edgeTable, IRecordId source, IRecordId target)
+        => new(edgeTable, RecordIdFormat.HashText($"{From(source)}|{edgeTable}|{From(target)}"));
+
+    /// <summary>
+    /// Deferred edge-id strategy: the <c>Value</c> is left empty as a sentinel that a
+    /// caller later collapses via <see cref="Resolve"/>. Since the deterministic-edge-id
+    /// change (2026-07-02) the emitted relation-variant save path no longer needs the
+    /// sentinel — the variant id anchor derives its edge id up front via
+    /// <see cref="ForEdge"/> (same hash scheme) when no id was assigned. The sentinel
+    /// remains for callers minting content-addressed edge ids by hand; one that reaches
+    /// dispatch un-resolved is sent without an explicit id, so the substrate mints a
+    /// random row id (i.e. NOT idempotent in practice).
     /// <para>
     /// Only meaningful as the edge id on a relation row — using an idempotent id
     /// elsewhere will produce empty-value strings in rendered SurrealQL.
@@ -52,15 +66,16 @@ public readonly record struct RecordId(string Table, string Value) : IRecordId, 
     /// <summary>
     /// Resolve a deferred-idempotent edge id against its <paramref name="source"/> and
     /// <paramref name="target"/> endpoints. No-op for already-resolved ids; for the
-    /// idempotent sentinel, returns a concrete <see cref="RecordId"/> whose value is
-    /// <see cref="RecordIdFormat.HashText"/> of <c>{source}|{Table}|{target}</c>. Same
-    /// triple always lands on the same row. The library never calls this itself (see
-    /// <see cref="Idempotent"/>) — it exists for callers minting content-addressed edge
-    /// ids by hand.
+    /// idempotent sentinel, delegates to <see cref="ForEdge"/> — the value becomes
+    /// <see cref="RecordIdFormat.HashText"/> of <c>{source}|{Table}|{target}</c>, so the
+    /// same triple always lands on the same row. The emitted relation-variant save path
+    /// applies the same derivation automatically (via <see cref="ForEdge"/> in the
+    /// variant id anchor); this instance form exists for callers minting
+    /// content-addressed edge ids by hand from the <see cref="Idempotent"/> sentinel.
     /// </summary>
     public RecordId Resolve(RecordId source, RecordId target)
         => IsIdempotent
-            ? new RecordId(Table, RecordIdFormat.HashText($"{source}|{Table}|{target}"))
+            ? ForEdge(Table, source, target)
             : this;
 
     /// <summary>

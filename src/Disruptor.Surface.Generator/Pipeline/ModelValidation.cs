@@ -142,6 +142,78 @@ internal static class ModelValidation
                 args: [issue.FullName, issue.Detail]);
         }
 
+        // CG029/CG030/CG031 — relation-variant checks relocated from
+        // RelationVariantEmitter (2026-07-02) so they flow through the located-
+        // diagnostics path and point at the offending declaration instead of
+        // Location.None. The emitter keeps the matching fail-closed behavior (skips
+        // non-partial variants; suppresses the hydration dispatcher on endpoint-pair
+        // collisions) but no longer reports. The kind/forward resolution and the
+        // (in.tb, out.tb) pair computation mirror the emitter exactly (shared helpers).
+        var unionLookup = RelationVariantEmitter.BuildUnionEndpointLookup(graph);
+        var variantTableIndex = graph.BuildTableIndex();
+        foreach (var group in graph.RelationVariants.ToLookup(v => v.KindAttributeFqn, StringComparer.Ordinal))
+        {
+            var kind = graph.FindKind(group.Key);
+            var forward = kind is null
+                ? null
+                : kind.Direction == RelationDirection.Forward
+                    ? kind
+                    : graph.FindKind(kind.PairedForwardFullName);
+            if (forward is null)
+            {
+                continue;
+            }
+
+            var pairs = new List<(string InTable, string OutTable, RelationVariantModel Variant)>();
+            foreach (var variant in group.OrderBy(v => v.FullName, StringComparer.Ordinal))
+            {
+                // CG029 — variant classes must be partial (the generator emits the
+                // implementation half). Further per-variant checks are skipped for
+                // non-partial variants, but they still contribute to the dispatcher's
+                // pair computation below (matching the emitter's suppression scope).
+                if (!variant.IsPartial)
+                {
+                    Add(pending, Diagnostics.VariantMustBePartial,
+                        typeKey: variant.FullName,
+                        args: [variant.FullName]);
+                }
+
+                if (variant.In is null || variant.Out is null)
+                {
+                    continue;
+                }
+
+                if (variant.IsPartial)
+                {
+                    // CG031 — a union endpoint carries an implicit kind via the
+                    // In<TKind>/Out<TKind> base of its attribute; it must match the
+                    // variant's (forward) kind or the schema and runtime disagree about
+                    // which edge table the variant lives on.
+                    AddUnionKindMismatch(pending, variant, "In", variant.In, forward, unionLookup);
+                    AddUnionKindMismatch(pending, variant, "Out", variant.Out, forward, unionLookup);
+                }
+
+                foreach (var inTable in RelationVariantEmitter.ResolveEndpointTableNames(variant.In, unionLookup, variantTableIndex))
+                {
+                    foreach (var outTable in RelationVariantEmitter.ResolveEndpointTableNames(variant.Out, unionLookup, variantTableIndex))
+                    {
+                        pairs.Add((inTable, outTable, variant));
+                    }
+                }
+            }
+
+            // CG030 — two variants of one kind sharing an (in.tb, out.tb) pair would
+            // make the hydration dispatcher ambiguous. Points at the first offender's
+            // declaration; the message names every participant.
+            foreach (var collision in pairs.GroupBy(p => (p.InTable, p.OutTable)).Where(g => g.Count() > 1))
+            {
+                var offenders = string.Join(", ", collision.Select(c => c.Variant.FullName));
+                Add(pending, Diagnostics.VariantEndpointPairCollision,
+                    typeKey: collision.First().Variant.FullName,
+                    args: [forward.FullName, $"({collision.Key.InTable}, {collision.Key.OutTable}) shared by {offenders}"]);
+            }
+        }
+
         foreach (var conflict in graph.AggregateConflicts)
         {
             // Format from RelationLinker.ComputeAggregates: "Member|Root1,Root2,...".
@@ -785,6 +857,42 @@ internal static class ModelValidation
         }
 
         return new EquatableArray<LocatedDiagnostic>(located.MoveToImmutable());
+    }
+
+    /// <summary>
+    /// CG031 — pends a <see cref="Diagnostics.UnionEndpointKindMismatch"/> when an
+    /// endpoint property is typed to a union whose <see cref="UnionEndpointModel.KindFullName"/>
+    /// doesn't equal the variant's forward kind. The union's kind is captured at extraction
+    /// from the <c>In&lt;TKind&gt;</c> / <c>Out&lt;TKind&gt;</c> generic base of the user's
+    /// attribute; the variant's forward kind is whichever <c>RelationAttribute</c>-derived
+    /// attribute is applied to the class (walked to its forward partner when the inverse
+    /// is what's on the class). Location resolves to the endpoint property declaration
+    /// via the member map (falling back to the variant declaration).
+    /// </summary>
+    private static void AddUnionKindMismatch(
+        ImmutableArray<PendingDiagnostic>.Builder pending,
+        RelationVariantModel variant,
+        string role,
+        RelationVariantPropertyModel endpoint,
+        RelationKindModel forward,
+        IReadOnlyDictionary<string, UnionEndpointModel> unionLookup)
+    {
+        var union = RelationVariantEmitter.ResolveUnionEndpoint(endpoint, unionLookup);
+        if (union is null || string.Equals(union.KindFullName, forward.FullName, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        Add(pending, Diagnostics.UnionEndpointKindMismatch,
+            typeKey: variant.FullName, memberName: endpoint.Name,
+            args:
+            [
+                variant.FullName,
+                SurrealNaming.StripAttributeSuffix(forward.Name),
+                role,
+                union.InterfaceFullName,
+                union.KindFullName,
+            ]);
     }
 
     private static void AddIndexIssue(ImmutableArray<PendingDiagnostic>.Builder pending, IndexIssueModel issue)
