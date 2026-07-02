@@ -119,7 +119,7 @@ internal static class ReferenceRegistryEmitter
     private static string UnwrapTask(string typeName)
     {
         const string prefix = "global::System.Threading.Tasks.Task<";
-        if (typeName.StartsWith(prefix) && typeName.EndsWith(">"))
+        if (typeName.StartsWith(prefix, StringComparison.Ordinal) && typeName.EndsWith(">", StringComparison.Ordinal))
         {
             return typeName.Substring(prefix.Length, typeName.Length - prefix.Length - 1);
         }
@@ -128,7 +128,7 @@ internal static class ReferenceRegistryEmitter
     }
 
     private static string StripNullableMarker(string typeName)
-        => typeName.EndsWith("?") ? typeName[..^1] : typeName;
+        => typeName.EndsWith("?", StringComparison.Ordinal) ? typeName[..^1] : typeName;
 
     private static string FormatTypeDeclaration(string accessibility, string typeName)
     {

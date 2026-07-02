@@ -109,8 +109,8 @@ internal static class UnionEndpointExtractor
 
         var name = decl.Identifier.ValueText;
         return name.Length > "IRecordId".Length
-            && name.StartsWith("I")
-            && name.EndsWith("RecordId");
+            && name.StartsWith("I", StringComparison.Ordinal)
+            && name.EndsWith("RecordId", StringComparison.Ordinal);
     }
 
     /// <summary>

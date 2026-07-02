@@ -31,6 +31,12 @@ internal static class RelationKindEmitter
 {
     public static void Emit(SourceProductionContext spc, ModelGraph graph)
     {
+        // Defensive hint-dedupe for the CG043 corner where two colliding kinds live in
+        // the *same* namespace (e.g. `Foo` and `FooAttribute` both stripping to marker
+        // `Foo`): the hint names would collide and crash AddSource (CS8785). Different-
+        // namespace collisions keep both markers — they're valid C# and skipping them
+        // would only add a CS0246 cascade on top of the CG043 error.
+        var seenHints = new HashSet<string>(StringComparer.Ordinal);
         foreach (var kind in graph.RelationKinds)
         {
             if (kind.Direction != RelationDirection.Forward)
@@ -38,14 +44,22 @@ internal static class RelationKindEmitter
                 continue;
             }
 
-            EmitForKind(spc, kind);
+            EmitForKind(spc, kind, seenHints);
         }
     }
 
-    private static void EmitForKind(SourceProductionContext spc, RelationKindModel kind)
+    private static void EmitForKind(SourceProductionContext spc, RelationKindModel kind, HashSet<string> seenHints)
     {
         var markerName = SurrealNaming.StripAttributeSuffix(kind.Name);
         var edgeName = SurrealNaming.ToEdgeName(kind.Name);
+
+        var hint = string.IsNullOrEmpty(kind.Namespace)
+            ? $"{markerName}.RelationKind.g.cs"
+            : $"{kind.Namespace}.{markerName}.RelationKind.g.cs";
+        if (!seenHints.Add(hint))
+        {
+            return;
+        }
 
         var writer = new CodeWriter().Header();
         using (writer.Namespace(kind.Namespace))
@@ -65,9 +79,6 @@ internal static class RelationKindEmitter
             IdEmitter.WriteIdType(writer, $"{markerName}Id", edgeName, []);
         }
 
-        var hint = string.IsNullOrEmpty(kind.Namespace)
-            ? $"{markerName}.RelationKind.g.cs"
-            : $"{kind.Namespace}.{markerName}.RelationKind.g.cs";
         spc.AddSource(hint, writer.ToSourceText());
     }
 }

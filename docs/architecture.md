@@ -64,6 +64,7 @@ The streams' predicates are syntax-only so the incremental cache keys hash cheap
 
 `RelationLinker.Build` is the single point of fan-in. It:
 
+0. **Dedupes the `CreateSyntaxProvider`-collected sets and rejects nested model types.** Relation kinds, relation variants, and shared-shape candidates are collected once per *declaration* (partials merge at the symbol level, so a split type yields identical duplicate models — first per full name wins); nested `[Table]`/`[CompositionRoot]` declarations are pulled out of the graph and reported as CG045.
 1. **Rewrites `TypeRef`s** so `TypeRef.IsTableType` is true for every type that turned out to be a `[Table]` after the full table set is known. Per-symbol extractors can't see this; they seed `IsTableType` from immediately-visible attributes and the linker patches up forward references.
 2. **Computes per-kind union sets** (`Unions`) — the source-side and target-side `[Table]` members for each forward kind. 2+ members → a marker interface emitted by `UnionInterfaceEmitter` (with both an entity-side and an id-side variant).
 3. **Computes union endpoints** (`UnionEndpoints`) — stitches the union-interface candidates and per-table membership opt-ins into `UnionEndpointModel`s keyed by interface FQN.
@@ -72,13 +73,14 @@ The streams' predicates are syntax-only so the incremental cache keys hash cheap
 6. **Computes entity indexes** (`Indexes` / `IndexIssues`) — groups `IndexAttribute` / `UniqueIndexAttribute` derivatives by attribute type per table, validates supported fields, and preserves property declaration order for composites.
 7. **Computes aggregates and aggregate conflicts** (CG011) by walking `[Children]` from each `[AggregateRoot]`.
 8. **Detects cascade-only reference cycles** (CG014) on the `[Reference, Cascade]` subgraph.
+9. **Computes generated-name collisions** (`NameCollisions`, CG042–CG044) — physical table names, edge table names, and aggregate-root simple names must each be unique; emitters that key output on those names skip the non-first participants via `ModelGraph.IsCollisionLoser` so a collision fails the build with the CG error instead of a duplicate-hint crash.
 
 The output is a `ModelGraph` record (see [Model graph shape](#model-graph-shape) below).
 
 **Diagnostics fire from three layers.** The split matters when you're adding a new one:
 
 - **Inside an extractor.** Cheap structural checks that don't need cross-table information (e.g. "is this property partial?"). Rare; most extractors stay pure and let the linker decide.
-- **Inside `RelationLinker`.** Cross-table checks that need the full model — currently used for CG014 (cascade-only cycles), the aggregate-conflict computation feeding CG011, shared-shape lift conflicts feeding CG036, and entity-index validation feeding CG037–CG041.
+- **Inside `RelationLinker`.** Cross-table checks that need the full model — currently used for CG014 (cascade-only cycles), the aggregate-conflict computation feeding CG011, shared-shape lift conflicts feeding CG036, entity-index validation feeding CG037–CG041, generated-name collision detection feeding CG042–CG044, and nested-type rejection feeding CG045.
 - **Inside `ModelGenerator.Emit`.** Everything else. The bulk of the per-table validation (CG001, CG008, CG022, CG024–CG028) lives here in long sequential loops; cross-aggregate reference checks (CG021), composition-root presence (CG018/CG019), and per-aggregate parent-reachability (CG020) also fire here. Shared-shape diagnostics (CG033, CG035, CG036) and entity-index diagnostics (CG037–CG041) are reported from linker output.
 
 Most contributors adding a diagnostic want the `ModelGenerator.Emit` layer — the model is fully linked, the source-production-context is in hand, and the convention is established. Add a descriptor in `Pipeline/Diagnostics.cs` and a `spc.ReportDiagnostic(...)` call at the appropriate loop body.
@@ -132,6 +134,8 @@ The fully-linked output of `RelationLinker.Build` is a `ModelGraph` record with 
 | `SharedShapeLiftConflicts` | Per-variant shared-shape merge conflicts reported as CG036. |
 | `Indexes` | Valid entity indexes grouped by user-defined index attribute type. Feeds `SchemaEmitter`. |
 | `IndexIssues` | Entity-index validation failures reported as CG037–CG041. |
+| `NameCollisions` | Generated-name collisions (physical table name / edge name / aggregate-root simple name) reported as CG042–CG044. Participants are sorted; `IsCollisionLoser` gives emitters the deterministic "first wins" skip set. |
+| `NestedTypeIssues` | Nested `[Table]` / `[CompositionRoot]` declarations reported as CG045 (already filtered out of `Tables` / `CompositionRoots`). |
 | `Aggregates` | Per-`[AggregateRoot]` membership, computed by `[Children]` BFS from each root. |
 | `AggregateConflicts` | `"Member\|Root1,Root2,…"` strings for CG011 (member reachable from 2+ roots). |
 | `CascadeCycles` | Cycle path strings for CG014. |

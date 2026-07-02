@@ -31,6 +31,30 @@ internal static class RelationLinker
         ImmutableArray<UnionMembershipCandidate> unionMembershipCandidates,
         ImmutableArray<SharedShapeInterfaceCandidate> sharedShapeCandidates)
     {
+        // Multi-declaration dedupe. The CreateSyntaxProvider-based extractors (relation
+        // kinds, relation variants, shared shapes) run once per *declaration*, but
+        // GetDeclaredSymbol merges partials — a type split across two matching partial
+        // declarations yields N identical models, and the per-symbol emitters would then
+        // AddSource the same hint twice (ArgumentException → CS8785, generator contributes
+        // nothing). Models are value-equatable, so keep the first occurrence per full name.
+        // Union candidates are exempt on purpose: interface candidates are deduped by the
+        // per-interface accumulator in ComputeUnionEndpoints, and membership candidates are
+        // intentionally per-declaration (each partial contributes its own base list).
+        forwardKinds = DedupeByFullName(forwardKinds, static k => k.FullName);
+        inverseKinds = DedupeByFullName(inverseKinds, static k => k.FullName);
+        relationVariants = DedupeByFullName(relationVariants, static v => v.FullName);
+        sharedShapeCandidates = DedupeByFullName(sharedShapeCandidates, static c => c.InterfaceFullName);
+
+        // CG045 — nested [Table] / [CompositionRoot] declarations. The emitters produce
+        // namespace-scoped partials only, so a nested declaration would emit an orphan
+        // top-level partial (CS9248/CS9249 storm) and every string-keyed graph lookup
+        // (aggregate membership, cascade cycles, CG017/CG021) would silently miss it.
+        // Fail closed: pull them out of the model here; ModelGenerator.Emit reports the
+        // issue list.
+        var nestedTypeIssues = ImmutableArray.CreateBuilder<NestedTypeIssueModel>();
+        tables = FilterNestedTables(tables, nestedTypeIssues);
+        compositionRoots = FilterNestedCompositionRoots(compositionRoots, nestedTypeIssues);
+
         var tableFullNames = new HashSet<string>();
         foreach (var t in tables)
         {
@@ -70,6 +94,7 @@ internal static class RelationLinker
         var (indexes, indexIssues) = ComputeIndexes(linked);
         var (aggregates, conflicts) = ComputeAggregates(linked);
         var cascadeCycles = ComputeCascadeCycles(linked);
+        var nameCollisions = ComputeNameCollisions(linked, forwardKinds);
 
         return new ModelGraph(
             Tables: linked,
@@ -81,10 +106,143 @@ internal static class RelationLinker
             SharedShapeLiftConflicts: new EquatableArray<SharedShapeLiftConflict>(liftConflicts),
             Indexes: new EquatableArray<IndexModel>(indexes),
             IndexIssues: new EquatableArray<IndexIssueModel>(indexIssues),
+            NameCollisions: new EquatableArray<NameCollisionModel>(nameCollisions),
+            NestedTypeIssues: new EquatableArray<NestedTypeIssueModel>(nestedTypeIssues.ToImmutable()),
             Aggregates: new EquatableArray<AggregateModel>(aggregates),
             AggregateConflicts: new EquatableArray<string>(conflicts),
             CascadeCycles: new EquatableArray<string>(cascadeCycles),
             CompositionRoots: new EquatableArray<CompositionRootModel>(compositionRoots));
+    }
+
+    private static ImmutableArray<TableModel> FilterNestedTables(
+        ImmutableArray<TableModel> tables,
+        ImmutableArray<NestedTypeIssueModel>.Builder issues)
+    {
+        if (!tables.Any(static t => t.IsNested))
+        {
+            return tables;
+        }
+
+        var kept = ImmutableArray.CreateBuilder<TableModel>(tables.Length);
+        foreach (var t in tables)
+        {
+            if (t.IsNested)
+            {
+                issues.Add(new NestedTypeIssueModel(t.FullName, "Table"));
+            }
+            else
+            {
+                kept.Add(t);
+            }
+        }
+
+        return kept.ToImmutable();
+    }
+
+    private static ImmutableArray<CompositionRootModel> FilterNestedCompositionRoots(
+        ImmutableArray<CompositionRootModel> roots,
+        ImmutableArray<NestedTypeIssueModel>.Builder issues)
+    {
+        if (!roots.Any(static r => r.IsNested))
+        {
+            return roots;
+        }
+
+        var kept = ImmutableArray.CreateBuilder<CompositionRootModel>(roots.Length);
+        foreach (var r in roots)
+        {
+            if (r.IsNested)
+            {
+                issues.Add(new NestedTypeIssueModel(r.FullName, "CompositionRoot"));
+            }
+            else
+            {
+                kept.Add(r);
+            }
+        }
+
+        return kept.ToImmutable();
+    }
+
+    /// <summary>
+    /// Pre-emit uniqueness validation over every generated-name space that is keyed on a
+    /// *simple* name (CG042/CG043/CG044). Without it, two same-named types silently merge
+    /// onto one physical table / edge table (SchemaEmitter keys DDL on the simple name)
+    /// or crash the whole generator with a duplicate <c>AddSource</c> hint (the aggregate
+    /// loader family keys hints and member names on the root's simple name). Reported by
+    /// <c>ModelGenerator.Emit</c>; emitters that key output on the colliding name consult
+    /// <see cref="ModelGraph.IsCollisionLoser"/> to skip the duplicates.
+    /// </summary>
+    private static ImmutableArray<NameCollisionModel> ComputeNameCollisions(
+        ImmutableArray<TableModel> tables,
+        ImmutableArray<RelationKindModel> forwardKinds)
+    {
+        var collisions = ImmutableArray.CreateBuilder<NameCollisionModel>();
+
+        // CG042 — physical table name (pluralised + snake-cased simple name). Catches
+        // both same-simple-name-across-namespaces (A.Design + B.Design) and distinct
+        // names that pluralise together (Item + Items → items).
+        AddCollisions(collisions, NameCollisionKind.TableName,
+            tables.Select(static t => (SurrealNaming.ToTableName(t.Name), t.FullName)));
+
+        // CG043 — edge table name from the forward attribute's simple class name.
+        AddCollisions(collisions, NameCollisionKind.EdgeName,
+            forwardKinds.Select(static k => (SurrealNaming.ToEdgeName(k.Name), k.FullName)));
+
+        // CG044 — aggregate-root simple name. AggregateLoaderEmitter /
+        // CompositionRootEmitter / LoadEntryEmitter key loader class names, AddSource
+        // hints, and Load{Name}Async members on it.
+        AddCollisions(collisions, NameCollisionKind.AggregateRootName,
+            tables.Where(static t => t.IsAggregateRoot).Select(static t => (t.Name, t.FullName)));
+
+        return collisions.ToImmutable();
+    }
+
+    private static void AddCollisions(
+        ImmutableArray<NameCollisionModel>.Builder collisions,
+        NameCollisionKind kind,
+        IEnumerable<(string Name, string FullName)> entries)
+    {
+        foreach (var group in entries
+                     .GroupBy(static e => e.Name, StringComparer.Ordinal)
+                     .Where(static g => g.Count() > 1)
+                     .OrderBy(static g => g.Key, StringComparer.Ordinal))
+        {
+            var participants = group
+                .Select(static e => e.FullName)
+                .OrderBy(static n => n, StringComparer.Ordinal)
+                .ToList();
+            collisions.Add(new NameCollisionModel(
+                Kind: kind,
+                CollidingName: group.Key,
+                ParticipantFullNames: new EquatableArray<string>(participants)));
+        }
+    }
+
+    /// <summary>
+    /// Keeps the first model per full name, dropping later duplicates. Duplicates are
+    /// identical by construction (the extractors snapshot the *merged* symbol once per
+    /// declaration), so "first wins" loses nothing; a genuine same-name redeclaration is
+    /// a CS0101 in the user's code and never reaches a healthy emit pass anyway.
+    /// </summary>
+    private static ImmutableArray<T> DedupeByFullName<T>(ImmutableArray<T> models, Func<T, string> fullName)
+    {
+        if (models.Length <= 1)
+        {
+            return models;
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var builder = ImmutableArray.CreateBuilder<T>(models.Length);
+        foreach (var model in models)
+        {
+            if (seen.Add(fullName(model)))
+            {
+                builder.Add(model);
+            }
+        }
+
+        return builder.Count == models.Length ? models : builder.ToImmutable();
     }
 
     private static (ImmutableArray<IndexModel> Indexes, ImmutableArray<IndexIssueModel> Issues) ComputeIndexes(
@@ -711,8 +869,8 @@ internal static class RelationLinker
         var markerNamespace = lastDot >= 0 ? markerFullName[..lastDot] : string.Empty;
         var markerSimpleName = lastDot >= 0 ? markerFullName[(lastDot + 1)..] : markerFullName;
 
-        if (!markerSimpleName.StartsWith("I")
-            || !markerSimpleName.EndsWith("RecordId")
+        if (!markerSimpleName.StartsWith("I", StringComparison.Ordinal)
+            || !markerSimpleName.EndsWith("RecordId", StringComparison.Ordinal)
             || markerSimpleName.Length <= "IRecordId".Length)
         {
             return null;
@@ -941,12 +1099,12 @@ internal static class RelationLinker
     private static string StripGlobalAndNullable(string fqn)
     {
         const string prefix = "global::";
-        if (fqn.StartsWith(prefix))
+        if (fqn.StartsWith(prefix, StringComparison.Ordinal))
         {
             fqn = fqn[prefix.Length..];
         }
 
-        if (fqn.EndsWith("?"))
+        if (fqn.EndsWith("?", StringComparison.Ordinal))
         {
             fqn = fqn[..^1];
         }
@@ -994,7 +1152,7 @@ internal static class RelationLinker
     private static string Strip(string fqn)
     {
         const string prefix = "global::";
-        if (fqn.StartsWith(prefix))
+        if (fqn.StartsWith(prefix, StringComparison.Ordinal))
         {
             fqn = fqn[prefix.Length..];
         }
@@ -1105,7 +1263,7 @@ internal static class RelationLinker
     }
 
     private static string StripAttribute(string name)
-        => name.EndsWith("Attribute") ? name[..^"Attribute".Length] : name;
+        => name.EndsWith("Attribute", StringComparison.Ordinal) ? name[..^"Attribute".Length] : name;
 
     private static string QualifyName(string ns, string name)
         => string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}";

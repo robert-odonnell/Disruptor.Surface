@@ -1164,7 +1164,7 @@ internal static class PartialEmitter
     private static string Quote(string s) => $"\"{s.Replace("\"", "\\\"")}\"";
 
     private static string StripNullable(string typeName)
-        => typeName.EndsWith("?") ? typeName[..^1] : typeName;
+        => typeName.EndsWith("?", StringComparison.Ordinal) ? typeName[..^1] : typeName;
 
     private static string FormatAccessibility(string raw) => raw switch
     {

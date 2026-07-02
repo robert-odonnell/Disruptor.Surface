@@ -842,8 +842,8 @@ public partial class CallsRelation : ICodeSymbolEdge
 }
 
 // Empty-body variant (preview.56+) — inherits the full shape from the interface.
-[References]
-public partial class ReferencesRelation : ICodeSymbolEdge;
+[RefersTo]
+public partial class RefersToRelation : ICodeSymbolEdge;
 ```
 
 #### Call site — `Create<TKind>` factory
@@ -867,7 +867,7 @@ public static partial I Create<TKind>(System.Action<I> init)
     where TKind : IRelationKind;
 ```
 
-The body is an if-chain dispatching on `typeof(TKind)` — `new CallsRelation()` for `Calls`, `new ReferencesRelation()` for `References`, etc. — runs the user's initialiser, then returns the instance. An unknown `TKind` throws `InvalidOperationException`.
+The body is an if-chain dispatching on `typeof(TKind)` — `new CallsRelation()` for `Calls`, `new RefersToRelation()` for `RefersTo`, etc. — runs the user's initialiser, then returns the instance. An unknown `TKind` throws `InvalidOperationException`.
 
 #### Composition — split contracts across the interface chain
 
@@ -1166,3 +1166,7 @@ The generator emits diagnostics for invalid model shapes. Most are errors (compi
 | `CG039` | Unique entity index includes a nullable field. |
 | `CG040` | Multiple entity indexes resolve to the same schema name. |
 | `CG041` | The same index attribute appears more than once on one field. |
+| `CG042` | Two `[Table]` classes map to the same physical SurrealDB table name (names are pluralised + snake-cased from the simple class name — covers both `A.Design` + `B.Design` and `Item` + `Items`). |
+| `CG043` | Two forward relation kinds map to the same SurrealDB edge table name (edge names derive from the attribute's simple class name minus the `Attribute` suffix). |
+| `CG044` | Two `[AggregateRoot]` tables share a simple name — the generated aggregate loader, `Load{Name}Async` entry points, and `LoadAsync` extensions are keyed on it. |
+| `CG045` | `[Table]` / `[CompositionRoot]` class is nested inside another type; model classes must be namespace-scoped. |

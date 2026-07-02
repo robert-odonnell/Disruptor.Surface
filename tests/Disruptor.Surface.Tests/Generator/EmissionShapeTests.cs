@@ -1358,6 +1358,58 @@ public sealed class EmissionShapeTests
     }
 
     [Fact]
+    public void Variant_SplitAcrossPartialDeclarations_GeneratesCleanly_Once()
+    {
+        // The CreateSyntaxProvider-based extractors run once per *declaration* but
+        // GetDeclaredSymbol merges partials — before RelationLinker.Build deduped the
+        // collected sets, a variant split across two matching partial declarations
+        // (the second carrying any attribute list) produced two identical models and
+        // RelationVariantEmitter crashed AddSource with a duplicate hint (CS8785).
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+
+            [Table, AggregateRoot] public partial class Epic {
+                [Id] public partial EpicId Id { get; set; }
+            }
+
+            [Table, AggregateRoot] public partial class Feature {
+                [Id] public partial FeatureId Id { get; set; }
+            }
+
+            [Restricts]
+            public partial class EpicRestriction {
+                [In]  public partial EpicId Source { get; set; }
+                [Out] public partial FeatureId Target { get; set; }
+            }
+
+            // Second declaration of the same variant — the attribute list makes it match
+            // the extractor predicate, so the transform runs once per declaration.
+            [System.Obsolete("split declaration")]
+            public partial class EpicRestriction {
+                [Property] public partial string Note { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+
+        // No duplicate-hint ArgumentException swallowed by the driver, no CG errors.
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+        Assert.DoesNotContain(runDiags, d => d.Severity == DiagnosticSeverity.Error);
+
+        // Exactly one emitted file for the variant.
+        var variantTrees = result.GeneratedTrees
+            .Where(t => t.FilePath.Contains("EpicRestriction.RelationVariant", StringComparison.Ordinal))
+            .ToList();
+        Assert.Single(variantTrees);
+        Assert.Contains("public partial class EpicRestriction", variantTrees[0].ToString());
+    }
+
+    [Fact]
     public void MultiVariantKind_EmitsVariantMarkerInterface_AllVariantsImplement()
     {
         // Multi-variant kinds get a per-kind I{KindName}Variant marker — every variant

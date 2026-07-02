@@ -261,4 +261,36 @@ internal static class Diagnostics
         category: Category,
         defaultSeverity: DiagnosticSeverity.Error,
         isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor TableNameCollision = new(
+        id: "CG042",
+        title: "Multiple [Table] classes map to the same SurrealDB table name",
+        messageFormat: "[Table] classes {0} map to the same SurrealDB table name '{1}'. Table names are pluralised + snake-cased from the class's simple name, so these distinct CLR types would silently share one physical table (and the generated query/hydration accessors would collide). Rename one of the classes.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor EdgeNameCollision = new(
+        id: "CG043",
+        title: "Multiple relation kinds map to the same SurrealDB edge table name",
+        messageFormat: "Relation kind attributes {0} map to the same SurrealDB edge table name '{1}'. Edge names are snake-cased from the attribute's simple class name (minus the Attribute suffix), so these distinct kinds would silently share one edge table with merged FROM/TO clauses. Rename one of the attribute classes.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor AggregateRootNameCollision = new(
+        id: "CG044",
+        title: "Multiple [AggregateRoot] tables share a simple name",
+        messageFormat: "[AggregateRoot] tables {0} share the simple name '{1}'. The generated aggregate loader class, Load{1}Async entry points, and LoadAsync query extensions are all keyed on the root's simple name and would collide. Rename one of the classes.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor NestedModelType = new(
+        id: "CG045",
+        title: "Model class must not be nested inside another type",
+        messageFormat: "'{0}' is annotated with [{1}] but is nested inside another type; the generator emits namespace-scoped partials only, so a nested declaration cannot receive its implementation half. Move the class to namespace scope.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
 }

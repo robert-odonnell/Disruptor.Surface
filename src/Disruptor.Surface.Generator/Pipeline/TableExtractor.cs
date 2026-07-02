@@ -40,7 +40,10 @@ internal static class TableExtractor
         }
 
         var ns = type.ContainingNamespace?.ToDisplayString() ?? string.Empty;
-        var fullName = string.IsNullOrEmpty(ns) ? type.MetadataName : $"{ns}.{type.MetadataName}";
+        // NormaliseFullName keeps containing types in the name (Ns.Outer.Inner) so a
+        // nested [Table] — rejected with CG045 by the linker — is reported under its
+        // real name. For namespace-scoped types it's identical to {ns}.{MetadataName}.
+        var fullName = NormaliseFullName(type);
         var hint = $"{fullName}.g.cs";
 
         return new TableModel(
@@ -48,6 +51,7 @@ internal static class TableExtractor
             Namespace: ns,
             Name: type.Name,
             IsPartial: isPartial,
+            IsNested: type.ContainingType is not null,
             IsAbstract: type.IsAbstract,
             IsSealed: type.IsSealed,
             IsAggregateRoot: isAggregateRoot,

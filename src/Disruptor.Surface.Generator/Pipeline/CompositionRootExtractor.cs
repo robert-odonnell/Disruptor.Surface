@@ -25,13 +25,17 @@ internal static class CompositionRootExtractor
         ct.ThrowIfCancellationRequested();
 
         var ns = type.ContainingNamespace?.ToDisplayString() ?? string.Empty;
-        var fullName = string.IsNullOrEmpty(ns) ? type.MetadataName : $"{ns}.{type.MetadataName}";
+        // NormaliseFullName keeps containing types in the name so a nested
+        // [CompositionRoot] — rejected with CG045 by the linker — is reported under
+        // its real name. Identical to {ns}.{MetadataName} for namespace-scoped types.
+        var fullName = TableExtractor.NormaliseFullName(type);
 
         return new CompositionRootModel(
             FullName: fullName,
             Namespace: ns,
             Name: type.Name,
             DeclaredAccessibility: type.DeclaredAccessibility.ToString(),
-            IsPartial: PartialDeclaration.IsDeclared(type, ct));
+            IsPartial: PartialDeclaration.IsDeclared(type, ct),
+            IsNested: type.ContainingType is not null);
     }
 }
