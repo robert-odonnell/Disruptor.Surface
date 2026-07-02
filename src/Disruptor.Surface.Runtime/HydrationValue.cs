@@ -68,9 +68,13 @@ public static class HydrationValue
     }
 
     /// <summary>
-    /// Generic field read for a scalar / collection / record type. Switches on the
-    /// runtime <see cref="SurrealValue"/> shape to materialise <typeparamref name="T"/>;
-    /// for records and arrays-of-records, walks public properties via reflection. Returns
+    /// Generic field read for a scalar / collection / typed-id type. Switches on the
+    /// runtime <see cref="SurrealValue"/> shape to materialise <typeparamref name="T"/>:
+    /// primitives, <c>Nullable&lt;T&gt;</c> wrappers, arrays / <c>List&lt;T&gt;</c> of
+    /// primitives, and any <see cref="IRecordId"/> target. Records / POCOs are NOT
+    /// handled here — the reflection walk that used to cover them was eliminated;
+    /// generator-emitted Hydrate bodies build records typed-and-direct, and an object
+    /// payload reaching this path throws <see cref="NotSupportedException"/>. Returns
     /// <c>default</c> when the field is missing or null/none.
     /// </summary>
     public static T ReadOrDefault<T>(SurrealObjectValue parent, string field)
@@ -80,7 +84,7 @@ public static class HydrationValue
             return default!;
         }
 
-        return (T)ConvertValue(v, typeof(T))!;
+        return (T)ConvertValue(v, typeof(T), field)!;
     }
 
     /// <summary>
@@ -174,7 +178,7 @@ public static class HydrationValue
     /// build records typed-and-direct (see <see cref="PartialEmitter"/>'s element
     /// collection handling), eliminating the reflection path that used to live here.
     /// </summary>
-    private static object? ConvertValue(SurrealValue v, Type targetType)
+    private static object? ConvertValue(SurrealValue v, Type targetType, string? field = null)
     {
         // Strip Nullable<T> wrapping once.
         var underlying = Nullable.GetUnderlyingType(targetType) ?? targetType;
@@ -209,19 +213,9 @@ public static class HydrationValue
                     return nv.SurrealNumber.AsInt();
                 }
 
-                if (underlying == typeof(int))
+                if (underlying == typeof(int) || underlying == typeof(short) || underlying == typeof(byte))
                 {
-                    return (int)nv.SurrealNumber.AsInt();
-                }
-
-                if (underlying == typeof(short))
-                {
-                    return (short)nv.SurrealNumber.AsInt();
-                }
-
-                if (underlying == typeof(byte))
-                {
-                    return (byte)nv.SurrealNumber.AsInt();
+                    return NarrowChecked(nv.SurrealNumber.AsInt(), underlying, field);
                 }
 
                 if (underlying == typeof(double))
@@ -268,7 +262,7 @@ public static class HydrationValue
                 break;
 
             case SurrealListValue av:
-                return ConvertArray(av, underlying);
+                return ConvertArray(av, underlying, field);
 
             case SurrealObjectValue:
                 throw new NotSupportedException(
@@ -282,7 +276,37 @@ public static class HydrationValue
             $"Cannot convert Value of kind {v.Kind} to {targetType.FullName}.");
     }
 
-    private static object ConvertArray(SurrealListValue av, Type targetType)
+    /// <summary>
+    /// Checked narrowing for integer targets smaller than <c>long</c>. SurrealDB stores
+    /// int64 on the wire; a DB value outside the CLR target's range must fail loudly with
+    /// the offending field and type named — the previous unchecked cast silently
+    /// truncated (e.g. 70_000 → short 4_464).
+    /// </summary>
+    private static object NarrowChecked(long value, Type target, string? field)
+    {
+        try
+        {
+            if (target == typeof(int))
+            {
+                return checked((int)value);
+            }
+
+            if (target == typeof(short))
+            {
+                return checked((short)value);
+            }
+
+            return checked((byte)value);
+        }
+        catch (OverflowException inner)
+        {
+            throw new OverflowException(
+                $"Value {value} in field '{field ?? "<array element>"}' does not fit target type {target.Name}.",
+                inner);
+        }
+    }
+
+    private static object ConvertArray(SurrealListValue av, Type targetType, string? field)
     {
         // T[] → element type from GetElementType; List<T>/IList<T>/IReadOnlyList<T> →
         // single generic argument. Anything else is unsupported.
@@ -306,7 +330,7 @@ public static class HydrationValue
             var arr = Array.CreateInstance(elementType, av.List.Count);
             for (var i = 0; i < av.List.Count; i++)
             {
-                arr.SetValue(ConvertValue(av.List[i], elementType), i);
+                arr.SetValue(ConvertValue(av.List[i], elementType, field), i);
             }
 
             return arr;
@@ -317,7 +341,7 @@ public static class HydrationValue
             var list = (IList)Activator.CreateInstance(listType)!;
             for (var i = 0; i < av.List.Count; i++)
             {
-                list.Add(ConvertValue(av.List[i], elementType));
+                list.Add(ConvertValue(av.List[i], elementType, field));
             }
 
             return list;

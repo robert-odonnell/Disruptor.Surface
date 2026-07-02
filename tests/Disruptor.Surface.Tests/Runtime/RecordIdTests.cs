@@ -98,4 +98,20 @@ public sealed class RecordIdTests
         Assert.StartsWith("m_", id.Value);
         Assert.Equal(RecordIdFormat.PrefixedHashLength, id.Value.Length);
     }
+
+    [Fact]
+    public void IsIdempotent_OnDefaultRecordId_IsFalse_NotNre()
+    {
+        // default(RecordId) has both components null — it's the in-band "no endpoint"
+        // sentinel the library itself logs for bulk Unrelate (Command.Unrelate). Reading
+        // IsIdempotent on it used to NRE on Value.Length; it must simply be false.
+        Assert.False(default(RecordId).IsIdempotent);
+    }
+
+    [Fact]
+    public void IsIdempotent_TrueForSentinel_FalseForRegularIds()
+    {
+        Assert.True(RecordId.Idempotent("restricts").IsIdempotent);
+        Assert.False(RecordId.New("designs").IsIdempotent);
+    }
 }
