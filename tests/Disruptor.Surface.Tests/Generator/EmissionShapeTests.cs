@@ -325,6 +325,60 @@ public sealed class EmissionShapeTests
     }
 
     [Fact]
+    public void IndexAnnotations_DoNotBustIncrementalCache_OnTriviaEdits()
+    {
+        // IndexAnnotationModel used to embed "{filePath}:{typeDeclSpanStart}" and the
+        // property's SpanStart — absolute positions, so adding a comment ABOVE an
+        // index-annotated property changed model equality and re-ran the single
+        // monolithic RegisterSourceOutput for every file (the exact regression the
+        // architecture doc's incremental contract warns about). The identity is now
+        // (partial-declaration ordinal, member ordinal), both stable under trivia edits.
+        var src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            public sealed class LookupAttribute : IndexAttribute;
+
+            [Table]
+            public partial class Story {
+                [Id] public partial StoryId Id { get; set; }
+                [Lookup, Property] public partial string ExternalKey { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+
+        var compilation = GeneratorHarness.CreateCompilation(src);
+        var parseOpts = new Microsoft.CodeAnalysis.CSharp.CSharpParseOptions(Microsoft.CodeAnalysis.CSharp.LanguageVersion.Preview);
+        var driver = Microsoft.CodeAnalysis.CSharp.CSharpGeneratorDriver.Create(
+            generators: [new Disruptor.Surface.Generator.ModelGenerator().AsSourceGenerator()],
+            parseOptions: parseOpts,
+            driverOptions: new GeneratorDriverOptions(IncrementalGeneratorOutputKind.None, trackIncrementalGeneratorSteps: true));
+
+        var afterFirst = driver.RunGenerators(compilation);
+
+        // Same file, one comment line added above the annotated property — a pure
+        // trivia edit that shifts every span below it.
+        var edited = src.Replace(
+            "    [Lookup, Property] public partial string ExternalKey { get; set; }",
+            "    // a comment above the index-annotated property\n    [Lookup, Property] public partial string ExternalKey { get; set; }");
+        var editedCompilation = compilation.ReplaceSyntaxTree(
+            compilation.SyntaxTrees.Single(),
+            Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(edited, parseOpts));
+
+        var afterSecond = afterFirst.RunGenerators(editedCompilation);
+        var result = afterSecond.GetRunResult().Results.Single();
+
+        // Every source output must come from the cache — the linked ModelGraph is
+        // value-equal, so RegisterSourceOutput is skipped entirely.
+        var outputSteps = result.TrackedOutputSteps.SelectMany(kv => kv.Value).SelectMany(step => step.Outputs);
+        Assert.NotEmpty(outputSteps);
+        Assert.All(outputSteps, output =>
+            Assert.True(output.Reason is IncrementalStepRunReason.Cached or IncrementalStepRunReason.Unchanged,
+                $"Expected cached output, got {output.Reason}"));
+    }
+
+    [Fact]
     public void KeywordClassNames_AreEscapedInEmittedTypeReferences()
     {
         // A [Table] named with a keyword (`@event`) flows through hand-built type

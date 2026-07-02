@@ -374,6 +374,25 @@ internal static class TableExtractor
         return new EquatableArray<IndexAnnotationModel>(indexes.ToImmutable());
     }
 
+    /// <summary>
+    /// Resolves the position-independent identity the index grouping in
+    /// <c>RelationLinker.ComputeIndexes</c> relies on:
+    /// <list type="bullet">
+    ///   <item><c>DeclarationKey</c> — which partial type declaration the property lives
+    ///         in, as the declaration's ordinal within the containing type symbol's
+    ///         <see cref="ISymbol.DeclaringSyntaxReferences"/>. Composite indexes must
+    ///         keep all fields in one declaration (CG038), and the ordinal distinguishes
+    ///         partial declarations without embedding a file path.</item>
+    ///   <item><c>SourceOrder</c> — the property's member ordinal within that type
+    ///         declaration, giving composite indexes their column order (= property
+    ///         declaration order).</item>
+    /// </list>
+    /// Both values are stable under edits elsewhere in the file. The previous encoding
+    /// (<c>"{filePath}:{typeDeclSpanStart}"</c> + property <c>SpanStart</c>) used absolute
+    /// positions, so ANY edit above an index-annotated property (a comment, a using)
+    /// changed model equality and re-emitted every file — the exact cache regression the
+    /// incremental-generator contract warns about — and was machine-path-sensitive.
+    /// </summary>
     private static (string DeclarationKey, int SourceOrder) ResolveSourceLocation(IPropertySymbol property)
     {
         var syntaxRef = property.DeclaringSyntaxReferences.FirstOrDefault();
@@ -383,9 +402,29 @@ internal static class TableExtractor
         }
 
         var typeDeclaration = declaration.Ancestors().OfType<TypeDeclarationSyntax>().FirstOrDefault();
-        var filePath = declaration.SyntaxTree.FilePath ?? string.Empty;
-        var declarationStart = typeDeclaration?.SpanStart ?? 0;
-        return ($"{filePath}:{declarationStart}", declaration.SpanStart);
+        if (typeDeclaration is null)
+        {
+            return (string.Empty, int.MaxValue);
+        }
+
+        var declarationOrdinal = 0;
+        var containingType = property.ContainingType;
+        if (containingType is not null)
+        {
+            var references = containingType.DeclaringSyntaxReferences;
+            for (var i = 0; i < references.Length; i++)
+            {
+                if (references[i].SyntaxTree == typeDeclaration.SyntaxTree
+                    && references[i].Span == typeDeclaration.Span)
+                {
+                    declarationOrdinal = i;
+                    break;
+                }
+            }
+        }
+
+        var memberOrdinal = typeDeclaration.Members.IndexOf(declaration);
+        return ($"decl:{declarationOrdinal}", memberOrdinal < 0 ? int.MaxValue : memberOrdinal);
     }
 
     internal static bool InheritsFromForwardRelation(INamedTypeSymbol cls)
