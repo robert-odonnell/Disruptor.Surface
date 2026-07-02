@@ -1,5 +1,7 @@
 using Disruptor.Surface.Annotations;
 using Disruptor.Surface.Runtime;
+using Disruptor.Surface.Runtime.Query;
+using Disruptor.Surreal;
 using Disruptor.Surreal.Values;
 using Xunit;
 
@@ -868,6 +870,206 @@ public sealed class SurrealSessionTests
         Assert.Null(session.Get<StubVariant>(variantId));
     }
 
+    // ──────────────────── 2026-07-02 review §4 fixes ─────────────────────────
+
+    [Fact]
+    public void Track_InitializeThrows_LeavesSessionUnpolluted()
+    {
+        // Track is atomic w.r.t. user OnCreate* hooks: Initialize runs BEFORE the
+        // identity-map insert and command-log append, so a throwing hook leaves no
+        // dangling map entry and no phantom Create in the log. (The entity does stay
+        // Bound — Bind is one-shot and precedes Initialize by design.)
+        var session = new SurrealSession();
+        var entity = new ThrowingInitializeEntity(new RecordId("designs", "x"));
+
+        var ex = Assert.Throws<InvalidOperationException>(() => session.Track(entity));
+        Assert.Equal("OnCreate hook failed", ex.Message);
+
+        Assert.False(session.IsTracked(entity.Id));
+        Assert.Null(session.Get<ThrowingInitializeEntity>(entity.Id));
+        Assert.Empty(session.Log.Entries);
+    }
+
+    [Fact]
+    public void AdoptIfUnbound_ChildBoundToDifferentSession_Throws()
+    {
+        // A child bound to a DIFFERENT session must fail loudly, mirroring Track's
+        // cross-session stance — the pre-fix silent no-op left the caller believing
+        // the child joined this session while it stayed in the other one.
+        var sessionA = new SurrealSession();
+        var sessionB = new SurrealSession();
+        var child = sessionA.Track(new StubEntity(new RecordId("constraints", "c")));
+
+        var ex = Assert.Throws<InvalidOperationException>(() => sessionB.AdoptIfUnbound(child));
+        Assert.Contains("different session", ex.Message);
+
+        // sessionB untouched; the child still belongs to sessionA.
+        Assert.False(sessionB.IsTracked(child.Id));
+        Assert.Same(sessionA, child.Session);
+    }
+
+    [Fact]
+    public async Task DeleteAsync_CrossSession_Throws_BeforeAnyWireDispatch()
+    {
+        // Same guard SaveAsync has via EnsureBoundForSave: an entity bound to a
+        // different session must not plan a delete against this session's snapshot.
+        // FakeSurreal.Throwing surfaces an IOException if anything reaches the wire;
+        // we expect the InvalidOperationException from the guard instead.
+        var sessionA = new SurrealSession();
+        var sessionB = new SurrealSession();
+        var entity = sessionA.Track(new StubEntity(new RecordId("designs", "x")));
+
+        var db = FakeSurreal.Throwing(new IOException("should never reach the wire"));
+        await using var tx = await db.BeginTransactionAsync();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => sessionB.DeleteAsync(entity, tx));
+
+        // sessionB closes per the fail-closed contract; sessionA stays usable.
+        Assert.True(sessionB.IsClosed);
+        Assert.False(sessionA.IsClosed);
+    }
+
+    [Fact]
+    public async Task QueryVariantsOutgoingAsync_ReQuery_ReturnsTrackedInstance_WithRefreshedPayload()
+    {
+        // Re-running a variant query must NOT hand back a detached duplicate: when the
+        // edge id is already tracked, the sink dedupe used to drop the fresh instance
+        // but the dropped, unbound duplicate was still returned (Session == null) and
+        // the tracked instance kept stale payload. Post-fix the EXISTING instance is
+        // re-hydrated and returned — reference-equal, session-bound, payload refreshed.
+        var src = new RecordId("constraints", "c");
+        var tgt = new RecordId("epics", "e");
+        var edgeId = new RecordId("stub_edge", "01h00000000000000000000042");
+
+        var note = "v1";
+        var (db, conn) = FakeSurreal.NullWithRecording();
+        conn.Responder = (method, _, _) => method switch
+        {
+            "begin" => new SurrealUuidValue(Guid.NewGuid()),
+            "query" => WrapAsQueryResponse(new SurrealListValue([BuildEdgeRow(edgeId, src, tgt, note)])),
+            _ => SurrealValue.None,
+        };
+
+        var session = new SurrealSession();
+        await using var tx = await db.BeginTransactionAsync();
+
+        var first = await session.QueryVariantsOutgoingAsync<StubVariant>(src, tx);
+        note = "v2";
+        var second = await session.QueryVariantsOutgoingAsync<StubVariant>(src, tx);
+
+        var variant = Assert.Single(second);
+        Assert.Same(Assert.Single(first), variant);
+        Assert.Same(variant, session.Get<StubVariant>(edgeId));
+        Assert.Same(session, variant.Session);
+        Assert.Equal("v2", variant.Note);
+    }
+
+    [Fact]
+    public async Task FetchAsync_OnDispatchFailure_ClosesSession_AndRethrows()
+    {
+        // FetchAsync joins the fail-closed family: a wire failure mid-fetch would
+        // otherwise leave an open session that is half old state, half new.
+        var session = new SurrealSession();
+        var db = FakeSurreal.Throwing(new IOException("boom"));
+        await using var tx = await db.BeginTransactionAsync();
+
+        var ex = await Assert.ThrowsAsync<IOException>(
+            () => session.FetchAsync(new SurfaceQuery<StubTarget>("targets"), tx));
+        Assert.Equal("boom", ex.Message);
+        Assert.True(session.IsClosed);
+    }
+
+    [Fact]
+    public async Task FetchAsync_LaterStatementError_Throws_AndClosesSession()
+    {
+        // Statement 0 succeeds, statement 1 errors. Take(0) alone would silently accept
+        // the response — EnsureSuccess must surface the failure from ANY statement, and
+        // the session must fail closed.
+        var (db, conn) = FakeSurreal.NullWithRecording();
+        conn.Responder = (method, _, _) => method switch
+        {
+            "begin" => new SurrealUuidValue(Guid.NewGuid()),
+            "query" => new SurrealListValue(
+            [
+                new SurrealObjectValue(new SurrealObject
+                {
+                    ["status"] = "OK",
+                    ["time"] = "1ms",
+                    ["result"] = new SurrealListValue([]),
+                }),
+                new SurrealObjectValue(new SurrealObject
+                {
+                    ["status"] = "ERR",
+                    ["time"] = "1ms",
+                    ["result"] = "second statement failed",
+                }),
+            ]),
+            _ => SurrealValue.None,
+        };
+
+        var session = new SurrealSession();
+        await using var tx = await db.BeginTransactionAsync();
+
+        await Assert.ThrowsAsync<SurrealRpcException>(
+            () => session.FetchAsync(new SurfaceQuery<StubTarget>("targets"), tx));
+        Assert.True(session.IsClosed);
+    }
+
+    [Fact]
+    public async Task DeleteAsync_Endpoint_PurgesGhostVariantEntities()
+    {
+        // SurrealDB removes edge rows when an endpoint record dies, so a tracked
+        // relation-variant entity whose endpoints include a deleted id mirrors no
+        // substrate row — CleanupLocalState must purge the ghost entity itself, not
+        // just the (in, edge, out) tuple.
+        var session = new SurrealSession();
+        var srcOwner = new StubEntity(new RecordId("constraints", "c"));
+        var tgtOwner = new StubEntity(new RecordId("epics", "e"));
+        ((IHydrationSink)session).Track(srcOwner);
+        ((IHydrationSink)session).Track(tgtOwner);
+
+        var variantId = new RecordId("stub_edge", "01h00000000000000000000007");
+        var variant = new StubVariant();
+        variant.ConfigureForSave(variantId, srcOwner.Id, tgtOwner.Id);
+
+        var db = FakeSurreal.Null();
+        await using var tx = await db.BeginTransactionAsync();
+        await session.SaveAsync(variant, tx);
+        Assert.Same(variant, session.Get<StubVariant>(variantId)); // sanity: the seed worked
+
+        await session.DeleteAsync(tgtOwner, tx);
+
+        Assert.Null(session.Get<StubVariant>(variantId));
+        Assert.False(session.IsTracked(variantId));
+        Assert.Empty(session.QueryRelatedIds<StubKind>(srcOwner));
+    }
+
+    [Fact]
+    public async Task DeleteAsync_PurgesLoadedAtStart_AndLoadedSlices()
+    {
+        // Regression: CleanupLocalState removed the entity from the identity map but
+        // left loadedAtStart + LoadedSlices behind. A later SaveContext then reported
+        // IsTracked=true for the deleted id (dispatching UPDATE against a dead row) and
+        // IsSliceLoaded kept answering for a record that no longer exists.
+        var session = new SurrealSession();
+        var deadId = new RecordId("designs", "dead");
+        var dead = new StubSaveableEntity(deadId);
+
+        var db = FakeSurreal.Null();
+        await using var tx = await db.BeginTransactionAsync();
+        await session.SaveAsync(dead, tx); // MarkSaved promotes deadId into loadedAtStart
+        ((IHydrationSink)session).MarkSliceLoaded(deadId, "constraints");
+        Assert.True(session.IsSliceLoaded(deadId, "constraints"));
+
+        await session.DeleteAsync(dead, tx);
+
+        Assert.False(session.IsSliceLoaded(deadId, "constraints"));
+        // A fresh SaveContext must see the deleted id as NOT tracked (CREATE, not UPDATE).
+        var observer = new StubTrackingObserver(new RecordId("designs", "obs"), observedDep: deadId);
+        await session.SaveAsync(observer, tx);
+        Assert.False(Assert.Single(observer.CapturedIsTracked));
+    }
+
     // ──────────────────────────── Phase 4 helpers ────────────────────────────
 
     private static (string Sql, SurrealObject Bindings) ExtractQueryParts(SurrealValue? @params)
@@ -879,13 +1081,20 @@ public sealed class SurrealSessionTests
         return (sql, bindings);
     }
 
-    private static SurrealObjectValue BuildEdgeRow(RecordId id, RecordId @in, RecordId @out)
-        => new(new SurrealObject
+    private static SurrealObjectValue BuildEdgeRow(RecordId id, RecordId @in, RecordId @out, string? note = null)
+    {
+        var obj = new SurrealObject
         {
             ["id"] = new SurrealRecordIdValue(id.ToSdk()),
             ["in"] = new SurrealRecordIdValue(@in.ToSdk()),
             ["out"] = new SurrealRecordIdValue(@out.ToSdk()),
-        });
+        };
+        if (note is not null)
+        {
+            obj["note"] = note;
+        }
+        return new(obj);
+    }
 
     /// <summary>
     /// Wraps <paramref name="rows"/> as a single-statement <c>query</c> response so
@@ -958,6 +1167,19 @@ public sealed class SurrealSessionTests
                 _refs[fieldName] = value;
             }
         }
+    }
+
+    /// <summary>Test-only entity whose Initialize throws — stands in for a user <c>OnCreate*</c> hook failure so the Track-atomicity test can assert the session stays unpolluted.</summary>
+    private sealed class ThrowingInitializeEntity(RecordId id) : IEntity
+    {
+        public RecordId Id { get; } = id;
+        public SurrealSession? Session { get; private set; }
+
+        public void Bind(SurrealSession session) => Session = session;
+        public void Initialize(SurrealSession session)
+            => throw new InvalidOperationException("OnCreate hook failed");
+        public void OnDeleting() { }
+        public void MarkAllSlicesLoaded(IHydrationSink sink) { }
     }
 
     /// <summary>Test-only entity that records the order of session-side hook calls. Bind matches the generator's emitted shape: throws on a cross-session bind attempt so the cross-session-protection tests exercise the realistic path.</summary>
@@ -1036,6 +1258,9 @@ public sealed class StubVariant : IEntity, IRelationVariant
     public RecordId? InId => _inId;
     public RecordId? OutId => _outId;
 
+    /// <summary>Stand-in payload field — Hydrate refreshes it from the row's <c>note</c> key so re-query tests can observe payload refresh on a tracked instance.</summary>
+    public string Note { get; private set; } = "";
+
     public void Bind(SurrealSession session) => Session = session;
     public void Initialize(SurrealSession session) { }
     public void OnDeleting() { }
@@ -1067,6 +1292,7 @@ public sealed class StubVariant : IEntity, IRelationVariant
         }
         _inId = HydrationValue.TryReadReferenceId(obj, "in");
         _outId = HydrationValue.TryReadReferenceId(obj, "out");
+        Note = HydrationValue.ReadString(obj, "note");
         sink.Track(this);
     }
 

@@ -97,12 +97,15 @@ public interface IEntity
     RecordId? GetParentId() => null;
 
     /// <summary>
-    /// SurrealSession calls this immediately before queueing the entity's own DELETE command,
-    /// giving the user's <c>partial void OnDeleting()</c> hook a window to queue child
-    /// deletes / clears. Anything queued from inside lands BEFORE the entity's own delete
-    /// in the commit script — exactly the order the schema's <c>ON DELETE REJECT</c>
-    /// references need (delete records that reference me, then me, then optionally any
-    /// records I reference).
+    /// Fired by <see cref="SurrealSession.DeleteAsync"/>'s pre-flight, once for every
+    /// entity in the predicted cascade set (the delete target plus everything the
+    /// substrate's <c>REFERENCE ON DELETE CASCADE</c> clauses will remove), before the
+    /// single DELETE dispatches. This is an in-memory notification window for the user's
+    /// <c>partial void OnDeleting()</c> hook — clear non-persisted state, telemetry,
+    /// invariant checks. It can NOT queue child deletes: delete is single-dispatch
+    /// (<c>tx.DeleteAsync(target)</c>, no commit script to inject into), and dependent
+    /// persistent state is handled by the schema's emitted <c>REFERENCE ON DELETE</c>
+    /// clauses on the substrate side.
     /// </summary>
     void OnDeleting();
 
@@ -436,9 +439,16 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
         // means a cross-session attempt fails cleanly without leaving a dangling entry in
         // state.Entities pointing at an instance whose Session belongs to someone else.
         entity.Bind(this);
+        // Initialize BEFORE the identity-map insert + command-log append so a throwing
+        // user OnCreate* hook leaves the session unpolluted (no dangling map entry, no
+        // phantom Create in the log). Safe ordering: the emitted Initialize only mints
+        // into the entity's own backing fields and never reads the identity map —
+        // EnsureBoundForSave already relies on that (it runs Bind → Initialize with no
+        // map insert at all). The entity does stay Bound after a failed Initialize;
+        // re-Tracking the same instance on this session remains legal.
+        entity.Initialize(this);
         state.Entities[entity.Id] = entity;
         Record(Command.Create(entity.Id));
-        entity.Initialize(this);
         // Fresh-entity Track: the user owns the entire state, so every slice is
         // implicitly "loaded" — there's no DB row to compare against. Mark all of them
         // so subsequent reads of [Children] / [Reference] / relations return the local
@@ -495,26 +505,40 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
         where T : class, IEntity, new()
     {
         ThrowIfClosed();
-
-        var (sql, bindings) = query.Compile();
-        var response = await queryFn(sql, bindings, ct);
-        var rows = response.Count > 0 ? response.Take(0) : null;
-
-        IHydrationSink sink = this;
-
-        if (rows is SurrealListValue arr)
+        try
         {
-            foreach (var row in arr.List)
+            var (sql, bindings) = query.Compile();
+            var response = await queryFn(sql, bindings, ct).ConfigureAwait(false);
+            // Surface errors from EVERY statement, not just the one Take(0) reads —
+            // a multi-statement response can succeed on statement 0 and fail later,
+            // and Take(0) alone would silently accept it.
+            response.EnsureSuccess();
+            var rows = response.Count > 0 ? response.Take(0) : null;
+
+            IHydrationSink sink = this;
+
+            if (rows is SurrealListValue arr)
             {
-                if (row is SurrealObjectValue obj)
+                foreach (var row in arr.List)
                 {
-                    HydrateMergingRoot<T>(obj, sink, query.Includes);
+                    if (row is SurrealObjectValue obj)
+                    {
+                        HydrateMergingRoot<T>(obj, sink, query.Includes);
+                    }
                 }
             }
+            else if (rows is SurrealObjectValue single)
+            {
+                HydrateMergingRoot<T>(single, sink, query.Includes);
+            }
         }
-        else if (rows is SurrealObjectValue single)
+        catch
         {
-            HydrateMergingRoot<T>(single, sink, query.Includes);
+            // Fail-closed like every other async boundary: a mid-loop hydration failure
+            // would otherwise leave an open session that is half old state, half new,
+            // violating the one-shot invariant.
+            closed = true;
+            throw;
         }
     }
 
@@ -683,7 +707,11 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     /// <c>[Parent]</c> setters: when the user does <c>new Constraint { Design = design }</c>,
     /// the Constraint's <c>Design</c> setter calls <c>design.Session?.AdoptIfUnbound(this)</c>
     /// so the constraint joins the design's session and shows up in
-    /// <c>design.Constraints</c> at Save time. No-op when the child is already bound.
+    /// <c>design.Constraints</c> at Save time. No-op when the child is already bound to
+    /// THIS session; throws when it is bound to a different one — mirroring
+    /// <see cref="Track{T}"/>'s cross-session stance, since silently leaving the child in
+    /// its original session while the caller believes it joined this one is the same
+    /// split-session contamination the emitted <c>Bind</c> guards against.
     /// </summary>
     public void AdoptIfUnbound(IEntity child)
     {
@@ -691,7 +719,15 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
         ArgumentNullException.ThrowIfNull(child);
         if (child.Session is not null)
         {
-            return;
+            if (ReferenceEquals(child.Session, this))
+            {
+                return;
+            }
+
+            throw new InvalidOperationException(
+                $"Cannot adopt entity {child.Id}: it is already bound to a different session. "
+                + "Transfer the entity by abandoning its original session and Tracking it here, "
+                + "or restructure the flow to keep one session.");
         }
 
         Track(child);
@@ -978,6 +1014,20 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
         ThrowIfClosed();
         try
         {
+            // Cross-session guard, mirroring EnsureBoundForSave: an entity bound to a
+            // different session must not plan against THIS session's snapshot — the
+            // prediction would run over the wrong entity graph while the dispatch goes
+            // through this session's transaction. Unbound entities pass: delete is keyed
+            // off the id alone. Inside the try so the throw closes the session, per the
+            // one-catcher contract (a pre-flight CascadeRejectException closes it too).
+            if (entity.Session is not null && !ReferenceEquals(entity.Session, this))
+            {
+                throw new InvalidOperationException(
+                    $"Cannot DeleteAsync entity {entity.Id} through this session: it is bound to a different session. "
+                    + "Delete planning walks the snapshot of the session the entity is bound to — "
+                    + "dispatching through a different session's transaction would split prediction and enforcement.");
+            }
+
             var plan = PlanDelete(entity.Id);
 
             foreach (var id in plan.CascadeSet)
@@ -1404,12 +1454,32 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
         return list;
     }
 
-    private static void HydrateOneVariant<TVariant>(
+    /// <summary>
+    /// Hydrates one edge row. When the edge id is already tracked in this session, the
+    /// EXISTING instance is re-hydrated (payload refresh) and returned — constructing a
+    /// fresh one would be dropped by the sink's dedupe and hand the caller a detached,
+    /// unbound duplicate while the tracked instance kept its stale payload (saving that
+    /// duplicate is the exact identity-map poison public <see cref="Track{T}"/> throws
+    /// to prevent). Mirrors <see cref="HydrateMergingRoot{T}"/>'s merge-over-existing
+    /// contract; re-Hydrate clobbers in-memory payload edits, same as FetchAsync.
+    /// </summary>
+    private void HydrateOneVariant<TVariant>(
         SurrealObjectValue row, IHydrationSink sink, string edgeName, List<TVariant> list)
         where TVariant : class, IEntity, new()
     {
-        var v = new TVariant();
-        v.Hydrate(row, sink);
+        TVariant v;
+        if (HydrationValue.TryReadRecordId(row, "id", out var id)
+            && state.Entities.TryGetValue(id, out var existing)
+            && existing is TVariant tracked)
+        {
+            tracked.Hydrate(row, sink);
+            v = tracked;
+        }
+        else
+        {
+            v = new TVariant();
+            v.Hydrate(row, sink);
+        }
 
         // Variant Hydrate already called sink.Track(this); now mirror the (in, edge, out)
         // tuple into the snapshot edge index so subsequent sync reads off the entity-side
@@ -1682,8 +1752,13 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     }
 
     /// <summary>
-    /// Wipes every in-memory mention of <paramref name="id"/> — the entity itself and
-    /// any edges with this on either endpoint. Parent / reference back-resolution is
+    /// Wipes every in-memory mention of <paramref name="id"/> — the entity itself (plus
+    /// its <c>loadedAtStart</c> / <c>LoadedSlices</c> tracking, so a deleted id stops
+    /// reporting <c>IsTracked</c>/<c>IsSliceLoaded</c> and a later Save pass doesn't
+    /// dispatch UPDATE against a dead row), any edges with this id on either endpoint,
+    /// and any tracked relation-variant ENTITIES whose endpoints include the id —
+    /// SurrealDB removes edge rows when an endpoint record dies, so those variants are
+    /// ghosts mirroring no substrate row. Parent / reference back-resolution is
     /// per-entity now (via <see cref="IEntity.GetParentId"/> + entity backing fields),
     /// so deleted entities naturally drop out of <see cref="QueryChildren{T}"/> when
     /// state.Entities loses them.
@@ -1702,25 +1777,49 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
             DropVariantEdge(ent);
         }
 
-        state.Entities.Remove(id);
+        RemoveTrackedState(id);
 
         foreach (var k in state.Edges.Where(k => k.Source == id || k.Target == id).ToList())
         {
             state.Edges.Remove(k);
         }
+
+        foreach (var kv in state.Entities.ToList())
+        {
+            if (kv.Value is IRelationVariant
+                && TryGetVariantEdge(kv.Value) is { } edge
+                && (edge.Source == id || edge.Target == id))
+            {
+                RemoveTrackedState(kv.Key);
+            }
+        }
     }
 
     /// <summary>
-    /// Mirrors a freshly-saved relation variant into the read-side edge index. Reads the
-    /// variant's two endpoints off <see cref="IEntity.EnumerateReferences"/> (which yields
-    /// <c>("in", inId)</c> / <c>("out", outId)</c> per the variant emitter contract) and
-    /// adds the <c>(in, edgeName, out)</c> tuple — the edge name comes from
-    /// <c>Id.Table</c>, which the variant's per-kind <c>{Marker}Id</c> struct sets to the
-    /// edge-table name (e.g. <c>"restricts"</c>).
-    /// <para>Either endpoint missing means the variant isn't fully formed yet — bail
-    /// silently rather than synthesise a partial edge.</para>
+    /// Drops one id from every per-record tracking structure: identity map,
+    /// <c>loadedAtStart</c>, and <c>LoadedSlices</c>. The invariant: an id absent from
+    /// the identity map must also be absent from the loaded-at-start set and the
+    /// load-shape map — a stale <c>loadedAtStart</c> entry makes a later SaveContext
+    /// report <c>IsTracked=true</c> for a deleted record (UPDATE against a dead row),
+    /// and stale slices answer <c>IsSliceLoaded</c> for a record that no longer exists.
     /// </summary>
-    private void RecordVariantEdge(IEntity variant)
+    private void RemoveTrackedState(RecordId id)
+    {
+        state.Entities.Remove(id);
+        loadedAtStart.Remove(id);
+        state.LoadedSlices.Remove(id);
+    }
+
+    /// <summary>
+    /// Reads a relation variant's <c>(in, edge, out)</c> tuple off
+    /// <see cref="IEntity.EnumerateReferences"/> (which yields <c>("in", inId)</c> /
+    /// <c>("out", outId)</c> per the variant emitter contract). The edge name comes from
+    /// <c>Id.Table</c>, which the variant's per-kind <c>{Marker}Id</c> struct sets to the
+    /// edge-table name (e.g. <c>"restricts"</c>). Returns <c>null</c> when either
+    /// endpoint is missing — the variant isn't fully formed yet, so callers must not
+    /// synthesise a partial edge.
+    /// </summary>
+    private static (RecordId Source, string Edge, RecordId Target)? TryGetVariantEdge(IEntity variant)
     {
         RecordId? src = null;
         RecordId? tgt = null;
@@ -1739,11 +1838,19 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
                 tgt = target;
             }
         }
-        if (src is null || tgt is null)
+        return src is null || tgt is null ? null : (src.Value, variant.Id.Table, tgt.Value);
+    }
+
+    /// <summary>
+    /// Mirrors a freshly-saved relation variant into the read-side edge index by adding
+    /// its <see cref="TryGetVariantEdge"/> tuple. No-op for a half-formed variant.
+    /// </summary>
+    private void RecordVariantEdge(IEntity variant)
+    {
+        if (TryGetVariantEdge(variant) is { } edge)
         {
-            return;
+            state.Edges.Add(edge);
         }
-        state.Edges.Add((src.Value, variant.Id.Table, tgt.Value));
     }
 
     /// <summary>
@@ -1754,27 +1861,9 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     /// </summary>
     private void DropVariantEdge(IEntity variant)
     {
-        RecordId? src = null;
-        RecordId? tgt = null;
-        foreach (var (fieldName, target) in variant.EnumerateReferences())
+        if (TryGetVariantEdge(variant) is { } edge)
         {
-            if (target is null)
-            {
-                continue;
-            }
-            if (fieldName == "in")
-            {
-                src = target;
-            }
-            else if (fieldName == "out")
-            {
-                tgt = target;
-            }
+            state.Edges.Remove(edge);
         }
-        if (src is null || tgt is null)
-        {
-            return;
-        }
-        state.Edges.Remove((src.Value, variant.Id.Table, tgt.Value));
     }
 }
