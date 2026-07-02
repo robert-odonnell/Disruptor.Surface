@@ -259,6 +259,8 @@ internal static class SurfaceQueryCompiler
                 return "*";
             }
 
+            ValidateAliasUniqueness(includes);
+
             var sb = new StringBuilder("*");
             foreach (var node in includes)
             {
@@ -279,6 +281,42 @@ internal static class SurfaceQueryCompiler
                 }
             }
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// Reject include lists where two subselect nodes at the same level share a
+        /// response alias (<see cref="IncludeChildrenNode.ChildTable"/> /
+        /// <see cref="IncludeRelationNode.ParentSliceKey"/>). SurrealDB keeps only one
+        /// <c>AS alias</c> column per name, so a collision would let one subselect
+        /// silently clobber the other in the response — fail loudly at compile time
+        /// instead. Inline-ref nodes project as <c>field.*</c> (no alias) and are exempt.
+        /// </summary>
+        private static void ValidateAliasUniqueness(IReadOnlyList<IIncludeNode> includes)
+        {
+            HashSet<string>? aliases = null;
+            foreach (var node in includes)
+            {
+                var alias = node switch
+                {
+                    IncludeChildrenNode children => children.ChildTable,
+                    IncludeRelationNode relation => relation.ParentSliceKey,
+                    _ => null,
+                };
+                if (alias is null)
+                {
+                    continue;
+                }
+
+                aliases ??= new HashSet<string>(StringComparer.Ordinal);
+                if (!aliases.Add(alias))
+                {
+                    throw new InvalidOperationException(
+                        $"Include alias collision: two includes at the same query level both project as '{alias}'. "
+                        + "SurrealDB keeps only one column per alias, so one subselect would silently clobber the "
+                        + "other in the response. Drop one of the includes, or rename the property so the slices "
+                        + "project under distinct aliases.");
+                }
+            }
         }
 
         /// <summary>
@@ -354,6 +392,18 @@ internal static class SurfaceQueryCompiler
             ContainsPredicate cp  => $"({cp.Field.Identifier()} != NONE AND string::contains({cp.Field.Identifier()}, {Allocate(cp.Substring)}))",
             StartsWithPredicate sp => $"({sp.Field.Identifier()} != NONE AND string::starts_with({sp.Field.Identifier()}, {Allocate(sp.Prefix)}))",
             EndsWithPredicate ep   => $"({ep.Field.Identifier()} != NONE AND string::ends_with({ep.Field.Identifier()}, {Allocate(ep.Suffix)}))",
+            // The IgnoreCase family folds the field via string::lowercase and lowercases
+            // the operand invariantly in C# — host-locale-independent on both sides.
+            // Same NONE guard as the plain string functions above.
+            ContainsIgnoreCasePredicate cip => $"({cip.Field.Identifier()} != NONE AND string::contains(string::lowercase({cip.Field.Identifier()}), {Allocate(cip.Substring.ToLowerInvariant())}))",
+            StartsWithIgnoreCasePredicate sip => $"({sip.Field.Identifier()} != NONE AND string::starts_with(string::lowercase({sip.Field.Identifier()}), {Allocate(sip.Prefix.ToLowerInvariant())}))",
+            EndsWithIgnoreCasePredicate eip => $"({eip.Field.Identifier()} != NONE AND string::ends_with(string::lowercase({eip.Field.Identifier()}), {Allocate(eip.Suffix.ToLowerInvariant())}))",
+            // string::matches is SurrealDB's regex primitive and takes the pattern as an
+            // ordinary (bindable) string argument. The ~ / ?~ / *~ operators are fuzzy
+            // match (edit distance), not regex — intentionally not used here.
+            MatchesPredicate mp => $"({mp.Field.Identifier()} != NONE AND string::matches({mp.Field.Identifier()}, {Allocate(mp.Pattern)}))",
+            IsNullOrEmptyPredicate nep => $"({nep.Field.Identifier()} IS NONE OR {nep.Field.Identifier()} IS NULL OR {nep.Field.Identifier()} = '')",
+            IsNotNullOrEmptyPredicate nnep => $"({nnep.Field.Identifier()} IS NOT NONE AND {nnep.Field.Identifier()} IS NOT NULL AND {nnep.Field.Identifier()} != '')",
             AndPredicate a        => $"({string.Join(" AND ", a.Operands.Select(CompilePredicate))})",
             OrPredicate  o        => $"({string.Join(" OR ", o.Operands.Select(CompilePredicate))})",
             NotPredicate n        => $"!({CompilePredicate(n.Operand)})",
