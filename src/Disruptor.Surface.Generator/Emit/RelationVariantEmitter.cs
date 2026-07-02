@@ -77,10 +77,11 @@ internal static class RelationVariantEmitter
 
             foreach (var variant in variants)
             {
+                // CG029 (variant must be partial) is reported from the located-diagnostics
+                // path (ModelValidation.Validate); the emitter only keeps the fail-closed
+                // skip — a non-partial class can't receive the implementation half.
                 if (!variant.IsPartial)
                 {
-                    spc.ReportDiagnostic(Diagnostic.Create(
-                        Diagnostics.VariantMustBePartial, Location.None, variant.FullName));
                     continue;
                 }
 
@@ -94,14 +95,9 @@ internal static class RelationVariantEmitter
                     continue;
                 }
 
-                // CG031 — union endpoint's TKind binding must match the variant's kind.
-                // The check is per-endpoint: each [In]/[Out] property typed to a union
-                // interface carries an implicit kind via the In<TKind>/Out<TKind> base
-                // its attribute derived from. A mismatch here means the user attached
-                // (e.g.) [Foo] : Out<RestrictsAttribute> to a variant marked [Validates].
-                ReportUnionKindMismatch(spc, variant, "In", variant.In, forward, unionLookup);
-                ReportUnionKindMismatch(spc, variant, "Out", variant.Out, forward, unionLookup);
-
+                // CG031 (union endpoint kind mismatch) is reported from ModelValidation
+                // with a real declaration location; emission proceeds regardless (same
+                // behavior as when the report lived here — the diagnostic is the gate).
                 EmitVariant(spc, variant, forward, variants.Count, typedIdNamespaces, unionLookup, graph);
             }
 
@@ -117,52 +113,13 @@ internal static class RelationVariantEmitter
     }
 
     /// <summary>
-    /// CG031 — reports a <see cref="Diagnostics.UnionEndpointKindMismatch"/> when an
-    /// endpoint property is typed to a union whose <see cref="UnionEndpointModel.KindFullName"/>
-    /// doesn't equal the variant's forward kind. The union's kind is captured at extraction
-    /// from the <c>In&lt;TKind&gt;</c> / <c>Out&lt;TKind&gt;</c> generic base of the user's
-    /// attribute; the variant's forward kind is whichever <c>RelationAttribute</c>-derived
-    /// attribute is applied to the class (walked to its forward partner when the inverse
-    /// is what's on the class). A mismatch makes the resulting schema and runtime
-    /// semantically inconsistent: the variant lives on one edge table but the union promises
-    /// a different one.
-    /// </summary>
-    private static void ReportUnionKindMismatch(
-        SourceProductionContext spc,
-        RelationVariantModel variant,
-        string role,
-        RelationVariantPropertyModel endpoint,
-        RelationKindModel forward,
-        IReadOnlyDictionary<string, UnionEndpointModel> unionLookup)
-    {
-        var union = ResolveUnionEndpoint(endpoint, unionLookup);
-        if (union is null)
-        {
-            return;
-        }
-
-        if (string.Equals(union.KindFullName, forward.FullName, StringComparison.Ordinal))
-        {
-            return;
-        }
-
-        spc.ReportDiagnostic(Diagnostic.Create(
-            Diagnostics.UnionEndpointKindMismatch,
-            Location.None,
-            variant.FullName,
-            SurrealNaming.StripAttributeSuffix(forward.Name),
-            role,
-            union.InterfaceFullName,
-            union.KindFullName));
-    }
-
-    /// <summary>
     /// Builds an FQN → <see cref="UnionEndpointModel"/> lookup keyed by interface full name
     /// (no <c>global::</c> prefix, no trailing <c>?</c>). Empty when the compilation declares
     /// no record-type-union endpoint interfaces — the existing entity / typed-id code paths
-    /// cover every variant in that case.
+    /// cover every variant in that case. Internal (not private): <c>ModelValidation</c>
+    /// reuses it for the relocated CG030/CG031 checks.
     /// </summary>
-    private static Dictionary<string, UnionEndpointModel> BuildUnionEndpointLookup(ModelGraph graph)
+    internal static Dictionary<string, UnionEndpointModel> BuildUnionEndpointLookup(ModelGraph graph)
     {
         var lookup = new Dictionary<string, UnionEndpointModel>(StringComparer.Ordinal);
         foreach (var union in graph.UnionEndpoints)
@@ -178,7 +135,7 @@ internal static class RelationVariantEmitter
     /// the FQN before consulting <paramref name="unionLookup"/>; the lookup keys are
     /// raw FQNs as <see cref="TableExtractor.NormaliseFullName"/> produces them.
     /// </summary>
-    private static UnionEndpointModel? ResolveUnionEndpoint(
+    internal static UnionEndpointModel? ResolveUnionEndpoint(
         RelationVariantPropertyModel p,
         IReadOnlyDictionary<string, UnionEndpointModel> unionLookup)
     {
@@ -320,9 +277,12 @@ internal static class RelationVariantEmitter
                 EntityEmitterCommon.WriteSessionPlumbing(writer);
 
                 // Per-variant id anchor — uses the per-kind {MarkerName}Id type (shared across
-                // every variant of this kind, since they all live on the same edge table). New()
-                // mints a Ulid; Hydrate parses the loaded edge id back into the typed wrapper.
-                EmitIdAnchor(writer, idTypeFqn);
+                // every variant of this kind, since they all live on the same edge table).
+                // The lazy mint derives a deterministic id from (in, edge, out) via
+                // RecordId.ForEdge when both endpoints are set (so re-saving the same pair
+                // replays onto the same row); Hydrate parses the loaded edge id back into
+                // the typed wrapper, and a user-assigned [Id] value wins over the mint.
+                EmitIdAnchor(writer, variant, idTypeFqn, SurrealNaming.ToEdgeName(forward.Name), unionLookup);
 
                 // Endpoint + payload properties — backing fields + property bodies. [In] / [Out]
                 // are required endpoints (one each); [Property] members carry the typed payload.
@@ -371,10 +331,102 @@ internal static class RelationVariantEmitter
         spc.AddSource(hint, writer.ToSourceText());
     }
 
-    private static void EmitIdAnchor(CodeWriter writer, string idTypeFqn)
+    /// <summary>
+    /// Emits the variant's id anchor: the <c>_id</c> backing field, the explicit
+    /// <c>IEntity.Id</c> accessor, the <c>__MintId</c> lazy mint, and (when the user
+    /// declared an <c>[Id]</c> property) the public delegate property.
+    /// <para>
+    /// <b>Deterministic edge ids (2026-07-02):</b> <c>__MintId</c> derives the edge row
+    /// id from the <c>(in, edge, out)</c> triple via <c>RecordId.ForEdge</c> when both
+    /// endpoints are resolvable, so the same endpoint pair always yields the same id
+    /// BEFORE dispatch. On the <c>UNIQUE (in, out)</c> duplicate path the substrate then
+    /// updates the very row id the session records via <c>MarkSaved</c> — no id drift,
+    /// re-save is replay-replace. The mint must live in the anchor (not SaveAsync):
+    /// the session's SaveContext reads <c>IEntity.Id</c> for its visited-set BEFORE the
+    /// emitted SaveAsync body runs, so a SaveAsync-local derive would arrive too late.
+    /// </para>
+    /// <para>
+    /// Precedence: a hydrated or user-assigned id wins (<c>??=</c> only mints when
+    /// <c>_id</c> is null). Endpoints that are unset (or nullable-and-null) at read time
+    /// are never derived from — <c>__MintId</c> falls back to a random Ulid mint, and
+    /// the save path's existing endpoint validation still fails before dispatch, so the
+    /// fallback id never reaches the substrate on that path.
+    /// </para>
+    /// </summary>
+    private static void EmitIdAnchor(
+        CodeWriter writer, RelationVariantModel variant, string idTypeFqn, string edgeName,
+        IReadOnlyDictionary<string, UnionEndpointModel> unionLookup)
     {
         writer.Line($"private {idTypeFqn}? _id;");
-        writer.Line($"global::Disruptor.Surface.Runtime.RecordId {Namespaces.EntityInterface}.Id => _id ??= {idTypeFqn}.New();");
+        writer.Line($"global::Disruptor.Surface.Runtime.RecordId {Namespaces.EntityInterface}.Id => _id ??= __MintId();");
+
+        using (writer.Block($"private {idTypeFqn} __MintId()"))
+        {
+            writer.Line($"var __in = {EndpointTryResolveExpression(variant.In!, unionLookup)};");
+            writer.Line($"var __out = {EndpointTryResolveExpression(variant.Out!, unionLookup)};");
+            writer.Line("return __in is { } __inId && __out is { } __outId");
+            using (writer.Indent())
+            {
+                writer.Line($"? new {idTypeFqn}(global::Disruptor.Surface.Runtime.RecordId.ForEdge(\"{edgeName}\", __inId, __outId).Value)");
+                writer.Line($": {idTypeFqn}.New();");
+            }
+        }
+
+        // Optional user-facing [Id] partial property — a get/set delegate to the anchor,
+        // mirroring PartialEmitter.EmitIdProperty. The setter refuses to mutate the anchor
+        // once the variant is bound to a session (identity map is keyed on the current id).
+        if (variant.Id is { } idProp)
+        {
+            var access = FormatAccessibility(idProp.DeclaredAccessibility);
+            var partialKw = idProp.IsPartial ? "partial " : "";
+            using (writer.Block($"{access} {partialKw}{idTypeFqn} {CSharpText.Identifier(idProp.Name)}"))
+            {
+                writer.Line("get => _id ??= __MintId();");
+                if (idProp.HasSetter || idProp.HasInitOnlySetter)
+                {
+                    using (writer.Block(idProp.HasInitOnlySetter ? "init" : "set"))
+                    {
+                        writer.Line("if (_session is not null)");
+                        using (writer.Indent())
+                        {
+                            writer.Line("throw new global::System.InvalidOperationException(\"Cannot mutate Id after the entity is bound to a session.\");");
+                        }
+
+                        writer.Line("_id = value;");
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Renders a null-safe <c>RecordId?</c> expression that resolves an endpoint's
+    /// current value WITHOUT throwing — the id anchor's <c>__MintId</c> consumes it to
+    /// decide between the deterministic <c>ForEdge</c> derive and the random fallback.
+    /// Shapes mirror <see cref="EmitEndpointIdResolution"/> minus the throw:
+    /// entity-typed reads the cached id (falling back to the entity ref's Id); typed-id
+    /// converts the struct when its Value is populated (default-unset structs and null
+    /// nullables yield null); union endpoints collapse via <c>RecordId.From</c>.
+    /// </summary>
+    private static string EndpointTryResolveExpression(
+        RelationVariantPropertyModel p,
+        IReadOnlyDictionary<string, UnionEndpointModel> unionLookup)
+    {
+        var backing = $"_{ToCamel(p.Name)}";
+        var local = $"__v_{ToCamel(p.Name)}";
+
+        if (ResolveUnionEndpoint(p, unionLookup) is not null)
+        {
+            return $"{backing} is {{ }} {local} ? global::Disruptor.Surface.Runtime.RecordId.From({local}) : (global::Disruptor.Surface.Runtime.RecordId?)null";
+        }
+
+        if (p.Type.IsTableType)
+        {
+            var idBacking = $"_{ToCamel(p.Name)}Id";
+            return $"{idBacking} ?? ({backing} is {{ }} {local} ? (({Namespaces.EntityInterface}){local}).Id : (global::Disruptor.Surface.Runtime.RecordId?)null)";
+        }
+
+        return $"{backing} is {{ Value: not null }} {local} ? (global::Disruptor.Surface.Runtime.RecordId?)(global::Disruptor.Surface.Runtime.RecordId){local} : null";
     }
 
     /// <summary>
@@ -890,15 +942,37 @@ internal static class RelationVariantEmitter
 
             // For payload-bearing variants, bind each payload field separately as $_p_{field}
             // so the SET clause can reference them. ContentValue.Set picks the right
-            // SurrealValue wrapping per scalar type (and omits null values for nullable
-            // payloads).
+            // SurrealValue wrapping per scalar type — but its null-omission contract
+            // (skip the key so the schema DEFAULT applies) is wrong for SQL variables
+            // the ON DUPLICATE KEY UPDATE clause ALWAYS references: a nullable payload
+            // set to null would leave $_p_{field} unbound. Nullable payloads therefore
+            // bind an explicit NONE when null. NONE (not NULL) keeps the duplicate path
+            // convergent with the insert path: $_content omits the null field, so the
+            // field is NONE on a fresh row — the update must land on the same state.
             if (hasPayload)
             {
                 foreach (var p in persistedPayload)
                 {
                     var backing = $"_{ToCamel(p.Name)}";
                     var bindLit = Quote($"_p_{p.FieldName}");
-                    writer.Line($"global::Disruptor.Surface.Runtime.ContentValue.Set(__bindings, {bindLit}, {backing});");
+                    if (p.Type.IsNullable)
+                    {
+                        writer.Line($"if ({backing} is null)");
+                        using (writer.Indent())
+                        {
+                            writer.Line($"__bindings[{bindLit}] = global::Disruptor.Surreal.Values.SurrealValue.None;");
+                        }
+
+                        writer.Line("else");
+                        using (writer.Indent())
+                        {
+                            writer.Line($"global::Disruptor.Surface.Runtime.ContentValue.Set(__bindings, {bindLit}, {backing});");
+                        }
+                    }
+                    else
+                    {
+                        writer.Line($"global::Disruptor.Surface.Runtime.ContentValue.Set(__bindings, {bindLit}, {backing});");
+                    }
                 }
             }
 
@@ -1144,22 +1218,14 @@ internal static class RelationVariantEmitter
         }
 
         // Pair-collision detection — two variants with the same (in.tb, out.tb) would
-        // make the dispatcher ambiguous. Group + report the offenders, then bail.
-        var collisions = pairs
+        // make the dispatcher ambiguous. CG030 is reported (with a real declaration
+        // location) from ModelValidation.Validate, which runs the same pair computation;
+        // the emitter only keeps the fail-closed dispatcher suppression.
+        var hasCollision = pairs
             .GroupBy(p => (p.InTable, p.OutTable))
-            .Where(g => g.Count() > 1)
-            .ToList();
-        if (collisions.Count > 0)
+            .Any(g => g.Count() > 1);
+        if (hasCollision)
         {
-            foreach (var group in collisions)
-            {
-                var offenders = string.Join(", ", group.Select(g => g.Variant.FullName));
-                spc.ReportDiagnostic(Diagnostic.Create(
-                    Diagnostics.VariantEndpointPairCollision,
-                    Location.None,
-                    forward.FullName,
-                    $"({group.Key.InTable}, {group.Key.OutTable}) shared by {offenders}"));
-            }
             return;
         }
 
@@ -1226,7 +1292,7 @@ internal static class RelationVariantEmitter
     /// <see cref="ResolveEndpointTableName"/>); union endpoints contribute every
     /// participating member's table name, deduped + sorted for stable emission.
     /// </summary>
-    private static List<string> ResolveEndpointTableNames(
+    internal static List<string> ResolveEndpointTableNames(
         RelationVariantPropertyModel p,
         IReadOnlyDictionary<string, UnionEndpointModel> unionLookup,
         IReadOnlyDictionary<string, TableModel> tablesByFullName)
