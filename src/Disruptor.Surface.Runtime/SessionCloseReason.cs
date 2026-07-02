@@ -40,6 +40,21 @@ public enum SessionCloseKind
 
     /// <summary>One of the async variant / edge-traversal query methods failed mid-dispatch or mid-hydration.</summary>
     QueryFailed,
+
+    /// <summary>
+    /// <see cref="SurrealSession.FetchAsync{T}(Query.SurfaceQuery{T}, Disruptor.Surreal.SurrealClient, CancellationToken)"/>'s
+    /// pre-flight root-pin check rejected the call before any wire dispatch: the query's
+    /// pinned id (<see cref="Query.SurfaceQuery{T}.WithId"/>) is not tracked in the
+    /// session. <see cref="SessionCloseReason.EntityId"/> carries the unknown pinned id.
+    /// </summary>
+    RejectedFetch,
+
+    /// <summary>
+    /// <see cref="Query.SurfaceQuery{T}.ExecuteIntoSessionAsync(SurrealSession, Disruptor.Surreal.SurrealClient, CancellationToken)"/>
+    /// failed mid-dispatch or mid-hydration while populating the supplied session —
+    /// the session fails closed like every other async boundary.
+    /// </summary>
+    HydrationFailed,
 }
 
 /// <summary>
@@ -75,6 +90,8 @@ public sealed record SessionCloseReason(
                 SessionCloseKind.UnrelateFailed => $"UnrelateAsync{of} failed",
                 SessionCloseKind.FetchFailed => $"FetchAsync{of} failed",
                 SessionCloseKind.QueryFailed => $"an async edge query{of} failed",
+                SessionCloseKind.RejectedFetch => $"FetchAsync{of} was rejected by the pre-flight root-pin check",
+                SessionCloseKind.HydrationFailed => $"a query hydration{of} into the session failed",
                 _ => $"an operation{of} failed",
             };
             return Cause is null

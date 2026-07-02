@@ -968,13 +968,16 @@ public sealed class SurrealSessionTests
     public async Task FetchAsync_OnDispatchFailure_ClosesSession_AndRethrows()
     {
         // FetchAsync joins the fail-closed family: a wire failure mid-fetch would
-        // otherwise leave an open session that is half old state, half new.
+        // otherwise leave an open session that is half old state, half new. The query
+        // pins a tracked root — the enforced Fetch contract — so the failure under
+        // test is the wire dispatch, not the pre-flight checks.
         var session = new SurrealSession();
+        var target = session.Track(new StubTarget());
         var db = FakeSurreal.Throwing(new IOException("boom"));
         await using var tx = await db.BeginTransactionAsync();
 
         var ex = await Assert.ThrowsAsync<IOException>(
-            () => session.FetchAsync(new SurfaceQuery<StubTarget>("targets"), tx));
+            () => session.FetchAsync(new SurfaceQuery<StubTarget>("targets").WithId(target.Id), tx));
         Assert.Equal("boom", ex.Message);
         Assert.True(session.IsClosed);
     }
@@ -1008,11 +1011,135 @@ public sealed class SurrealSessionTests
         };
 
         var session = new SurrealSession();
+        var target = session.Track(new StubTarget());
         await using var tx = await db.BeginTransactionAsync();
 
         await Assert.ThrowsAsync<SurrealRpcException>(
-            () => session.FetchAsync(new SurfaceQuery<StubTarget>("targets"), tx));
+            () => session.FetchAsync(new SurfaceQuery<StubTarget>("targets").WithId(target.Id), tx));
         Assert.True(session.IsClosed);
+    }
+
+    // ──────────────── 2026-07-02 review: FetchAsync boundary contract ────────
+
+    [Fact]
+    public async Task FetchAsync_QueryWithoutWithId_Throws_BeforeAnyWireDispatch_SessionStaysOpen()
+    {
+        // Fetch is a slice widener, never a bulk import: a pin-less query
+        // (.Where(...).Limit(100).Include*(...)) would silently import unrelated
+        // aggregate roots and scalar-clobber tracked ones. Rejected as pure API misuse
+        // (ArgumentException, session stays open — the UnrelateAsync both-null stance)
+        // BEFORE anything reaches the wire.
+        var session = new SurrealSession();
+        var target = session.Track(new StubTarget());
+        var (db, conn) = FakeSurreal.NullWithRecording();
+        await using var tx = await db.BeginTransactionAsync();
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(
+            () => session.FetchAsync(new SurfaceQuery<StubTarget>("targets"), tx));
+        Assert.Contains("WithId", ex.Message);
+
+        // The recording fake proves no query dispatched (only the txn "begin").
+        Assert.DoesNotContain(conn.Sent, s => s.Method == "query");
+        // API misuse doesn't kill the snapshot — the session stays usable.
+        Assert.False(session.IsClosed);
+        Assert.Same(target, session.Get<StubTarget>(target.Id));
+    }
+
+    [Fact]
+    public async Task FetchAsync_PinnedIdNotTracked_Throws_Closes_AndDoesNotTrackTheId()
+    {
+        // The pinned root must ALREADY be tracked: fetching an unknown id means the
+        // caller's view of the snapshot is wrong, so the session closes (pre-flight
+        // rejection, CascadeRejectException precedent) — and the unknown id must not
+        // appear in the session afterward. No wire dispatch.
+        var session = new SurrealSession();
+        session.Track(new StubTarget());
+        var unknownId = new RecordId("targets", "unknown");
+        var (db, conn) = FakeSurreal.NullWithRecording();
+        await using var tx = await db.BeginTransactionAsync();
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => session.FetchAsync(new SurfaceQuery<StubTarget>("targets").WithId(unknownId), tx));
+        Assert.Contains("not tracked", thrown.Message);
+
+        Assert.DoesNotContain(conn.Sent, s => s.Method == "query");
+        Assert.True(session.IsClosed);
+        Assert.False(session.IsTracked(unknownId));
+
+        var reason = session.CloseReason!;
+        Assert.Equal(SessionCloseKind.RejectedFetch, reason.Kind);
+        Assert.Equal(unknownId, reason.EntityId);
+        Assert.Same(thrown, reason.Cause);
+    }
+
+    [Fact]
+    public async Task FetchAsync_ResponseRootRowWithForeignId_Throws_Closes_AndDoesNotTrackTheRow()
+    {
+        // A malicious/buggy response can return root rows the pin never asked for.
+        // Any root row whose id differs from the pinned id is rejected before it
+        // hydrates: the session fails closed and the foreign row is NOT tracked.
+        var session = new SurrealSession();
+        var target = session.Track(new StubTarget());
+        var intruderId = new RecordId("targets", "intruder");
+
+        var (db, conn) = FakeSurreal.NullWithRecording();
+        conn.Responder = (method, _, _) => method switch
+        {
+            "begin" => new SurrealUuidValue(Guid.NewGuid()),
+            "query" => WrapAsQueryResponse(new SurrealListValue(
+            [
+                new SurrealObjectValue(new SurrealObject
+                {
+                    ["id"] = new SurrealRecordIdValue(intruderId.ToSdk()),
+                    ["name"] = "intruder",
+                }),
+            ])),
+            _ => SurrealValue.None,
+        };
+        await using var tx = await db.BeginTransactionAsync();
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => session.FetchAsync(new SurfaceQuery<StubTarget>("targets").WithId(target.Id), tx));
+        Assert.Contains("pinned", thrown.Message);
+
+        Assert.True(session.IsClosed);
+        Assert.False(session.IsTracked(intruderId));
+        var reason = session.CloseReason!;
+        Assert.Equal(SessionCloseKind.FetchFailed, reason.Kind);
+        Assert.Equal(target.Id, reason.EntityId);
+        Assert.Same(thrown, reason.Cause);
+    }
+
+    [Fact]
+    public async Task FetchAsync_PinnedTrackedRoot_ReHydratesTheExistingInstance()
+    {
+        // The legitimate top-up flow: pin the tracked root, fetch, and the DB row
+        // re-Hydrates over the SAME instance (slice-widening scalar clobber). The
+        // session stays open.
+        var session = new SurrealSession();
+        var target = session.Track(new StubTarget());
+
+        var (db, conn) = FakeSurreal.NullWithRecording();
+        conn.Responder = (method, _, _) => method switch
+        {
+            "begin" => new SurrealUuidValue(Guid.NewGuid()),
+            "query" => WrapAsQueryResponse(new SurrealListValue(
+            [
+                new SurrealObjectValue(new SurrealObject
+                {
+                    ["id"] = new SurrealRecordIdValue(target.Id.ToSdk()),
+                    ["name"] = "fresh-from-db",
+                }),
+            ])),
+            _ => SurrealValue.None,
+        };
+        await using var tx = await db.BeginTransactionAsync();
+
+        await session.FetchAsync(new SurfaceQuery<StubTarget>("targets").WithId(target.Id), tx);
+
+        Assert.False(session.IsClosed);
+        Assert.Same(target, session.Get<StubTarget>(target.Id));
+        Assert.Equal("fresh-from-db", target.Name);
     }
 
     [Fact]
@@ -1170,16 +1297,18 @@ public sealed class SurrealSessionTests
     public async Task FetchAsync_WireFailure_StampsFetchFailed()
     {
         var session = new SurrealSession();
+        var target = session.Track(new StubTarget());
         var db = FakeSurreal.Throwing(new IOException("boom"));
         await using var tx = await db.BeginTransactionAsync();
 
         var thrown = await Assert.ThrowsAsync<IOException>(
-            () => session.FetchAsync(new SurfaceQuery<StubTarget>("targets"), tx));
+            () => session.FetchAsync(new SurfaceQuery<StubTarget>("targets").WithId(target.Id), tx));
 
         Assert.NotNull(session.CloseReason);
         var reason = session.CloseReason!;
         Assert.Equal(SessionCloseKind.FetchFailed, reason.Kind);
-        Assert.Null(reason.EntityId);
+        // The pinned root names the failing fetch in the close reason.
+        Assert.Equal(target.Id, reason.EntityId);
         Assert.Same(thrown, reason.Cause);
     }
 

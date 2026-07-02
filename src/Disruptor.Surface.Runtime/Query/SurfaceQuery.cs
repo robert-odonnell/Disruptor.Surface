@@ -376,6 +376,13 @@ public sealed class SurfaceQuery<T>
     /// session — useful for batched read-then-mutate flows — though the typical path is
     /// the generated <c>LoadAsync</c> extension.
     /// </para>
+    /// <para>
+    /// Fail-closed: any dispatch or mid-loop hydration failure closes
+    /// <paramref name="session"/> with <see cref="SessionCloseKind.HydrationFailed"/>
+    /// (original exception preserved as <see cref="SessionCloseReason.Cause"/> and
+    /// rethrown unwrapped) — a caller-supplied session must not survive half old state,
+    /// half new, same boundary contract as <see cref="SurrealSession.FetchAsync{T}(SurfaceQuery{T}, SurrealClient, CancellationToken)"/>.
+    /// </para>
     /// </summary>
     public Task<IReadOnlyList<T>> ExecuteIntoSessionAsync(
         SurrealSession session,
@@ -395,47 +402,61 @@ public sealed class SurfaceQuery<T>
         Func<string, SurrealObject?, CancellationToken, Task<SurrealQueryResponse>> queryFn,
         CancellationToken ct)
     {
-        var (sql, bindings) = SurfaceQueryCompiler.Compile(Table, Filter, PinnedId, Includes, OrderClauses, LimitCount, StartAt);
-        var response = await queryFn(sql, bindings, ct);
-        var rows = ExtractRows(response);
-
-        IHydrationSink sink = session;
-
-        // Collect the object rows first so entity k always pairs with rowObjs[k] in the
-        // nested-hydration pass below. Filtering inline while indexing the raw row array
-        // desyncs the pairing: one non-object row (e.g. a NONE element) would shift every
-        // subsequent entity onto its neighbour's nested slices.
-        var rowObjs = new List<SurrealObjectValue>();
-        if (rows is SurrealListValue arr)
+        try
         {
-            foreach (var row in arr.List)
+            var (sql, bindings) = SurfaceQueryCompiler.Compile(Table, Filter, PinnedId, Includes, OrderClauses, LimitCount, StartAt);
+            var response = await queryFn(sql, bindings, ct);
+            var rows = ExtractRows(response);
+
+            IHydrationSink sink = session;
+
+            // Collect the object rows first so entity k always pairs with rowObjs[k] in the
+            // nested-hydration pass below. Filtering inline while indexing the raw row array
+            // desyncs the pairing: one non-object row (e.g. a NONE element) would shift every
+            // subsequent entity onto its neighbour's nested slices.
+            var rowObjs = new List<SurrealObjectValue>();
+            if (rows is SurrealListValue arr)
             {
-                if (row is SurrealObjectValue obj)
+                foreach (var row in arr.List)
                 {
-                    rowObjs.Add(obj);
+                    if (row is SurrealObjectValue obj)
+                    {
+                        rowObjs.Add(obj);
+                    }
                 }
             }
-        }
-        else if (rows is SurrealObjectValue single)
-        {
-            rowObjs.Add(single);
-        }
+            else if (rows is SurrealObjectValue single)
+            {
+                rowObjs.Add(single);
+            }
 
-        var list = new List<T>(rowObjs.Count);
-        foreach (var rowObj in rowObjs)
-        {
-            list.Add(HydrateOne(rowObj, sink));
-        }
+            var list = new List<T>(rowObjs.Count);
+            foreach (var rowObj in rowObjs)
+            {
+                list.Add(HydrateOne(rowObj, sink));
+            }
 
-        // Walk each root row's nested arrays and feed them through Hydrate as well —
-        // children / inline-ref records emitted by the compiler land in the same session
-        // and reads of [Children] / [Reference] resolve correctly.
-        foreach (var rowObj in rowObjs)
-        {
-            HydrateNested(rowObj, Includes, sink);
-        }
+            // Walk each root row's nested arrays and feed them through Hydrate as well —
+            // children / inline-ref records emitted by the compiler land in the same session
+            // and reads of [Children] / [Reference] resolve correctly.
+            foreach (var rowObj in rowObjs)
+            {
+                HydrateNested(rowObj, Includes, sink);
+            }
 
-        return list;
+            return list;
+        }
+        catch (Exception ex)
+        {
+            // Fail-closed, same wrap as SurrealSession.FetchAsync: this method mutates
+            // the supplied session, so a mid-loop dispatch/hydration failure would
+            // otherwise leave the CALLER's session open and half old state, half new.
+            // For the fresh internal sessions the other terminals (ExecuteAsync,
+            // FirstOrDefaultAsync, Single*, generated LoadAsync) new up, closing is
+            // harmless — the throw discards them anyway.
+            session.CloseAsFailed(SessionCloseKind.HydrationFailed, ex);
+            throw;
+        }
 
         static T HydrateOne(SurrealObjectValue row, IHydrationSink sink)
         {
