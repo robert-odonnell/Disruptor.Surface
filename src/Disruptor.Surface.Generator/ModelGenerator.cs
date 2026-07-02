@@ -12,10 +12,13 @@ public sealed class ModelGenerator : IIncrementalGenerator
 {
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
+        // Record declarations are admitted alongside classes so the pipeline can REJECT
+        // them with CG048 — AttributeTargets.Class allows `[Table] partial record X`,
+        // and a class-only predicate silently ignored it (clean compile, no output).
         var tables = context.SyntaxProvider
             .ForAttributeWithMetadataName(
                 AnnotationsMetadata.Table,
-                predicate: static (node, _) => node is ClassDeclarationSyntax,
+                predicate: static (node, _) => node is ClassDeclarationSyntax or RecordDeclarationSyntax,
                 transform: static (ctx, ct) => TableExtractor.TryExtract(ctx, ct))
             .Where(static t => t is not null)
             .Select(static (t, _) => t!);
@@ -48,7 +51,7 @@ public sealed class ModelGenerator : IIncrementalGenerator
         var compositionRoots = context.SyntaxProvider
             .ForAttributeWithMetadataName(
                 AnnotationsMetadata.CompositionRoot,
-                predicate: static (node, _) => node is ClassDeclarationSyntax,
+                predicate: static (node, _) => node is ClassDeclarationSyntax or RecordDeclarationSyntax,
                 transform: static (ctx, ct) => CompositionRootExtractor.TryExtract(ctx, ct))
             .Where(static c => c is not null)
             .Select(static (c, _) => c!);
@@ -135,6 +138,18 @@ public sealed class ModelGenerator : IIncrementalGenerator
                 Location.None,
                 nested.FullName,
                 nested.AttributeName));
+        }
+
+        // CG048 — [Table] / [CompositionRoot] / relation kind attributes on record
+        // declarations. The linker pulled these out of the graph; this explains why
+        // nothing was emitted for them (previously: silent skip, clean compile).
+        foreach (var record in graph.RecordTypeIssues)
+        {
+            spc.ReportDiagnostic(Diagnostic.Create(
+                Diagnostics.RecordTypeNotSupported,
+                Location.None,
+                record.FullName,
+                record.AttributeName));
         }
 
         // CG046/CG047 — malformed relation variants pulled out of the graph by the

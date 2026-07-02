@@ -59,4 +59,5 @@ public sealed record RelationVariantModel(
     bool IsPartial,
     string DeclaredAccessibility,
     EquatableArray<string> ImplementedInterfaceFullNames,
-    EquatableArray<string> DuplicateRoles);
+    EquatableArray<string> DuplicateRoles,
+    bool IsRecord);

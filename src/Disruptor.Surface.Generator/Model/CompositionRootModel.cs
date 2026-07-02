@@ -13,4 +13,5 @@ public sealed record CompositionRootModel(
     string Name,
     string DeclaredAccessibility,
     bool IsPartial,
-    bool IsNested);
+    bool IsNested,
+    bool IsRecord);

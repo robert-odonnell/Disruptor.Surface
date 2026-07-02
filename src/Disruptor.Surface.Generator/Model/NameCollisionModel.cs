@@ -39,3 +39,14 @@ public sealed record NameCollisionModel(
 public sealed record NestedTypeIssueModel(
     string FullName,
     string AttributeName);
+
+/// <summary>
+/// A model attribute (<c>[Table]</c> / <c>[CompositionRoot]</c> / an on-class relation
+/// kind attribute) applied to a <c>record</c> declaration (CG048). The FAWMN predicates
+/// admit record declarations only so the transform can flag them; the linker pulls the
+/// flagged models out of the graph and this issue explains why nothing was emitted —
+/// previously the predicate silently skipped records (clean compile, zero output).
+/// </summary>
+public sealed record RecordTypeIssueModel(
+    string FullName,
+    string AttributeName);

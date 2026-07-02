@@ -819,6 +819,93 @@ public sealed class DiagnosticsTests
     }
 
     [Fact]
+    public void CG048_TableOnRecord_IsRejected()
+    {
+        // AttributeTargets.Class admits records, but the old FAWMN predicate only
+        // matched ClassDeclarationSyntax — `[Table] partial record X` compiled clean
+        // and generated nothing. The predicate now admits records and CG048 rejects.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [Table] public partial record Snapshot {
+                [Property] public partial string Name { get; set; }
+            }
+            """;
+        var (result, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.Contains(runDiags, d => d.Id == "CG048");
+
+        var message = runDiags.First(d => d.Id == "CG048").GetMessage();
+        Assert.Contains("M.Snapshot", message);
+        Assert.Contains("[Table]", message);
+
+        // Fail-closed: nothing emitted for the record.
+        Assert.All(result.Results, r => Assert.Null(r.Exception));
+        Assert.DoesNotContain(result.GeneratedTrees,
+            t => t.FilePath.Contains("Snapshot", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void CG048_CompositionRootOnRecord_IsRejected()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [CompositionRoot] public partial record Workspace { }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG048");
+        Assert.NotNull(diag);
+        Assert.Contains("M.Workspace", diag!.GetMessage());
+        Assert.Contains("[CompositionRoot]", diag.GetMessage());
+    }
+
+    [Fact]
+    public void CG048_RelationKindOnRecordVariant_IsRejected()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+
+            [Table] public partial class Constraint {
+                [Id] public partial ConstraintId Id { get; set; }
+            }
+
+            [Restricts]
+            public partial record RecordVariant {
+                [In] public partial Constraint Source { get; set; }
+                [Out] public partial Constraint Target { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG048");
+        Assert.NotNull(diag);
+        Assert.Contains("M.RecordVariant", diag!.GetMessage());
+        Assert.Contains("[Restricts]", diag.GetMessage());
+    }
+
+    [Fact]
+    public void CG048_DoesNotFire_OnClassDeclarations()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+
+            [Table] public partial class Plain {
+                [Property] public partial string Name { get; set; }
+            }
+
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id == "CG048");
+    }
+
+    [Fact]
     public void CG042_CG043_CG044_CG045_DoNotFire_OnNormalShapes()
     {
         // Distinct table names, one relation kind pair, one aggregate root, everything

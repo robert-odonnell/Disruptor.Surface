@@ -55,6 +55,16 @@ internal static class RelationLinker
         tables = FilterNestedTables(tables, nestedTypeIssues);
         compositionRoots = FilterNestedCompositionRoots(compositionRoots, nestedTypeIssues);
 
+        // CG048 — [Table] / [CompositionRoot] / relation kind attributes on record
+        // declarations. The FAWMN predicates admit records only so we can reject them
+        // here; the emitters' partial-class fragments don't compose with record
+        // synthesis. Same fail-closed pattern as nested types above.
+        var recordTypeIssues = ImmutableArray.CreateBuilder<RecordTypeIssueModel>();
+        tables = FilterRecords(tables, recordTypeIssues, static t => t.IsRecord, static t => (t.FullName, "Table"));
+        compositionRoots = FilterRecords(compositionRoots, recordTypeIssues, static r => r.IsRecord, static r => (r.FullName, "CompositionRoot"));
+        relationVariants = FilterRecords(relationVariants, recordTypeIssues, static v => v.IsRecord,
+            static v => (v.FullName, SurrealNaming.StripAttributeSuffix(SurrealNaming.SimpleName(v.KindAttributeFqn))));
+
         // CG046 — variants declaring the same singular role ([In]/[Out]/[Id]) more than
         // once. The extractor flags them (RelationVariantModel.DuplicateRoles) instead of
         // dropping them, so the user gets a diagnostic naming the variant and the role
@@ -116,6 +126,7 @@ internal static class RelationLinker
             IndexIssues: new EquatableArray<IndexIssueModel>(indexIssues),
             NameCollisions: new EquatableArray<NameCollisionModel>(nameCollisions),
             NestedTypeIssues: new EquatableArray<NestedTypeIssueModel>(nestedTypeIssues.ToImmutable()),
+            RecordTypeIssues: new EquatableArray<RecordTypeIssueModel>(recordTypeIssues.ToImmutable()),
             RelationVariantIssues: new EquatableArray<RelationVariantIssueModel>(relationVariantIssues.ToImmutable()),
             Aggregates: new EquatableArray<AggregateModel>(aggregates),
             AggregateConflicts: new EquatableArray<string>(conflicts),
@@ -142,6 +153,39 @@ internal static class RelationLinker
             else
             {
                 kept.Add(t);
+            }
+        }
+
+        return kept.ToImmutable();
+    }
+
+    /// <summary>
+    /// Pulls record-declared models (CG048) out of a collected set, adding one
+    /// <see cref="RecordTypeIssueModel"/> per offender. Generic over the model type so
+    /// tables, composition roots, and relation variants share one filter.
+    /// </summary>
+    private static ImmutableArray<T> FilterRecords<T>(
+        ImmutableArray<T> models,
+        ImmutableArray<RecordTypeIssueModel>.Builder issues,
+        Func<T, bool> isRecord,
+        Func<T, (string FullName, string AttributeName)> describe)
+    {
+        if (!models.Any(isRecord))
+        {
+            return models;
+        }
+
+        var kept = ImmutableArray.CreateBuilder<T>(models.Length);
+        foreach (var model in models)
+        {
+            if (isRecord(model))
+            {
+                var (fullName, attributeName) = describe(model);
+                issues.Add(new RecordTypeIssueModel(fullName, attributeName));
+            }
+            else
+            {
+                kept.Add(model);
             }
         }
 

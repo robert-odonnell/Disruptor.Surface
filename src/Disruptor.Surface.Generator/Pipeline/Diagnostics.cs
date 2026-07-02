@@ -302,6 +302,14 @@ internal static class Diagnostics
         defaultSeverity: DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
+    public static readonly DiagnosticDescriptor RecordTypeNotSupported = new(
+        id: "CG048",
+        title: "Model attribute is not supported on record declarations",
+        messageFormat: "'{0}' carries [{1}] but is declared as a record; the generator emits partial-class implementation halves (backing fields, IEntity plumbing, session binding) that don't compose with record synthesis (positional constructor, copy semantics, value equality). Declare '{0}' as a partial class.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public static readonly DiagnosticDescriptor VariantMissingEndpoints = new(
         id: "CG047",
         title: "Relation variant declares or inherits no [In]/[Out] endpoints",

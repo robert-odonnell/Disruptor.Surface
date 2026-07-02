@@ -15,7 +15,12 @@ internal static class TableExtractor
             return null;
         }
 
-        if (type.TypeKind != TypeKind.Class)
+        // Records are admitted (the FAWMN predicate matches record declarations) so the
+        // linker can reject them with CG048 — previously `[Table] partial record X`
+        // compiled clean and generated nothing. Non-record structs/interfaces can't
+        // carry [Table] (AttributeTargets.Class), so the class-or-record guard is
+        // purely defensive.
+        if (type.TypeKind != TypeKind.Class && !type.IsRecord)
         {
             return null;
         }
@@ -52,6 +57,7 @@ internal static class TableExtractor
             Name: type.Name,
             IsPartial: isPartial,
             IsNested: type.ContainingType is not null,
+            IsRecord: type.IsRecord,
             IsAbstract: type.IsAbstract,
             IsSealed: type.IsSealed,
             IsAggregateRoot: isAggregateRoot,

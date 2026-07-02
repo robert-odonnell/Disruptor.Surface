@@ -37,10 +37,10 @@ internal static class RelationVariantExtractor
     /// attribute.
     /// </summary>
     public static bool IsClassWithAttributeList(SyntaxNode node, CancellationToken _)
-        => node is ClassDeclarationSyntax cls && cls.AttributeLists.Count > 0;
+        => node is (ClassDeclarationSyntax or RecordDeclarationSyntax) and TypeDeclarationSyntax { AttributeLists.Count: > 0 };
 
     public static RelationVariantModel? TryExtract(GeneratorSyntaxContext ctx, CancellationToken ct)
-        => ctx.Node is ClassDeclarationSyntax decl
+        => ctx.Node is TypeDeclarationSyntax decl and (ClassDeclarationSyntax or RecordDeclarationSyntax)
             ? ctx.SemanticModel.GetDeclaredSymbol(decl, ct) is INamedTypeSymbol cls
                 ? TryExtractFromSymbol(cls, ct)
                 : null
@@ -180,7 +180,8 @@ internal static class RelationVariantExtractor
             IsPartial: PartialDeclaration.IsDeclared(cls, ct),
             DeclaredAccessibility: cls.DeclaredAccessibility.ToString(),
             ImplementedInterfaceFullNames: new EquatableArray<string>(implementedInterfacesBuilder.ToImmutable()),
-            DuplicateRoles: new EquatableArray<string>(duplicateRolesBuilder.ToImmutable()));
+            DuplicateRoles: new EquatableArray<string>(duplicateRolesBuilder.ToImmutable()),
+            IsRecord: cls.IsRecord);
     }
 
     /// <summary>
