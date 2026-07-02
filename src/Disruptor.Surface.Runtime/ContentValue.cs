@@ -73,13 +73,13 @@ public static class ContentValue
             }
         }
 
-        public void Set(string key, DateTime value) => obj[key] = (DateTimeOffset)value;
+        public void Set(string key, DateTime value) => obj[key] = ToInstant(value);
 
         public void Set(string key, DateTime? value)
         {
             if (value is { } v)
             {
-                obj[key] = (DateTimeOffset)v;
+                obj[key] = ToInstant(v);
             }
         }
 
@@ -93,13 +93,14 @@ public static class ContentValue
             }
         }
 
-        public void Set(string key, Guid value) => obj[key] = value;
+        /// <summary>Guid serialises as its canonical 36-char "D" format string (matches SurrealDB's <c>TYPE string</c> mapping in <c>SchemaEmitter</c> — the raw CBOR uuid would be rejected by SCHEMAFULL tables).</summary>
+        public void Set(string key, Guid value) => obj[key] = value.ToString("D");
 
         public void Set(string key, Guid? value)
         {
             if (value is { } v)
             {
-                obj[key] = v;
+                obj[key] = v.ToString("D");
             }
         }
 
@@ -123,4 +124,21 @@ public static class ContentValue
             }
         }
     }
+
+    /// <summary>
+    /// <see cref="DateTime"/> → instant conversion for the write and query-binding paths.
+    /// Invariant: the stored instant is deterministic regardless of host timezone.
+    /// <see cref="DateTimeKind.Unspecified"/> is treated as UTC — never machine-local:
+    /// the naive <c>(DateTimeOffset)</c> cast throws <see cref="ArgumentOutOfRangeException"/>
+    /// for <c>default(DateTime)</c> on any UTC+N machine and silently shifts wall-clock
+    /// values per host zone. <see cref="DateTimeKind.Utc"/> maps directly;
+    /// <see cref="DateTimeKind.Local"/> converts via the CLR's instant-preserving cast
+    /// (the one case that legitimately reads the host zone — the instant survives).
+    /// Hydration reads back <c>UtcDateTime</c> (<see cref="HydrationValue"/>), so
+    /// Unspecified and Utc values round-trip losslessly in instant terms.
+    /// </summary>
+    internal static DateTimeOffset ToInstant(DateTime value)
+        => value.Kind == DateTimeKind.Unspecified
+            ? new DateTimeOffset(DateTime.SpecifyKind(value, DateTimeKind.Utc))
+            : (DateTimeOffset)value;
 }

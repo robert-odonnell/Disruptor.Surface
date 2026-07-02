@@ -9,8 +9,19 @@ namespace Disruptor.Surface.Runtime.Query;
 /// </summary>
 public interface IPredicate;
 
-/// <summary>Equality test: <c>field = $param</c>.</summary>
+/// <summary>
+/// Equality test: <c>field = $param</c>. A <c>null</c> <see cref="Value"/> compiles to
+/// the unset test <c>(field IS NONE OR field IS NULL)</c> instead of a binding — the
+/// write path omits keys for null values, so stored nulls are NONE (absent fields) and
+/// <c>field = NULL</c> would never match them.
+/// </summary>
 public sealed record EqPredicate(string Field, object? Value) : IPredicate;
+
+/// <summary>Field-unset test: <c>(field IS NONE OR field IS NULL)</c>. The named form of <c>Eq(null)</c>.</summary>
+public sealed record IsNonePredicate(string Field) : IPredicate;
+
+/// <summary>Field-set test: <c>(field IS NOT NONE AND field IS NOT NULL)</c>. The complement of <see cref="IsNonePredicate"/>.</summary>
+public sealed record IsNotNonePredicate(string Field) : IPredicate;
 
 /// <summary>Comparison operators emitted as <c>&lt;</c>, <c>&lt;=</c>, <c>&gt;</c>, <c>&gt;=</c>.</summary>
 public enum RangeOp

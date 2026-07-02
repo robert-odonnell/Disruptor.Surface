@@ -26,7 +26,9 @@ public static partial class SurrealFormatter
         return name;
     }
 
-    [GeneratedRegex("^[A-Za-z_][A-Za-z0-9_]*$", RegexOptions.Compiled)] private static partial Regex IdentifierPattern();
+    // \A/\z anchors, not ^/$ — the $ anchor also matches before a trailing newline, so
+    // "name\n" would slip through and land the newline in generated SurrealQL.
+    [GeneratedRegex(@"\A[A-Za-z_][A-Za-z0-9_]*\z", RegexOptions.Compiled)] private static partial Regex IdentifierPattern();
 }
 
 public sealed class SurrealFormatException(string message) : Exception(message);
