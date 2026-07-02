@@ -1114,9 +1114,45 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     /// Ignore is skipped). Cascade + Unset run to fixpoint. Phase 2: filter rejecters
     /// whose owner is itself cascading away (transitively) — they don't block. Phase 3:
     /// throw <see cref="CascadeRejectException"/> if any steady-state blockers remain.
+    /// <para>
+    /// The incoming-reference index is built by ONE scan over the tracked entities at
+    /// plan start (O(entities × refs)) and the BFS resolves against it by lookup —
+    /// previously every BFS node rescanned every entity's <see cref="IEntity.EnumerateReferences"/>
+    /// (O(cascade × entities × refs)). The one-scan snapshot is observationally
+    /// identical to the per-node rescan it replaced: no user code runs mid-plan
+    /// (<see cref="IEntity.OnDeleting"/> hooks and the Unset mirror writes both fire in
+    /// <see cref="DeleteAsync"/> AFTER the plan returns), so there is nothing that
+    /// could mutate a reference between plan start and the BFS reading it. If a
+    /// mid-plan mutation window is ever introduced, the snapshot semantics here become
+    /// a real choice and this comment must be revisited.
+    /// </para>
     /// </summary>
     private DeletePlan PlanDelete(RecordId target)
     {
+        // Reverse-reference index: target id → (referencer entity, snake-cased field
+        // name) pairs whose reference currently points at it. Built in tracked-entity
+        // iteration order, references in enumeration order — the same visit order the
+        // per-node rescan produced, so blocker lists, cascade order, and Unset actions
+        // come out identical.
+        var incoming = new Dictionary<RecordId, List<(IEntity Referencer, string FieldName)>>();
+        foreach (var entity in state.Entities.Values)
+        {
+            foreach (var (fieldName, refTarget) in entity.EnumerateReferences())
+            {
+                if (refTarget is not { } referenced)
+                {
+                    continue;
+                }
+
+                if (!incoming.TryGetValue(referenced, out var list))
+                {
+                    list = [];
+                    incoming[referenced] = list;
+                }
+                list.Add((entity, fieldName));
+            }
+        }
+
         var deleted = new HashSet<RecordId> { target };
         var queue = new Queue<RecordId>();
         queue.Enqueue(target);
@@ -1134,59 +1170,51 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
                 continue;
             }
 
-            foreach (var entity in state.Entities.Values)
+            if (!incoming.TryGetValue(current, out var referencers))
+            {
+                continue;
+            }
+
+            foreach (var (entity, fieldName) in referencers)
             {
                 var entityTable = entity.Id.Table;
+
+                // Pick the policy entry that matches this entity's table + field. The
+                // registry is keyed on the referenced table; we still have to filter
+                // by the (referencer table, field name) on this end.
                 ReferenceFieldInfo? hitInfo = null;
-                string? hitField = null;
-
-                foreach (var (fieldName, refTarget) in entity.EnumerateReferences())
+                foreach (var info in policiesForCurrent)
                 {
-                    if (refTarget != current)
+                    if (info.ReferencerTable == entityTable && info.FieldName == fieldName)
                     {
-                        continue;
+                        hitInfo = info;
+                        break;
                     }
+                }
 
-                    // Pick the policy entry that matches this entity's table + field. The
-                    // registry is keyed on the referenced table; we still have to filter
-                    // by the (referencer table, field name) on this end.
-                    foreach (var info in policiesForCurrent)
-                    {
-                        if (info.ReferencerTable == entityTable && info.FieldName == fieldName)
+                if (hitInfo is null)
+                {
+                    continue;
+                }
+
+                switch (hitInfo.Behavior)
+                {
+                    case ReferenceDeleteBehavior.Cascade:
+                        if (deleted.Add(entity.Id))
                         {
-                            hitInfo = info;
-                            hitField = fieldName;
-                            break;
+                            queue.Enqueue(entity.Id);
                         }
-                    }
-
-                    if (hitInfo is null)
-                    {
-                        continue;
-                    }
-
-                    switch (hitInfo.Behavior)
-                    {
-                        case ReferenceDeleteBehavior.Cascade:
-                            if (deleted.Add(entity.Id))
-                            {
-                                queue.Enqueue(entity.Id);
-                            }
-                            break;
-                        case ReferenceDeleteBehavior.Unset:
-                            unsetActions.Add((entity, hitField!));
-                            break;
-                        case ReferenceDeleteBehavior.Reject:
-                            rejecters.Add((entity, hitField!, current));
-                            break;
-                        case ReferenceDeleteBehavior.Ignore:
-                            // Schema declared "leave dangling" — substrate does nothing,
-                            // and we don't need to either.
-                            break;
-                    }
-
-                    hitInfo = null;
-                    hitField = null;
+                        break;
+                    case ReferenceDeleteBehavior.Unset:
+                        unsetActions.Add((entity, fieldName));
+                        break;
+                    case ReferenceDeleteBehavior.Reject:
+                        rejecters.Add((entity, fieldName, current));
+                        break;
+                    case ReferenceDeleteBehavior.Ignore:
+                        // Schema declared "leave dangling" — substrate does nothing,
+                        // and we don't need to either.
+                        break;
                 }
             }
         }

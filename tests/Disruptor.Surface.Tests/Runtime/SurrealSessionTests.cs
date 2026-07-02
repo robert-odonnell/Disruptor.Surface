@@ -1221,6 +1221,69 @@ public sealed class SurrealSessionTests
         Assert.Equal(entity.Id, reason.EntityId);
     }
 
+    // ─────────── 2026-07-02 session-DX: PlanDelete reverse-reference index ───
+
+    [Fact]
+    public async Task DeleteAsync_DiamondCascade_DeletesEachEntityOnce()
+    {
+        // Diamond: a → b1 → c and a → b2 → c, every reference Cascade. Delete c —
+        // a is reachable through BOTH b1 and b2; the cascade set must contain it once
+        // and OnDeleting must fire exactly once per entity. Guards the reverse-index
+        // rewrite against double-visiting a node reachable via multiple paths.
+        var registry = new StubReferenceRegistry();
+        registry.Add("c", referencer: "b1", field: "c_ref", behavior: ReferenceDeleteBehavior.Cascade);
+        registry.Add("c", referencer: "b2", field: "c_ref", behavior: ReferenceDeleteBehavior.Cascade);
+        registry.Add("b1", referencer: "a", field: "b1_ref", behavior: ReferenceDeleteBehavior.Cascade);
+        registry.Add("b2", referencer: "a", field: "b2_ref", behavior: ReferenceDeleteBehavior.Cascade);
+        var session = new SurrealSession(registry);
+
+        var c = new RefStubEntity(new RecordId("c", "c1"));
+        var b1 = new RefStubEntity(new RecordId("b1", "x"), ("c_ref", c.Id));
+        var b2 = new RefStubEntity(new RecordId("b2", "y"), ("c_ref", c.Id));
+        var a = new RefStubEntity(new RecordId("a", "a1"), ("b1_ref", b1.Id), ("b2_ref", b2.Id));
+        ((IHydrationSink)session).Track(c);
+        ((IHydrationSink)session).Track(b1);
+        ((IHydrationSink)session).Track(b2);
+        ((IHydrationSink)session).Track(a);
+
+        var db = FakeSurreal.Null();
+        await using var tx = await db.BeginTransactionAsync();
+        await session.DeleteAsync(c, tx);
+
+        Assert.Equal(1, c.OnDeletingCount);
+        Assert.Equal(1, b1.OnDeletingCount);
+        Assert.Equal(1, b2.OnDeletingCount);
+        Assert.Equal(1, a.OnDeletingCount);
+        Assert.False(session.IsTracked(a.Id));
+        Assert.False(session.IsClosed);
+    }
+
+    [Fact]
+    public async Task DeleteAsync_TwoUnsetFieldsOnOneEntity_SameTarget_BothNulled()
+    {
+        // One referencer holding TWO distinct Unset references at the same target:
+        // both fields must be mirrored to null. Guards the reverse-index build against
+        // collapsing multiple (referencer, field) pairs per target into one.
+        var registry = new StubReferenceRegistry();
+        registry.Add("b", referencer: "a", field: "x_ref", behavior: ReferenceDeleteBehavior.Unset);
+        registry.Add("b", referencer: "a", field: "y_ref", behavior: ReferenceDeleteBehavior.Unset);
+        var session = new SurrealSession(registry);
+
+        var b = new RefStubEntity(new RecordId("b", "b1"));
+        var a = new RefStubEntity(new RecordId("a", "a1"), ("x_ref", b.Id), ("y_ref", b.Id));
+        ((IHydrationSink)session).Track(b);
+        ((IHydrationSink)session).Track(a);
+
+        var db = FakeSurreal.Null();
+        await using var tx = await db.BeginTransactionAsync();
+        await session.DeleteAsync(b, tx);
+
+        Assert.False(a.OnDeletingCalled);
+        var refs = ((IEntity)a).EnumerateReferences().ToList();
+        Assert.All(refs, r => Assert.Null(r.Target));
+        Assert.Equal(2, refs.Count);
+    }
+
     // ──────────────────────────── Phase 4 helpers ────────────────────────────
 
     private static (string Sql, SurrealObject Bindings) ExtractQueryParts(SurrealValue? @params)
@@ -1296,11 +1359,12 @@ public sealed class SurrealSessionTests
 
         public RecordId Id { get; }
         public SurrealSession? Session { get; private set; }
-        public bool OnDeletingCalled { get; private set; }
+        public bool OnDeletingCalled => OnDeletingCount > 0;
+        public int OnDeletingCount { get; private set; }
 
         public void Bind(SurrealSession session) => Session = session;
         public void Initialize(SurrealSession session) { }
-        public void OnDeleting() => OnDeletingCalled = true;
+        public void OnDeleting() => OnDeletingCount++;
         public void MarkAllSlicesLoaded(IHydrationSink sink) { }
 
         IEnumerable<(string FieldName, RecordId? Target)> IEntity.EnumerateReferences()
