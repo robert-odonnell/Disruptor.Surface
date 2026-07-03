@@ -902,7 +902,7 @@ public partial interface ICodeSymbolEdge : IRelationVariant
 }
 ```
 
-The interface members can carry `[In]` / `[Out]` / `[Property]` / `[Id]` (preview.56+). Variants with an empty body (`: ICodeSymbolEdge;`) inherit the lifted shape; variants that self-declare attributed `partial` members win for any role they declare. Both shapes coexist:
+The interface members can carry `[In]` / `[Out]` / `[Property]` (preview.56+; an `[Id]` member on a shared-shape interface is rejected with CG057 — relation-variant identity is canonical, see the Diagnostics table below). Variants with an empty body (`: ICodeSymbolEdge;`) inherit the lifted shape; variants that self-declare attributed `partial` members win for any role they declare. Both shapes coexist:
 
 ```csharp
 // Self-describing variant (preview.55 shape — still valid). Useful when one
@@ -1290,3 +1290,4 @@ The generator emits diagnostics for invalid model shapes. Most are errors (compi
 | `CG054` | More than one `[CreatedAt]` (or `[UpdatedAt]`, or `[Version]`) property on one table. |
 | `CG055` | One property carries more than one of `[CreatedAt]`/`[UpdatedAt]`/`[Version]`; the markers prescribe contradictory write behaviors for the same field. |
 | `CG056` | Relation-variant payload `[Property]` type has no SurrealDB scalar mapping; the field is omitted from the emitted DDL and from the dispatched edge content (in-memory-only state). Warning — the entity-table equivalent is the CG025 error. |
+| `CG057` | Error — `[Id]` on a relation variant (self-declared or lifted); edge identity is canonically derived from (in, edge, out). |

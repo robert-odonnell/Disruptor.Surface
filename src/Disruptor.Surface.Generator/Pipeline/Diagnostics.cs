@@ -381,4 +381,12 @@ internal static class Diagnostics
         category: Category,
         defaultSeverity: DiagnosticSeverity.Warning,
         isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor IdOnRelationVariant = new(
+        id: "CG057",
+        title: "[Id] is not allowed on relation variants",
+        messageFormat: "Relation variant '{0}' declares an [Id] member '{1}' (self-declared or lifted from a shared-shape interface). Relation-variant identity is canonical — the edge row id is always derived from (in, edge, out) via RecordId.ForEdge, and a user-assignable id desynchronises the session's identity map from the row the UNIQUE(in, out) duplicate path actually updates. Remove the [Id] member; the edge id is readable as ((IEntity)variant).Id once both endpoints are set.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
 }

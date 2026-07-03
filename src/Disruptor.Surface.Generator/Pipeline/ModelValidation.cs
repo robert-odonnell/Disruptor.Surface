@@ -178,6 +178,19 @@ internal static class ModelValidation
                         args: [variant.FullName]);
                 }
 
+                // CG057 — relation-variant identity is canonical (derived via RecordId.ForEdge);
+                // a user-assignable [Id] can desynchronise MarkSaved from the UNIQUE(in, out)
+                // duplicate-update row. variant.Id here is post-link, so it covers both
+                // self-declared members and shared-shape-lifted [Id] contributions. Duplicate-[Id]
+                // variants never reach this loop (CG046 filtered them into RelationVariantIssues).
+                if (variant.Id is { } variantId)
+                {
+                    Add(pending, Diagnostics.IdOnRelationVariant,
+                        args: [variant.FullName, variantId.Name],
+                        typeKey: variant.FullName,
+                        memberName: variantId.Name);
+                }
+
                 if (variant.In is null || variant.Out is null)
                 {
                     continue;
