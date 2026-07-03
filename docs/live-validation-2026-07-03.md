@@ -71,12 +71,19 @@ read time. Both paths fail closed with a distinct, catchable exception type.
 > (Appendix B, session B1); no unquoted `order`/`group` control was run. Showing that the
 > quoted forms *work* does not show the bare forms *need* quoting — that inference was
 > over-broad, and the parser source disproves it for everything except `value`. Correct
-> two-tier split (now shipped as **CG058**/**CG059** — see `docs/notes.md`):
-> **hard/error** = the 4 value literals `none`/`null`/`true`/`false` (silent misparse —
-> SurrealQL reads them as the literal, not an identifier, so no quoting rescues them);
+> two-tier split (now shipped as **CG058**/**CG059** — see `docs/notes.md`). The tiers
+> are split by **loud-vs-silent failure**, *not* by quoting-rescue:
+> **hard/error** = the 4 value literals `none`/`null`/`true`/`false` — a bare occurrence
+> is read *silently* as the literal, not an identifier, so it corrupts the query with no
+> error and no quoting rescues it;
 > **soft/warning** = the other 40 `RESERVED_KEYWORD` words, including `value`, `select`,
-> `where`, `table` (loud failure — parse/apply error, in principle rescuable by quoting,
-> which is why they're a warning and not an error). The transcript and per-position
+> `where`, `table` — these fail **loudly** (a parse/apply error caught at dev/apply time,
+> never silent corruption), which is what makes a warning (not an error) the right tier.
+> Note that quoting-rescue is **not uniform across the warning tier**: some of these words
+> *are* rescued by backticks (e.g. `value`, session B1), but statement-keywords are not —
+> backtick-quoted `` `select` `` still throws a SyntaxError in DML (B2.18–B2.20), so the
+> deferred quoting PR must verify rescue-ability *per word* and may have to keep
+> statement-keywords rejected rather than quoted. The transcript and per-position
 > observations below are unchanged and remain valid raw evidence; only the "order/group/
 > value are all soft-reserved and need quoting" gloss was wrong — of that assumed trio,
 > only `value` actually is.
@@ -136,6 +143,16 @@ in-memory server — is **Appendix B** below, and every claim here cites its lin
   - `CREATE … SET `none` = 'x'` → `Expected an idiom` even though the name is
     backtick-quoted (B2.3; same failure for `null`/`true`/`false` at B2.7/B2.11/B2.15,
     and a syntax error for `select` at B2.19);
+    > **Note (reconciles with the two-tier framing at the top of §3):** `select` sits in
+    > the SOFT/WARNING tier because it fails **loudly** (SyntaxError, immediately — never
+    > the silent corruption of the value literals), *not* because quoting can rescue it.
+    > This bullet's own evidence shows it can't: backtick-quoted
+    > `` CREATE bad_select:one SET `select` = 'x' `` still throws a SyntaxError (B2.19)
+    > and `SELECT * FROM bad_select` still fails `Failed to get field definitions`
+    > (B2.20). So the "loud failure ⇒ in principle rescuable by quoting" property is
+    > **not** uniform across the warning tier — statement-keywords like `select` are the
+    > exception, and the deferred quoting PR must verify rescue per word rather than
+    > assume backticks fix all 40.
   - and, more dangerously, **`DEFINE FIELD `none` …` is *accepted* at define time
     (B2.2) but silently poisons the table** — even a plain `SELECT * FROM …` with no
     WHERE clause then errors with `Failed to get field definitions` (B2.4; same for
@@ -159,23 +176,31 @@ hybrid (quote everywhere reserved-adjacent *and* add a diagnostic) from the prob
 evidence; the correction at the top of §3 shows that inference over-read what "backticks
 are accepted" proves. Current, shipped decision:
 
-- **Reject-only, two-tier, shipped.** **CG058 (error)** on the 4 value literals
-  (`none`/`null`/`true`/`false`) — these misparse *silently* and no quoting can rescue
-  them. **CG059 (warning)** on the other 40 words in SurrealDB's `RESERVED_KEYWORD` set
-  (`keywords.rs` @ v3.1.4), including `value` and `select` — these fail *loudly* (a parse
-  or apply error), which quoting *could* in principle rescue, but a warning is the shipped
-  treatment: the generator flags them, the author renames or accepts the risk, no wire
-  behavior changes. `order`/`group`/`type`/`count`/`limit`/`start` etc. are correctly
-  *not* flagged — they are not in `RESERVED_KEYWORD`. See `docs/notes.md` (unreleased
-  CG058/CG059 entry) for the implementation.
+- **Reject-only, two-tier, shipped.** The tiers split on **loud-vs-silent failure**, not
+  on quoting-rescue. **CG058 (error)** on the 4 value literals
+  (`none`/`null`/`true`/`false`) — a bare occurrence corrupts the query *silently* (read
+  as the literal) and no quoting can rescue it. **CG059 (warning)** on the other 40 words
+  in SurrealDB's `RESERVED_KEYWORD` set (`keywords.rs` @ v3.1.4), including `value` and
+  `select` — these fail *loudly* (a parse or apply error caught at dev/apply time, never
+  silent corruption), which is what makes a warning the right tier: the generator flags
+  them, the author renames or accepts the risk, no wire behavior changes.
+  `order`/`group`/`type`/`count`/`limit`/`start` etc. are correctly *not* flagged — they
+  are not in `RESERVED_KEYWORD`. See `docs/notes.md` (unreleased CG058/CG059 entry) for
+  the implementation.
 - **Backtick-quoting is deferred and optional**, not a follow-up PR already scoped to
-  ship. If it's ever picked up, it must: (a) escape iff-in-`RESERVED_KEYWORD`, mirroring
-  SurrealDB's own `EscapeIdent` serializer; (b) never ship without CG058 already in
-  place — quoting a value-literal name would turn today's loud failure into a
-  silently-accepted wrong query, which is strictly worse; (c) be justified first by a
-  live test of a *bare* (unquoted) soft-reserved word actually failing in the position
-  it's meant to fix — every probe in this report only ever ran backtick-quoted forms of
-  `order`/`group`/`value`, so it never established that the bare forms break.
+  ship. Quoting-rescue is **not uniform** across the warning tier — some words (`value`,
+  B1) round-trip when quoted, but statement-keywords do not: backtick-quoted `` `select` ``
+  still throws in DML (B2.18–B2.20). So if quoting is ever picked up, it must: (a) escape
+  iff-in-`RESERVED_KEYWORD`, mirroring SurrealDB's own `EscapeIdent` serializer, **and
+  verify rescue-ability per word** — keeping statement-keywords rejected rather than
+  quoted where backticks don't help; (b) never ship without CG058 already in
+  place — quoting does *not* rescue value literals (a backtick-quoted
+  `` DEFINE FIELD `none` `` is accepted at define time but silently poisons all reads,
+  B2.2/B2.4), so adding quoting would only make a value-literal name *look* handled while
+  CG058 stays the sole guardrail against the silent read-poison; (c) be justified first
+  by a live test of a *bare* (unquoted) soft-reserved word actually failing in the
+  position it's meant to fix — every probe in this report only ever ran backtick-quoted
+  forms of `order`/`group`/`value`, so it never established that the bare forms break.
 
 <details>
 <summary>Original 2026-07-03 recommendation (superseded by the correction above, kept for history)</summary>

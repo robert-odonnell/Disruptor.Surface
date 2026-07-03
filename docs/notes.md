@@ -180,7 +180,7 @@ Newest first. One or two lines per preview. "Substantive" means architecture / b
 
 ### unreleased — CG058/CG059 reserved-word diagnostics (identifier-quoting reject-only fix) (DONE 2026-07-03)
 
-No version bump. Follow-up to the identifier-quoting verdict recorded in the preview.60 live-validation entry below: quoting rescues soft reserved words but not the four SurrealQL value literals, and quoting itself stays deferred — so this closes the gap with a reject-only diagnostic instead. Two-tier split of SurrealDB's `RESERVED_KEYWORD` set (`surrealdb/crates/core/src/syn/lexer/keywords.rs` @ tag `v3.1.4`, captured in the new `Pipeline/SurrealReservedWords.cs`): the four value literals (`none`/`null`/`true`/`false`) misparse *silently* — `parse_prime_expr` intercepts them before the identifier fallback, so a bare occurrence in a query becomes the literal, not a field reference, and no backtick-quoting rescues it — these are **CG058 (error)**. The other 40 words fail *loudly* (parse/apply error) and are rescuable by future quoting — **CG059 (warning)**. `ModelValidation.ValidateReservedWords` checks every render point that turns a user name into a SurrealQL identifier: table names, entity fields (reusing the new `SchemaEmitter.EmitsSchemaField` predicate — extracted verbatim from `EmitTableFields`'s inline filter so the check can't drift from what the emitter actually renders — instead of re-deriving the "does this render a column" test), inline element-collection sub-fields, forward-relation edge names, and relation-variant payload fields. Correction to a prior assumption: `order`/`group`/`type`/`count` are **not** in `RESERVED_KEYWORD` and must not fire — pinned by a dedicated negative test. **484/484 green** (480 prior + 4 net new).
+No version bump. Follow-up to the identifier-quoting verdict recorded in the preview.60 live-validation entry below: quoting rescues soft reserved words but not the four SurrealQL value literals, and quoting itself stays deferred — so this closes the gap with a reject-only diagnostic instead. Two-tier split of SurrealDB's `RESERVED_KEYWORD` set (`surrealdb/crates/core/src/syn/lexer/keywords.rs` @ tag `v3.1.4`, captured in the new `Pipeline/SurrealReservedWords.cs`): the four value literals (`none`/`null`/`true`/`false`) misparse *silently* — `parse_prime_expr` intercepts them before the identifier fallback, so a bare occurrence in a query becomes the literal, not a field reference, and no backtick-quoting rescues it — these are **CG058 (error)**. The other 40 words fail *loudly* (parse/apply error, caught at dev/apply time rather than silent corruption) — **CG059 (warning)**; the tiers split on loud-vs-silent, *not* on quoting-rescue (which is not uniform across the warning tier — `value` quotes cleanly but statement-keywords like `select` still throw even backtick-quoted, B2.18–B2.20). `ModelValidation.ValidateReservedWords` checks every render point that turns a user name into a SurrealQL identifier: table names, entity fields (reusing the new `SchemaEmitter.EmitsSchemaField` predicate — extracted verbatim from `EmitTableFields`'s inline filter so the check can't drift from what the emitter actually renders — instead of re-deriving the "does this render a column" test), inline element-collection sub-fields, forward-relation edge names, and relation-variant payload fields. Correction to a prior assumption: `order`/`group`/`type`/`count` are **not** in `RESERVED_KEYWORD` and must not fire — pinned by a dedicated negative test. **484/484 green** (480 prior + 4 net new).
 
 ### unreleased — docs: correct reserved-word evidence in trackers (DONE 2026-07-03)
 
@@ -192,10 +192,14 @@ parser-source grounding above and over-read the probe: showing backtick-quoted `
 `order`/`group` control was ever run). The 44-word `RESERVED_KEYWORD` set (`keywords.rs`
 @ v3.1.4) proves `order`/`group`/`type`/`count`/`limit`/`start`/`set`/`content`/`fetch`/
 `split`/`default` are not reserved at all; only `value` (of the assumed trio) actually is.
-Reclassified as two-tier across all three docs: 4 error-tier value literals
-(`none`/`null`/`true`/`false`, silent misparse, unrescuable), 40 warning-tier
-`RESERVED_KEYWORD` words incl. `select`/`value`/`where`/`table` (loud, in principle
-rescuable). Recommendation updated from "implement quoting + diagnostic, do both" to
+Reclassified as two-tier across all three docs, keyed on **loud-vs-silent failure**
+(not quoting-rescue): 4 error-tier value literals (`none`/`null`/`true`/`false`, silent
+misparse, unrescuable), 40 warning-tier `RESERVED_KEYWORD` words incl.
+`select`/`value`/`where`/`table` (fail loudly at dev/apply time). Quoting-rescue is
+**not uniform** in the warning tier — `value` round-trips backtick-quoted (B1) but
+statement-keywords like `select` still throw even when quoted (B2.18–B2.20), so the
+deferred quoting PR must verify rescue per word and may keep statement-keywords rejected.
+Recommendation updated from "implement quoting + diagnostic, do both" to
 reject-only two-tier **shipped** (CG058/CG059, superseded text kept in a collapsed
 `<details>` for history); backtick-quoting is deferred/optional and gated on (a) escape
 iff-in-`RESERVED_KEYWORD` mirroring `EscapeIdent`, (b) never shipping without CG058

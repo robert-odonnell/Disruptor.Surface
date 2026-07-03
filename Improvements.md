@@ -26,16 +26,22 @@ and the CG042–CG056 fail-closed diagnostics family.
    parser source (`crates/core/src/syn/lexer/keywords.rs` @ tag `v3.1.4`, the 44-word
    `RESERVED_KEYWORD` set — the exact set its `EscapeIdent` serializer backtick-quotes)
    shows `order`/`group`/`type`/`count`/`limit`/`start` are **not** reserved; only
-   `value` (of that trio) is. **CG058 (error)** rejects the 4 unrescuable value
-   literals (`none`/`null`/`true`/`false`) at generate time — these misparse silently
-   and no quoting can rescue them. **CG059 (warning)** flags the other 40
-   `RESERVED_KEYWORD` words (incl. `value`/`select`) — these fail loudly (`Expected an
-   idiom` / poisoned reads: `Failed to get field definitions`), in principle rescuable
-   by quoting, but a warning is the shipped treatment. Backtick-quoting remains
-   deferred and optional: if it's picked up later it must escape
-   iff-in-`RESERVED_KEYWORD` (mirroring SurrealDB's `EscapeIdent`), never ship without
-   CG058 already in place, and be justified first by a still-missing live test of a
-   bare (unquoted) soft-reserved word actually failing.
+   `value` (of that trio) is. The tiers split on **loud-vs-silent failure**, not on
+   quoting-rescue. **CG058 (error)** rejects the 4 value literals
+   (`none`/`null`/`true`/`false`) at generate time — a bare occurrence corrupts the query
+   *silently* (read as the literal) and no quoting can rescue it. **CG059 (warning)**
+   flags the other 40 `RESERVED_KEYWORD` words (incl. `value`/`select`) — these fail
+   *loudly* (`Expected an idiom` / poisoned reads: `Failed to get field definitions`),
+   caught at dev/apply time rather than silently, which is why a warning (not an error)
+   is the right tier. Quoting-rescue is **not uniform** across this tier: `value`
+   round-trips when backtick-quoted (B1) but statement-keywords do not — backtick-quoted
+   `` `select` `` still throws in DML (B2.18–B2.20). Backtick-quoting remains deferred and
+   optional: if it's picked up later it must escape iff-in-`RESERVED_KEYWORD` (mirroring
+   SurrealDB's `EscapeIdent`) **and verify rescue per word** (statement-keywords may stay
+   rejected), never ship without CG058 already in place (quoting does not fix a value
+   literal — a backtick-quoted `` DEFINE FIELD `none` `` still silently poisons reads), and
+   be justified first by a still-missing live test of a bare (unquoted) soft-reserved word
+   actually failing.
 2. **Variant duplicate-edge id drift** — RESOLVED (2026-07-02) by deterministic edge
    ids: the variant id anchor derives the edge row id from `(source, edge, target)`
    via `RecordId.ForEdge` before dispatch, so the duplicate path updates the same row

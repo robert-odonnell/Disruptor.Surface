@@ -54,13 +54,18 @@ compile/emit, not the test's intent.
   serializer backtick-quotes) disproves that: `order`/`group`/`type`/`count`/`limit`/
   `start` are **not** in the set — showing backticks *work* on them never showed the
   bare form *needed* quoting (no unquoted-`order`/`group` control was ever run). Only
-  `value` (of that assumed trio) is actually reserved. Correct two-tier split:
-  **hard/error** = the 4 value literals `none`/`null`/`true`/`false` (silent misparse,
+  `value` (of that assumed trio) is actually reserved. Correct two-tier split, keyed on
+  **loud-vs-silent failure** (not on quoting-rescue): **hard/error** = the 4 value
+  literals `none`/`null`/`true`/`false` (bare occurrence corrupts the query *silently*,
   unrescuable by quoting); **soft/warning** = the other 40 `RESERVED_KEYWORD` words
-  incl. `value`/`select`/`where`/`table` (loud failure, in principle rescuable).
-  **Shipped:** reject-only two-tier diagnostic — CG058 (error) on the 4, CG059
-  (warning) on the 40. Backtick-quoting itself remains **deferred and optional**, not
-  a scoped follow-up — see the corrected recommendation at
+  incl. `value`/`select`/`where`/`table` (fail *loudly* — parse/apply error at
+  dev/apply time, never silent corruption). Note quoting-rescue is **not uniform** in
+  the warning tier: `value` round-trips when backtick-quoted (B1) but statement-keywords
+  do not — backtick-quoted `` `select` `` still throws in DML (B2.18–B2.20). **Shipped:**
+  reject-only two-tier diagnostic — CG058 (error) on the 4, CG059 (warning) on the 40.
+  Backtick-quoting itself remains **deferred and optional**, not a scoped follow-up, and
+  if pursued must verify rescue per word (statement-keywords may stay rejected) — see the
+  corrected recommendation at
   [`live-validation-2026-07-03.md` §3](live-validation-2026-07-03.md).
 - **Duplicate-path smoke for pre-existing data** — see Question 3.
 
@@ -97,12 +102,17 @@ In rough value order; details in `Improvements.md`:
    `RESERVED_KEYWORD` set; only `value` (of the assumed `order`/`group`/`value` trio)
    actually is. Owner chose the reject-only fix: **CG058 (error)** on the 4
    unrescuable value literals (`none`/`null`/`true`/`false`), **CG059 (warning)** on
-   the other 40 `RESERVED_KEYWORD` words incl. `value`/`select`. Backtick-quoting is
-   **deferred and optional** — if pursued later it must escape
-   iff-in-`RESERVED_KEYWORD` (mirroring SurrealDB's `EscapeIdent`), never ship without
-   CG058 (quoting a value literal would convert today's loud failure into silent
-   read-poison), and be justified first by a still-missing live test of a bare
-   (unquoted) soft-reserved word actually failing. See §2 and
+   the other 40 `RESERVED_KEYWORD` words incl. `value`/`select`. The tiers split on
+   **loud-vs-silent failure**, not on quoting-rescue: value literals corrupt *silently*
+   (unrescuable), the other 40 fail *loudly*. Quoting-rescue is **not uniform** across
+   the warning tier — `value` round-trips when quoted (B1) but statement-keywords do not
+   (backtick-quoted `` `select` `` still throws, B2.18–B2.20). Backtick-quoting is
+   **deferred and optional** — if pursued later it must escape iff-in-`RESERVED_KEYWORD`
+   (mirroring SurrealDB's `EscapeIdent`) **and verify rescue per word** (statement-keywords
+   may have to stay rejected), never ship without CG058 (quoting does *not* fix a value
+   literal — a backtick-quoted `` DEFINE FIELD `none` `` still silently poisons reads, so
+   CG058 stays the sole guardrail), and be justified first by a still-missing live test of
+   a bare (unquoted) soft-reserved word actually failing. See §2 and
    [`live-validation-2026-07-03.md` §3](live-validation-2026-07-03.md).
 2. **Non-nullable variant payload defaults** — a non-nullable `string` payload left
    at its (null) backing default still omits its binding on the duplicate-update
