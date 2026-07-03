@@ -37,24 +37,35 @@ compile/emit, not the test's intent.
 
 ## 2. Deferred fixes that NEED the live substrate before implementation
 
-- **SurrealQL identifier quoting** (review §5). Properties named `Order`, `Group`,
-  `None`, `Value`, etc. render bare into queries and DDL (`none` parses as the NONE
-  literal → silently always-false predicates). The fix — backtick-quote every
-  identifier at the `SurrealFormatter` chokepoint and in `SchemaEmitter` DDL —
-  changes every emitted statement, so it needs live confirmation that backtick
-  quoting is accepted in every position we emit (DEFINE FIELD/INDEX columns, WHERE,
-  ORDER BY, SET, subselect aliases). Alternative if quoting misbehaves anywhere: a
-  generator diagnostic rejecting reserved-word names (smaller, but a word-list to
-  maintain). **Owner call needed on which approach** — see Questions below.
-  **Live verdict 2026-07-03 (SurrealDB 3.1.4): do BOTH — it's a hybrid.** Backticks
-  *are* accepted in every emit position for soft reserved words (`order`/`group`/`value`
-  round-trip through DEFINE FIELD/INDEX, CREATE/UPDATE SET, WHERE, ORDER BY, subselect
-  alias), so the chokepoint-quoting fix is viable and should ship. But value literals
-  `none`/`null`/`true`/`false` and the keyword `select` are **unrescuable by quoting**:
-  `SET `none` = …` errors `Expected an idiom`, and a bare `DEFINE FIELD `none`` is
-  accepted yet silently poisons the whole table's reads (`Failed to get field
-  definitions`). So the reserved-word diagnostic is still needed — scoped to exactly
-  that unrescuable set. Full evidence + per-position table:
+- **SurrealQL identifier quoting** (review §5). Properties named `None`, `Value`, etc.
+  render bare into queries and DDL (`none` parses as the NONE literal → silently
+  always-false predicates). The fix — backtick-quote every identifier at the
+  `SurrealFormatter` chokepoint and in `SchemaEmitter` DDL — would change every
+  emitted statement, so it would need live confirmation that backtick quoting is
+  accepted in every position we emit (DEFINE FIELD/INDEX columns, WHERE, ORDER BY,
+  SET, subselect aliases). Alternative: a generator diagnostic rejecting
+  reserved-word names (smaller, no emitted-statement changes). **Owner call
+  resolved — see §4 Q1: reject-only, shipped as CG058/CG059.**
+  **Live verdict 2026-07-03 (SurrealDB 3.1.4), corrected post-parser-source review:**
+  the original verdict here read "do BOTH — it's a hybrid," inferring from
+  "backtick-quoted `order`/`group`/`value` round-trip cleanly" that `order`/`group`
+  are reserved words needing quoting. SurrealDB's own parser source (`keywords.rs` @
+  v3.1.4, the 44-word `RESERVED_KEYWORD` set — the exact set its `EscapeIdent`
+  serializer backtick-quotes) disproves that: `order`/`group`/`type`/`count`/`limit`/
+  `start` are **not** in the set — showing backticks *work* on them never showed the
+  bare form *needed* quoting (no unquoted-`order`/`group` control was ever run). Only
+  `value` (of that assumed trio) is actually reserved. Correct two-tier split, keyed on
+  **loud-vs-silent failure** (not on quoting-rescue): **hard/error** = the 4 value
+  literals `none`/`null`/`true`/`false` (bare occurrence corrupts the query *silently*,
+  unrescuable by quoting); **soft/warning** = the other 40 `RESERVED_KEYWORD` words
+  incl. `value`/`select`/`where`/`table` (fail *loudly* — parse/apply error at
+  dev/apply time, never silent corruption). Note quoting-rescue is **not uniform** in
+  the warning tier: `value` round-trips when backtick-quoted (B1) but statement-keywords
+  do not — backtick-quoted `` `select` `` still throws in DML (B2.18–B2.20). **Shipped:**
+  reject-only two-tier diagnostic — CG058 (error) on the 4, CG059 (warning) on the 40.
+  Backtick-quoting itself remains **deferred and optional**, not a scoped follow-up, and
+  if pursued must verify rescue per word (statement-keywords may stay rejected) — see the
+  corrected recommendation at
   [`live-validation-2026-07-03.md` §3](live-validation-2026-07-03.md).
 - **Duplicate-path smoke for pre-existing data** — see Question 3.
 
@@ -83,9 +94,25 @@ In rough value order; details in `Improvements.md`:
 
 1. **Identifier quoting strategy** — quote everything (robust, big diff churn, needs
    live validation) vs. reserved-word diagnostic (fail-closed, needs a word list)?
-   **Now informed (live 2026-07-03):** the answer is neither-alone but *both* — quoting
-   works for the soft-reserved majority, but a small unrescuable value-literal set
-   (`none`/`null`/`true`/`false`/`select`) still needs a diagnostic. See §2 and
+   **RESOLVED 2026-07-03 — reject-only, two-tier, shipped (CG058/CG059).** The
+   2026-07-03 "do both, it's a hybrid" live verdict was corrected after checking
+   SurrealDB's own parser source (`keywords.rs` @ v3.1.4): the assumed "quoting works
+   for the soft-reserved majority" read too much into the probe —
+   `order`/`group`/`type`/`count`/`limit`/`start` are **not** in the 44-word
+   `RESERVED_KEYWORD` set; only `value` (of the assumed `order`/`group`/`value` trio)
+   actually is. Owner chose the reject-only fix: **CG058 (error)** on the 4
+   unrescuable value literals (`none`/`null`/`true`/`false`), **CG059 (warning)** on
+   the other 40 `RESERVED_KEYWORD` words incl. `value`/`select`. The tiers split on
+   **loud-vs-silent failure**, not on quoting-rescue: value literals corrupt *silently*
+   (unrescuable), the other 40 fail *loudly*. Quoting-rescue is **not uniform** across
+   the warning tier — `value` round-trips when quoted (B1) but statement-keywords do not
+   (backtick-quoted `` `select` `` still throws, B2.18–B2.20). Backtick-quoting is
+   **deferred and optional** — if pursued later it must escape iff-in-`RESERVED_KEYWORD`
+   (mirroring SurrealDB's `EscapeIdent`) **and verify rescue per word** (statement-keywords
+   may have to stay rejected), never ship without CG058 (quoting does *not* fix a value
+   literal — a backtick-quoted `` DEFINE FIELD `none` `` still silently poisons reads, so
+   CG058 stays the sole guardrail), and be justified first by a still-missing live test of
+   a bare (unquoted) soft-reserved word actually failing. See §2 and
    [`live-validation-2026-07-03.md` §3](live-validation-2026-07-03.md).
 2. **Non-nullable variant payload defaults** — a non-nullable `string` payload left
    at its (null) backing default still omits its binding on the duplicate-update

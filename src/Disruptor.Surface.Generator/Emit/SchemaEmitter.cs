@@ -228,6 +228,34 @@ internal static class SchemaEmitter
         return chunks;
     }
 
+    /// <summary>
+    /// True iff <paramref name="p"/> renders a <c>DEFINE FIELD</c> line on its owning
+    /// table: scalar <c>[Property]</c> (incl. inline element collections), <c>[Reference]</c>,
+    /// <c>[Parent]</c>, <c>[Children]</c> (the reverse-fk <c>COMPUTED</c> field). Excludes
+    /// <c>[Id]</c> (implicit on every Surreal record) and relation read-collections
+    /// (forward/inverse — edge-table reads, not entity columns). Shared with
+    /// <c>ModelValidation.ValidateReservedWords</c> (CG058/CG059) so the reserved-word
+    /// check covers exactly the fields this emitter actually renders — do not re-derive
+    /// this predicate at the call site.
+    /// </summary>
+    internal static bool EmitsSchemaField(PropertyModel p)
+    {
+        if (p.Kinds.HasFlag(PropertyKind.Id))
+        {
+            return false;
+        }
+
+        if (p.RelationRole != RelationRole.None)
+        {
+            return false;
+        }
+
+        return p.Kinds.HasFlag(PropertyKind.Reference)
+            || p.Kinds.HasFlag(PropertyKind.Parent)
+            || p.Kinds.HasFlag(PropertyKind.Children)
+            || p.Kinds.HasFlag(PropertyKind.Property);
+    }
+
     private static void EmitTableFields(StringBuilder sb, TableModel table, ModelGraph graph)
     {
         var tableName = SurrealNaming.ToTableName(table.Name);
@@ -237,20 +265,7 @@ internal static class SchemaEmitter
         {
             // [Id] is implicit on every Surreal record. Relation properties (forward/
             // inverse collections) are edge-table reads, not entity columns.
-            if (p.Kinds.HasFlag(PropertyKind.Id))
-            {
-                continue;
-            }
-
-            if (p.RelationRole != RelationRole.None)
-            {
-                continue;
-            }
-
-            if (!p.Kinds.HasFlag(PropertyKind.Reference)
-                && !p.Kinds.HasFlag(PropertyKind.Parent)
-                && !p.Kinds.HasFlag(PropertyKind.Children)
-                && !p.Kinds.HasFlag(PropertyKind.Property))
+            if (!EmitsSchemaField(p))
             {
                 continue;
             }

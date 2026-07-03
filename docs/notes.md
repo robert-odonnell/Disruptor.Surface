@@ -63,7 +63,7 @@ When the user writes `partial IReadOnlyCollection<IRestrictedBy> Foo { get; }`, 
 
 ### Diagnostics
 
-`Pipeline/Diagnostics.cs` defines the `CG001`–`CG057` descriptors. When adding a new validation, add the descriptor here and report it from `ModelGenerator.Emit` (or the appropriate extractor). Selected highlights: CG001 (`[Table]` not partial), CG011 (entity reachable from multiple aggregate roots), CG014 (cascade-only reference cycle), CG018 (multiple `[CompositionRoot]` classes), CG019 (`[CompositionRoot]` class not partial), CG037–CG041 (entity-index shape errors), CG042–CG044 (generated-name collisions: physical table name, edge table name, aggregate-root simple name), CG045 (nested `[Table]`/`[CompositionRoot]` rejected), CG046/CG047 (malformed relation variants: duplicate roles / unresolved endpoints), CG048 (model attributes on records rejected), CG049 (generic `[Table]` rejected), CG050/CG051 (element-collection shape errors), CG052–CG055 (audit/version marker shape errors: missing `[Property]`, wrong type, per-table duplicates, marker combos), CG056 (warning — unmapped relation-variant payload type, field omitted from DDL + wire), CG057 (error — [Id] on a relation variant, self-declared or shared-shape-lifted; edge identity is canonically derived via RecordId.ForEdge).
+`Pipeline/Diagnostics.cs` defines the `CG001`–`CG059` descriptors. When adding a new validation, add the descriptor here and report it from `ModelGenerator.Emit` (or the appropriate extractor). Selected highlights: CG001 (`[Table]` not partial), CG011 (entity reachable from multiple aggregate roots), CG014 (cascade-only reference cycle), CG018 (multiple `[CompositionRoot]` classes), CG019 (`[CompositionRoot]` class not partial), CG037–CG041 (entity-index shape errors), CG042–CG044 (generated-name collisions: physical table name, edge table name, aggregate-root simple name), CG045 (nested `[Table]`/`[CompositionRoot]` rejected), CG046/CG047 (malformed relation variants: duplicate roles / unresolved endpoints), CG048 (model attributes on records rejected), CG049 (generic `[Table]` rejected), CG050/CG051 (element-collection shape errors), CG052–CG055 (audit/version marker shape errors: missing `[Property]`, wrong type, per-table duplicates, marker combos), CG056 (warning — unmapped relation-variant payload type, field omitted from DDL + wire), CG057 (error — [Id] on a relation variant, self-declared or shared-shape-lifted; edge identity is canonically derived via RecordId.ForEdge), CG058 (error — generated identifier collides with a SurrealQL value literal none/null/true/false, which misparses silently), CG059 (warning — generated identifier is a reserved keyword; fails loudly, not yet backtick-quoted).
 
 ## Runtime model (Disruptor.Surface.Runtime)
 
@@ -177,6 +177,36 @@ The Sample project's classes (`Design`, `Constraint`, `Epic`, `Feature`, `UserSt
 Newest first. One or two lines per preview. "Substantive" means architecture / behaviour / new public surface; polish (renames, doc edits, formatting) is omitted.
 
 **preview.60 upgrade note:** edge rows written before preview.60 carry random Ulid ids (pre-deterministic-id era). Replaying a save against such a row updates the *old* row via `UNIQUE(in, out)` while the session derives the hash id — wipe/reseed dev databases when upgrading (preview-status policy; `remaining-work.md` §4 Q3).
+
+### unreleased — CG058/CG059 reserved-word diagnostics (identifier-quoting reject-only fix) (DONE 2026-07-03)
+
+No version bump. Follow-up to the identifier-quoting verdict recorded in the preview.60 live-validation entry below: quoting rescues soft reserved words but not the four SurrealQL value literals, and quoting itself stays deferred — so this closes the gap with a reject-only diagnostic instead. Two-tier split of SurrealDB's `RESERVED_KEYWORD` set (`surrealdb/crates/core/src/syn/lexer/keywords.rs` @ tag `v3.1.4`, captured in the new `Pipeline/SurrealReservedWords.cs`): the four value literals (`none`/`null`/`true`/`false`) misparse *silently* — `parse_prime_expr` intercepts them before the identifier fallback, so a bare occurrence in a query becomes the literal, not a field reference, and no backtick-quoting rescues it — these are **CG058 (error)**. The other 40 words fail *loudly* (parse/apply error, caught at dev/apply time rather than silent corruption) — **CG059 (warning)**; the tiers split on loud-vs-silent, *not* on quoting-rescue (which is not uniform across the warning tier — `value` quotes cleanly but statement-keywords like `select` still throw even backtick-quoted, B2.18–B2.20). `ModelValidation.ValidateReservedWords` checks every render point that turns a user name into a SurrealQL identifier: table names, entity fields (reusing the new `SchemaEmitter.EmitsSchemaField` predicate — extracted verbatim from `EmitTableFields`'s inline filter so the check can't drift from what the emitter actually renders — instead of re-deriving the "does this render a column" test), inline element-collection sub-fields, forward-relation edge names, and relation-variant payload fields. Correction to a prior assumption: `order`/`group`/`type`/`count` are **not** in `RESERVED_KEYWORD` and must not fire — pinned by a dedicated negative test. **484/484 green** (480 prior + 4 net new).
+
+### unreleased — docs: correct reserved-word evidence in trackers (DONE 2026-07-03)
+
+No code change. Corrects `live-validation-2026-07-03.md` §3, `remaining-work.md` §2/§4-Q1,
+and `Improvements.md` item 1, whose "hybrid" recommendation and "`order`/`group`/`value` are
+soft reserved words rescued by backticks" classification predated the CG058/CG059
+parser-source grounding above and over-read the probe: showing backtick-quoted `order`/
+`group` round-trip cleanly never showed the *bare* forms need quoting (no unquoted
+`order`/`group` control was ever run). The 44-word `RESERVED_KEYWORD` set (`keywords.rs`
+@ v3.1.4) proves `order`/`group`/`type`/`count`/`limit`/`start`/`set`/`content`/`fetch`/
+`split`/`default` are not reserved at all; only `value` (of the assumed trio) actually is.
+Reclassified as two-tier across all three docs, keyed on **loud-vs-silent failure**
+(not quoting-rescue): 4 error-tier value literals (`none`/`null`/`true`/`false`, silent
+misparse, unrescuable), 40 warning-tier `RESERVED_KEYWORD` words incl.
+`select`/`value`/`where`/`table` (fail loudly at dev/apply time). Quoting-rescue is
+**not uniform** in the warning tier — `value` round-trips backtick-quoted (B1) but
+statement-keywords like `select` still throw even when quoted (B2.18–B2.20), so the
+deferred quoting PR must verify rescue per word and may keep statement-keywords rejected.
+Recommendation updated from "implement quoting + diagnostic, do both" to
+reject-only two-tier **shipped** (CG058/CG059, superseded text kept in a collapsed
+`<details>` for history); backtick-quoting is deferred/optional and gated on (a) escape
+iff-in-`RESERVED_KEYWORD` mirroring `EscapeIdent`, (b) never shipping without CG058
+already in place, (c) a still-missing bare-soft-word live test. `remaining-work.md` §4 Q1
+marked RESOLVED with the reject-only decision. Appendix B's raw CLI transcript is
+untouched — only the "these words are reserved" interpretive gloss was wrong, not the
+observed data.
 
 ### preview.60 — live-substrate validation run: 7/7 smoke PASS + identifier-quoting verdict (remaining-work §1/§2) (DONE 2026-07-03)
 

@@ -389,4 +389,20 @@ internal static class Diagnostics
         category: Category,
         defaultSeverity: DiagnosticSeverity.Error,
         isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ReservedValueLiteralName = new(
+        id: "CG058",
+        title: "Generated identifier collides with a SurrealQL value literal",
+        messageFormat: "'{0}' renders to the SurrealQL identifier '{1}', which is a reserved value literal (none/null/true/false). Emitted bare in a query it parses as the literal — silently matching no rows and poisoning reads of the column — and backtick-quoting does not rescue it. Rename the member so it renders to a non-reserved identifier.",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ReservedKeywordName = new(
+        id: "CG059",
+        title: "Generated identifier is a SurrealQL reserved keyword",
+        messageFormat: "'{0}' renders to the SurrealQL identifier '{1}', which is a reserved keyword. The generator emits identifiers unquoted, so the schema DDL or a query using it will fail at apply/query time. Rename the member (the generator does not yet backtick-quote reserved identifiers).",
+        category: Category,
+        defaultSeverity: DiagnosticSeverity.Warning,
+        isEnabledByDefault: true);
 }

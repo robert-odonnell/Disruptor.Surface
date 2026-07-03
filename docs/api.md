@@ -1292,3 +1292,5 @@ The generator emits diagnostics for invalid model shapes. Most are errors (compi
 | `CG055` | One property carries more than one of `[CreatedAt]`/`[UpdatedAt]`/`[Version]`; the markers prescribe contradictory write behaviors for the same field. |
 | `CG056` | Relation-variant payload `[Property]` type has no SurrealDB scalar mapping; the field is omitted from the emitted DDL and from the dispatched edge content (in-memory-only state). Warning — the entity-table equivalent is the CG025 error. |
 | `CG057` | Error — `[Id]` on a relation variant (self-declared or lifted); edge identity is canonically derived from (in, edge, out). |
+| `CG058` | Error — generated identifier renders to a SurrealQL value literal (none/null/true/false); misparses silently. |
+| `CG059` | Warning — generated identifier is a SurrealQL reserved keyword; fails at apply/query time, not yet quoted. |

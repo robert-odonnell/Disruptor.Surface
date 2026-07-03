@@ -1436,6 +1436,96 @@ public sealed class DiagnosticsTests
         Assert.DoesNotContain(runDiags, d => d.Id == "CG057");
     }
 
+    [Fact]
+    public void CG058_ValueLiteralFieldName_IsRejected()
+    {
+        // A [Property] named None renders to the SurrealQL identifier `none`, a value
+        // literal that silently misparses in WHERE/SET — hard error.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Widget {
+                [Id] public partial WidgetId Id { get; set; }
+                [Property] public partial string None { get; set; }
+            }
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG058");
+        Assert.NotNull(diag);
+        Assert.Equal(DiagnosticSeverity.Error, diag!.Severity);
+        Assert.Contains("none", diag.GetMessage());
+        Assert.Contains("None", diag.GetMessage());          // names the C# member
+        AssertLocationAt(diag, src, "string None");
+    }
+
+    [Fact]
+    public void CG058_ValueLiteralEdgeName_IsRejected()
+    {
+        // Edge name derives from the relation-kind attribute: NoneAttribute -> `none`.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            public sealed class NoneAttribute : ForwardRelation;
+            [Table] public partial class A { [Id] public partial AId Id { get; set; } }
+            [None] public partial class Link {
+                [In] public partial A Source { get; set; }
+                [Out] public partial A Target { get; set; }
+            }
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG058");
+        Assert.NotNull(diag);
+        Assert.Equal(DiagnosticSeverity.Error, diag!.Severity);
+        Assert.Contains("none", diag.GetMessage());
+    }
+
+    [Fact]
+    public void CG059_ReservedKeywordFieldName_Warns()
+    {
+        // A [Property] named Value renders to `value`, which is in RESERVED_KEYWORD:
+        // fails loudly at schema-apply, rescuable by future quoting -> warning.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Widget {
+                [Id] public partial WidgetId Id { get; set; }
+                [Property] public partial string Value { get; set; }
+            }
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG059");
+        Assert.NotNull(diag);
+        Assert.Equal(DiagnosticSeverity.Warning, diag!.Severity);
+        Assert.Contains("value", diag.GetMessage());
+        AssertLocationAt(diag, src, "string Value");
+    }
+
+    [Fact]
+    public void CG058_And_CG059_DoNotFire_ForNonReservedNames()
+    {
+        // Corrects the live-validation doc's assumption: order/group/type/count/status
+        // are NOT in RESERVED_KEYWORD and must NOT warn.
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            namespace M;
+            [Table] public partial class Widget {
+                [Id] public partial WidgetId Id { get; set; }
+                [Property] public partial int Order { get; set; }
+                [Property] public partial string Group { get; set; }
+                [Property] public partial string Type { get; set; }
+                [Property] public partial int Count { get; set; }
+                [Property] public partial string Status { get; set; }
+            }
+            [CompositionRoot] public partial class Workspace { }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id == "CG058");
+        Assert.DoesNotContain(runDiags, d => d.Id == "CG059");
+    }
+
     // ── diagnostic source-location helpers ──────────────────────────────────────
     //
     // Diagnostics are reported with external-file locations rehydrated from the
