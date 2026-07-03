@@ -1021,6 +1021,7 @@ Read methods (sync):
 | Method | Purpose |
 | --- | --- |
 | `Get<T>(IRecordId id)` | Lookup a hydrated or tracked entity by id. |
+| `GetAll<T>()` | All tracked entities of type `T`, ordered by id — the batch-mutate companion for hydration flows. |
 | `QueryChildren<T>(owner, childTable)` | Read children by parent link. Matches each candidate's `IEntity.GetParentId()` against `owner.Id`. |
 | `QueryOutgoing<TKind, T>(owner)` | Read same-aggregate outgoing relation targets. |
 | `QueryIncoming<TKind, T>(owner)` | Read same-aggregate incoming relation sources. |

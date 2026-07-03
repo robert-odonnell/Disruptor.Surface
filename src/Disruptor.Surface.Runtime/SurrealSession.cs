@@ -332,6 +332,28 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     }
 
     /// <summary>
+    /// All tracked entities of type <typeparamref name="T"/> in this session's identity
+    /// map, ordered by id (ordinal table-then-value) for deterministic iteration. The
+    /// batch-mutate companion to <see cref="Get{T}(IRecordId)"/> — pairs with the
+    /// hydration terminal (<c>Workspace.Hydrate.{Table}(ids)</c>), whose ExecuteAsync
+    /// returns only the populated session.
+    /// </summary>
+    public IReadOnlyCollection<T> GetAll<T>() where T : class, IEntity
+    {
+        ThrowIfClosed();
+        var results = new List<T>();
+        foreach (var entity in state.Entities.Values)
+        {
+            if (entity is T typed)
+            {
+                results.Add(typed);
+            }
+        }
+        results.Sort(static (a, b) => a.Id.CompareTo(b.Id));
+        return results;
+    }
+
+    /// <summary>
     /// Walks the in-memory entity index for children of <paramref name="owner"/> in
     /// <paramref name="childTable"/>. Children are filtered by their typed-id table
     /// match and by their <see cref="IEntity"/>-side <c>Parent</c> matching
