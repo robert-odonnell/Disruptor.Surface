@@ -26,8 +26,8 @@ public sealed class VariantSaveTests
     /// <summary>
     /// Single-variant kind (SCHEMAFULL edge table) with typed-id endpoints — no
     /// forward-dep dispatch, so the wire sees exactly one INSERT RELATION per save.
-    /// Carries the optional user-facing [Id] (must win over the derive) and a nullable
-    /// payload (must bind an explicit NONE on the duplicate-update path when null).
+    /// Carries a nullable payload (must bind an explicit NONE on the duplicate-update
+    /// path when null).
     /// </summary>
     private const string CrossAggregateModel = """
         using Disruptor.Surface.Annotations;
@@ -44,7 +44,6 @@ public sealed class VariantSaveTests
 
         [Touches]
         public partial class CrossLink {
-            [Id]  public partial TouchesId Id { get; set; }
             [In]  public partial OwnerId Source { get; set; }
             [Out] public partial ForeignId Target { get; set; }
             [Property] public partial string? Note { get; set; }
@@ -88,7 +87,7 @@ public sealed class VariantSaveTests
     // ───────────────────────────── emission shape ────────────────────────────
 
     [Fact]
-    public void Emits_MintId_DeterministicDerive_AndUserIdDelegate()
+    public void Emits_MintId_DeterministicDerive()
     {
         var (result, _, _, compileDiags) = GeneratorHarness.Run(CrossAggregateModel);
         Assert.Empty(compileDiags);
@@ -103,17 +102,25 @@ public sealed class VariantSaveTests
         // Deterministic derive from the (in, edge, out) triple via RecordId.ForEdge.
         Assert.Contains("global::Disruptor.Surface.Runtime.RecordId.ForEdge(\"touches\", __inId, __outId).Value", src);
         // Typed-id endpoints only derive from a populated struct — a default-unset or
-        // nullable-null endpoint yields null and falls back to the random mint (the
-        // save path still fails before dispatch for unset endpoints).
+        // nullable-null endpoint yields null and throws — endpoints must be set before
+        // Id is read.
         Assert.Contains("var __in = _source is { Value: not null } __v_source ? (global::Disruptor.Surface.Runtime.RecordId?)(global::Disruptor.Surface.Runtime.RecordId)__v_source : null;", src);
-        Assert.Contains(": global::M.TouchesId.New();", src);
+        Assert.Contains(": throw new global::System.InvalidOperationException(", src);
+        Assert.Contains("Cannot derive the edge id for 'CrossLink'", src);
+        Assert.DoesNotContain("TouchesId.New()", src);   // src is the variant's .g.cs only — safe scope
+    }
 
-        // The user's [Id] partial property is a delegate to the anchor — reading it
-        // derives, assigning it wins over the derive, and mutation after session-bind
-        // is refused (identity map is keyed on the current id).
-        Assert.Contains("public partial global::M.TouchesId Id", src);
-        Assert.Contains("get => _id ??= __MintId();", src);
-        Assert.Contains("Cannot mutate Id after the entity is bound to a session.", src);
+    [Fact]
+    public void ReadingVariantId_BeforeEndpointsAreSet_Throws()
+    {
+        var asm = GeneratorHarness.CompileAndLoad(CrossAggregateModel);
+        var linkT = asm.GetType("M.CrossLink", throwOnError: true)!;
+        var variant = (IEntity)Activator.CreateInstance(linkT)!;
+
+        var ex = Assert.Throws<InvalidOperationException>(() => variant.Id);
+        Assert.Contains("Cannot derive the edge id for 'CrossLink'", ex.Message);
+        Assert.Contains("Source", ex.Message);
+        Assert.Contains("Target", ex.Message);
     }
 
     [Fact]
@@ -173,22 +180,6 @@ public sealed class VariantSaveTests
     }
 
     [Fact]
-    public async Task E2E_UserAssignedId_WinsOverDerivation()
-    {
-        var asm = GeneratorHarness.CompileAndLoad(CrossAggregateModel);
-        const string assigned = "01H0000000000000000000USER";
-
-        var saved = await SaveCrossLinkAsync(
-            asm,
-            sourceUlid: "01H0000000000000000000000A",
-            targetUlid: "01H0000000000000000000000B",
-            assignedIdUlid: assigned);
-
-        Assert.Equal(new RecordId("touches", assigned), saved.Id);
-        Assert.NotEqual(RecordId.ForEdge("touches", saved.In, saved.Out), saved.Id);
-    }
-
-    [Fact]
     public async Task E2E_EntityTypedEndpoints_MultiVariantKind_DeriveTheSameIdAcrossSaves()
     {
         // Entity-typed endpoints (multi-variant SCHEMALESS kind): the derive resolves
@@ -229,8 +220,8 @@ public sealed class VariantSaveTests
     public async Task E2E_NullableEndpoint_NullAtSave_StillFailsBeforeDispatch()
     {
         // Nullable endpoints left null keep their pre-derive failure behavior: the
-        // derive never runs from a null endpoint (__MintId falls back to a random
-        // mint), and the save path fails before any INSERT RELATION reaches the wire.
+        // derive never runs from a null endpoint (__MintId throws instead), so the
+        // save path fails before any INSERT RELATION reaches the wire.
         var source = """
             using Disruptor.Surface.Annotations;
             namespace M;
@@ -271,15 +262,14 @@ public sealed class VariantSaveTests
     private sealed record DispatchedEdge(RecordId Id, RecordId In, RecordId Out);
 
     /// <summary>
-    /// Creates a CrossLink with the given typed-id endpoints (and optional assigned
-    /// [Id] / payload), saves it through a fresh <see cref="SurrealSession"/> against a
-    /// recording fake, and returns the (id, in, out) record ids from the dispatched
-    /// <c>$_content</c>.
+    /// Creates a CrossLink with the given typed-id endpoints, saves it through a fresh
+    /// <see cref="SurrealSession"/> against a recording fake, and returns the (id, in,
+    /// out) record ids from the dispatched <c>$_content</c>.
     /// </summary>
     private static async Task<DispatchedEdge> SaveCrossLinkAsync(
-        System.Reflection.Assembly asm, string sourceUlid, string targetUlid, string? assignedIdUlid = null)
+        System.Reflection.Assembly asm, string sourceUlid, string targetUlid)
     {
-        var (_, vars) = await SaveCrossLinkRawAsync(asm, sourceUlid, targetUlid, note: null, assignedIdUlid);
+        var (_, vars) = await SaveCrossLinkRawAsync(asm, sourceUlid, targetUlid, note: null);
         var content = Assert.IsType<SurrealObjectValue>(GetVar(vars, "_content"));
         return new DispatchedEdge(
             ReadRecordId(content, "id"),
@@ -288,7 +278,7 @@ public sealed class VariantSaveTests
     }
 
     private static async Task<(string Sql, SurrealObject Vars)> SaveCrossLinkRawAsync(
-        System.Reflection.Assembly asm, string sourceUlid, string targetUlid, string? note, string? assignedIdUlid = null)
+        System.Reflection.Assembly asm, string sourceUlid, string targetUlid, string? note)
     {
         var linkT = asm.GetType("M.CrossLink", throwOnError: true)!;
         var link = (IEntity)Activator.CreateInstance(linkT)!;
@@ -297,11 +287,6 @@ public sealed class VariantSaveTests
         if (note is not null)
         {
             linkT.GetProperty("Note")!.SetValue(link, note);
-        }
-
-        if (assignedIdUlid is not null)
-        {
-            linkT.GetProperty("Id")!.SetValue(link, Activator.CreateInstance(asm.GetType("M.TouchesId", throwOnError: true)!, assignedIdUlid));
         }
 
         var session = new SurrealSession();

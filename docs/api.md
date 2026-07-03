@@ -786,7 +786,7 @@ DEFINE FIELD IF NOT EXISTS run_id ON uses TYPE string DEFAULT "";
 
 Every relation table gets `DEFINE INDEX … UNIQUE` on `(in, out)` and is declared `TYPE RELATION ENFORCED`. The variant's `SaveAsync` body uses `INSERT RELATION INTO {edge} $_content ON DUPLICATE KEY UPDATE field = $_p_field, …` so re-saving the same `(in, out)` pair refreshes payload (or no-ops when the variant has no `[Property]` members). The `RELATION` keyword satisfies `TYPE RELATION ENFORCED` (which `UPSERT` does not). Nullable payloads set to `null` bind an explicit `NONE` for their `$_p_{field}` duplicate-update variable (the `$_content` insert path omits the field so the schema `DEFAULT` applies; the update path converges to the same NONE state — and a variable the SET clause always references must always be bound).
 
-**Edge ids are deterministic.** When a variant has no assigned id at save time, its id anchor derives one from the `(in, edge, out)` triple via `RecordId.ForEdge` — `HashText("{source}|{edge}|{target}")`, a hash-form value the per-kind `{Kind}Id` validation accepts. The same endpoint pair yields the same edge id on every save, so the `UNIQUE (in, out)` duplicate path updates exactly the row id the session records via `MarkSaved` — re-save is replay-replace, with no id drift between session and substrate. Precedence: a hydrated id or a user-assigned value wins; a variant may declare `[Id] public partial {Kind}Id Id { get; set; }` to assign one explicitly (mutation is refused once the variant is session-bound). Endpoints still unset when the id is first read fall back to a random Ulid mint — the save path fails before dispatch in that case, so the fallback id never lands.
+**Edge ids are deterministic.** When a variant has no hydrated id at save time, its id anchor derives one from the `(in, edge, out)` triple via `RecordId.ForEdge` — `HashText("{source}|{edge}|{target}")`, a hash-form value the per-kind `{Kind}Id` validation accepts. The same endpoint pair yields the same edge id on every save, so the `UNIQUE (in, out)` duplicate path updates exactly the row id the session records via `MarkSaved` — re-save is replay-replace, with no id drift between session and substrate. Edge identity is canonical and closed: `[Id]` on a relation variant is a compile error (CG057), and reading `Id` before both endpoints are set throws `InvalidOperationException`. The id a variant carries is therefore always `RecordId.ForEdge(in, edge, out)` (or the hydrated row id, which is the same value for rows this library wrote). Hand-minted edge rows outside the variant save path can still use `RecordId.Idempotent`/`Resolve`.
 
 ### Runtime calls
 
@@ -902,7 +902,7 @@ public partial interface ICodeSymbolEdge : IRelationVariant
 }
 ```
 
-The interface members can carry `[In]` / `[Out]` / `[Property]` / `[Id]` (preview.56+). Variants with an empty body (`: ICodeSymbolEdge;`) inherit the lifted shape; variants that self-declare attributed `partial` members win for any role they declare. Both shapes coexist:
+The interface members can carry `[In]` / `[Out]` / `[Property]` (preview.56+; an `[Id]` member on a shared-shape interface is rejected with CG057 — relation-variant identity is canonical, see the Diagnostics table below). Variants with an empty body (`: ICodeSymbolEdge;`) inherit the lifted shape; variants that self-declare attributed `partial` members win for any role they declare. Both shapes coexist:
 
 ```csharp
 // Self-describing variant (preview.55 shape — still valid). Useful when one
@@ -1021,6 +1021,7 @@ Read methods (sync):
 | Method | Purpose |
 | --- | --- |
 | `Get<T>(IRecordId id)` | Lookup a hydrated or tracked entity by id. |
+| `GetAll<T>()` | All tracked entities of type `T`, ordered by id — the batch-mutate companion for hydration flows. |
 | `QueryChildren<T>(owner, childTable)` | Read children by parent link. Matches each candidate's `IEntity.GetParentId()` against `owner.Id`. |
 | `QueryOutgoing<TKind, T>(owner)` | Read same-aggregate outgoing relation targets. |
 | `QueryIncoming<TKind, T>(owner)` | Read same-aggregate incoming relation sources. |
@@ -1290,3 +1291,4 @@ The generator emits diagnostics for invalid model shapes. Most are errors (compi
 | `CG054` | More than one `[CreatedAt]` (or `[UpdatedAt]`, or `[Version]`) property on one table. |
 | `CG055` | One property carries more than one of `[CreatedAt]`/`[UpdatedAt]`/`[Version]`; the markers prescribe contradictory write behaviors for the same field. |
 | `CG056` | Relation-variant payload `[Property]` type has no SurrealDB scalar mapping; the field is omitted from the emitted DDL and from the dispatched edge content (in-memory-only state). Warning — the entity-table equivalent is the CG025 error. |
+| `CG057` | Error — `[Id]` on a relation variant (self-declared or lifted); edge identity is canonically derived from (in, edge, out). |

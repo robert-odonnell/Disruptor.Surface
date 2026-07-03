@@ -22,7 +22,8 @@ namespace Disruptor.Surface.Runtime.Query;
 /// <para>
 /// At construction time the lambda runs once with a discovery probe row that captures
 /// each <c>Read</c>'d field; that list becomes the SurrealQL SELECT projection. At
-/// query time the lambda runs once per result row with a real JSON-backed row.
+/// query time the lambda runs once per result row against the CBOR-decoded
+/// <see cref="Disruptor.Surreal.Values.SurrealObjectValue"/>.
 /// </para>
 /// </summary>
 public static class SurfaceProjection
@@ -78,8 +79,8 @@ public static class SurfaceProjection
 /// <summary>
 /// Default <see cref="ISurfaceProjection{TRow}"/> implementation: holds the discovered
 /// field list and the user's materialise lambda. Each <see cref="Materialise"/> call
-/// wraps the row in a <see cref="JsonProjectionRow"/> and runs the lambda again; the
-/// lambda's <see cref="IProjectionRow.Read{T}"/> calls hit the real JSON values.
+/// wraps the row in a <see cref="ValueProjectionRow"/> and runs the lambda again; the
+/// lambda's <see cref="IProjectionRow.Read{T}"/> calls hit the decoded response values.
 /// </summary>
 internal sealed class SurfaceProjection<TRow>(
     IReadOnlyList<string> selectFields,

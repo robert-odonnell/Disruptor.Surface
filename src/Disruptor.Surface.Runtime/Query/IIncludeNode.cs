@@ -46,8 +46,9 @@ public sealed record IncludeInlineRefNode(string Field) : IIncludeNode;
 /// </para>
 /// <para>
 /// <see cref="Hydrator"/> is the generator-emitted callback that instantiates a fresh
-/// entity of the right CLR type and runs <c>IEntity.Hydrate</c> against the row JSON.
-/// Captured at codegen time so the runtime never needs reflection / type discovery to
+/// entity of the right CLR type and runs <c>IEntity.Hydrate</c> against the row's
+/// <see cref="Disruptor.Surreal.Values.SurrealValue"/>. Captured at codegen time so the
+/// runtime never needs reflection / type discovery to
 /// dispatch on the table-name string. <c>null</c> when the node was constructed by hand
 /// (tests, ad-hoc tooling) — in that case the runtime emits SQL but won't hydrate the
 /// nested rows.

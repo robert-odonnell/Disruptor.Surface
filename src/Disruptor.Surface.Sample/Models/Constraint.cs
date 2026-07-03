@@ -16,6 +16,8 @@ public partial class Constraint
 
     [Property] public partial string Description { get; set; }
 
+    [Property] public partial string? Notes { get; set; }
+
     [Restricts] public partial IReadOnlyCollection<IEntity> Restrictions { get; }
 
     [ReferencedBy] public partial IReadOnlyCollection<IRecordId> References { get; }

@@ -1,6 +1,6 @@
 ---
 name: AggregateRoot, membership, cross-aggregate ID-only contract
-description: [AggregateRoot] marks the unit of load coordination. Membership is via [Children] reachability from the root; CG011 fires on conflict. Cross-aggregate edges expose IDs only on the read side; the typed async Session.RelateAsync<TKind> primitive is the canonical mutation.
+description: [AggregateRoot] marks the unit of load coordination. Membership is via [Children] reachability from the root; CG011 fires on conflict. Cross-aggregate edges expose IDs only on the read side; the canonical mutations are Session.SaveAsync(new TVariant { Source, Target }, tx) for creation and Session.UnrelateAsync<TKind> for deletion.
 type: project
 originSessionId: 1e5d41a3-6a1f-4283-a81a-3bde6363f5b2
 ---

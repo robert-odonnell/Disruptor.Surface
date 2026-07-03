@@ -61,6 +61,7 @@ public sealed class SurrealSessionTests
         session.Abandon();
 
         Assert.Throws<InvalidOperationException>(() => session.Get<StubEntity>(entity.Id));
+        Assert.Throws<InvalidOperationException>(() => session.GetAll<StubEntity>());
         Assert.Throws<InvalidOperationException>(() => session.QueryChildren<StubEntity>(entity, "child"));
         Assert.Throws<InvalidOperationException>(() => session.QueryOutgoing<StubEntity>(entity, "edge"));
         Assert.Throws<InvalidOperationException>(() => session.QueryIncoming<StubEntity>(entity, "edge"));
@@ -226,6 +227,30 @@ public sealed class SurrealSessionTests
         var session = new SurrealSession();
         var resolved = session.Get<StubEntity>(new RecordId("designs", "missing"));
         Assert.Null(resolved);
+    }
+
+    [Fact]
+    public void GetAll_ReturnsOnlyMatchingType_OrderedById()
+    {
+        var session = new SurrealSession();
+        var b = new StubEntity(new RecordId("designs", "bb"));
+        var a = new StubEntity(new RecordId("designs", "aa"));
+        var other = new RefStubEntity(new RecordId("constraints", "cc"));
+        ((IHydrationSink)session).Track(b);
+        ((IHydrationSink)session).Track(other);
+        ((IHydrationSink)session).Track(a);
+
+        var all = session.GetAll<StubEntity>();
+
+        Assert.Equal(new[] { a, b }, all);            // id-ordered, other type filtered out
+        Assert.Empty(session.GetAll<RefStubEntity>().Where(e => e.Id.Table == "designs"));
+    }
+
+    [Fact]
+    public void GetAll_EmptySession_ReturnsEmpty()
+    {
+        var session = new SurrealSession();
+        Assert.Empty(session.GetAll<StubEntity>());
     }
 
     // Sync Relate / typed-kind Relate behaviour tests (TypedRelate_*, Relate_With*) were

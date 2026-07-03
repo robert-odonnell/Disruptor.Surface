@@ -243,6 +243,26 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     }
 
     /// <summary>
+    /// Reads <paramref name="entity"/>'s id for a close-reason report, swallowing a
+    /// throw from the getter itself. A relation variant's <c>Id</c> derives from its
+    /// endpoints and throws when they aren't both resolvable yet (see the id anchor's
+    /// <c>__MintId</c>) — when THAT is the failure a catch block is reporting, a naive
+    /// second read would throw again and mask the original exception, leaving the
+    /// session never closed. <c>null</c> here means "id unavailable", not "no entity".
+    /// </summary>
+    private static RecordId? TryReadIdForCloseReason(IEntity entity)
+    {
+        try
+        {
+            return entity.Id;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Fail-close entry point for same-assembly query surfaces that mutate a
     /// caller-supplied session (<see cref="SurfaceQuery{T}.ExecuteIntoSessionAsync(SurrealSession, SurrealClient, CancellationToken)"/>):
     /// stamps the truthful close reason — never <see cref="SessionCloseKind.Abandoned"/>,
@@ -309,6 +329,28 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
         ThrowIfClosed();
         var rid = RecordId.From(id);
         return state.Entities.TryGetValue(rid, out var entity) && entity is T typed ? typed : null;
+    }
+
+    /// <summary>
+    /// All tracked entities of type <typeparamref name="T"/> in this session's identity
+    /// map, ordered by id (ordinal table-then-value) for deterministic iteration. The
+    /// batch-mutate companion to <see cref="Get{T}(IRecordId)"/> — pairs with the
+    /// hydration terminal (<c>Workspace.Hydrate.{Table}(ids)</c>), whose ExecuteAsync
+    /// returns only the populated session.
+    /// </summary>
+    public IReadOnlyCollection<T> GetAll<T>() where T : class, IEntity
+    {
+        ThrowIfClosed();
+        var results = new List<T>();
+        foreach (var entity in state.Entities.Values)
+        {
+            if (entity is T typed)
+            {
+                results.Add(typed);
+            }
+        }
+        results.Sort(static (a, b) => a.Id.CompareTo(b.Id));
+        return results;
     }
 
     /// <summary>
@@ -833,25 +875,6 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     // ──────────────────────────── boundary (async) ───────────────────────────
 
     /// <summary>
-    /// Flushes pending writes through a streamed server-side transaction. Each rendered
-    /// command is dispatched as its own RPC inside the txn (begin → N queries → commit),
-    /// so wire-side batch limits no longer cap commit size. The session closes on return
-    /// regardless of outcome — the one-shot invariant is "load → mutate → commit (or
-    /// fail), then loop."
-    /// <para>
-    /// Concurrency surfaces natively: if another writer's commit lands first and conflicts
-    /// with ours, SurrealDB raises a <see cref="SurrealConflictException"/> at COMMIT
-    /// (or earlier, on a conflicting write). The domain catches and decides whether to
-    /// reload-and-retry. No application-level lease, no CAS-on-sequence — the substrate
-    /// owns concurrency now.
-    /// </para>
-    /// <para>
-    /// Single exception boundary: any exception during commit marks the session closed
-    /// and rethrows. Nothing else in the runtime catches exceptions; everything else
-    /// throws freely and lands here.
-    /// </para>
-    /// </summary>
-    /// <summary>
     /// Per-entity Save: dispatches <paramref name="entity"/> (and its forward dependencies +
     /// new children, transitively) into <paramref name="tx"/>. Whole-entity always — every
     /// dispatched row is a <c>CREATE/UPDATE record:id CONTENT { … }</c>. Dependency-first
@@ -881,7 +904,7 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
         {
             // Fail-closed: any dispatch failure marks the session done. The app catches
             // and cancels the txn on its own.
-            Close(new SessionCloseReason(SessionCloseKind.SaveFailed, entity.Id, ex));
+            Close(new SessionCloseReason(SessionCloseKind.SaveFailed, TryReadIdForCloseReason(entity), ex));
             throw;
         }
     }
@@ -957,7 +980,7 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
             // Fail-closed: the batch is one logical Save. Same contract as the
             // single-entity overload, with its own close kind so diagnostics say
             // which write surface died.
-            Close(new SessionCloseReason(SessionCloseKind.BatchSaveFailed, current.Id, ex));
+            Close(new SessionCloseReason(SessionCloseKind.BatchSaveFailed, TryReadIdForCloseReason(current), ex));
             throw;
         }
     }
@@ -1326,7 +1349,7 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
             var kind = ex is CascadeRejectException
                 ? SessionCloseKind.RejectedDelete
                 : SessionCloseKind.DeleteFailed;
-            Close(new SessionCloseReason(kind, entity.Id, ex));
+            Close(new SessionCloseReason(kind, TryReadIdForCloseReason(entity), ex));
             throw;
         }
     }

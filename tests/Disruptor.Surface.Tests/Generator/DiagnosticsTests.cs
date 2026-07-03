@@ -1346,6 +1346,96 @@ public sealed class DiagnosticsTests
         Assert.Empty(compileDiags);
     }
 
+    [Fact]
+    public void CG057_IdOnRelationVariant_IsRejected()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+
+            [Table] public partial class Constraint {
+                [Id] public partial ConstraintId Id { get; set; }
+            }
+
+            [Restricts]
+            public partial class WithId {
+                [Id]  public partial RestrictsId Id { get; set; }
+                [In]  public partial Constraint Source { get; set; }
+                [Out] public partial Constraint Target { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src, FixturePath);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG057");
+        Assert.NotNull(diag);
+        Assert.Equal(DiagnosticSeverity.Error, diag!.Severity);
+        Assert.Contains("M.WithId", diag.GetMessage());
+        Assert.Contains("Id", diag.GetMessage());
+        // Member-precise location via the declaration-location map (memberName path).
+        AssertLocationAt(diag, src, "RestrictsId Id");
+    }
+
+    [Fact]
+    public void CG057_LiftedIdFromAnnotatedSharedShape_IsRejected()
+    {
+        // An [Id] can also arrive via the annotated shared-shape lift (preview.56/.57) —
+        // the linker merges it into variant.Id, so a validation check on the post-link
+        // model catches it with no extra linker work. The variant has no declared member
+        // named 'Id', so the location degrades to the variant declaration — assert the
+        // diagnostic fires; only assert location if the map's fallback lands somewhere
+        // deterministic (verify DeclarationLocationExtractor's miss behavior in Step 3).
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+
+            [Table] public partial class Constraint {
+                [Id] public partial ConstraintId Id { get; set; }
+            }
+
+            public partial interface IEdgeShape : IRelationVariant {
+                [Id]  RestrictsId Id { get; set; }
+                [In]  Constraint Source { get; set; }
+                [Out] Constraint Target { get; set; }
+            }
+
+            [Restricts]
+            public partial class Lifted : IEdgeShape;
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        var diag = runDiags.FirstOrDefault(d => d.Id == "CG057");
+        Assert.NotNull(diag);
+        Assert.Contains("M.Lifted", diag!.GetMessage());
+    }
+
+    [Fact]
+    public void CG057_DoesNotFire_ForTableIdOrIdlessVariant()
+    {
+        const string src = """
+            using Disruptor.Surface.Annotations;
+            using Disruptor.Surface.Runtime;
+            namespace M;
+
+            public sealed class RestrictsAttribute : ForwardRelation;
+
+            [Table] public partial class Constraint {
+                [Id] public partial ConstraintId Id { get; set; }
+            }
+
+            [Restricts]
+            public partial class Clean {
+                [In]  public partial Constraint Source { get; set; }
+                [Out] public partial Constraint Target { get; set; }
+            }
+            """;
+        var (_, _, runDiags, _) = GeneratorHarness.Run(src);
+        Assert.DoesNotContain(runDiags, d => d.Id == "CG057");
+    }
+
     // ── diagnostic source-location helpers ──────────────────────────────────────
     //
     // Diagnostics are reported with external-file locations rehydrated from the
