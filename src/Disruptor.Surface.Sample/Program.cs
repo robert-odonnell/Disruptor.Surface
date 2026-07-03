@@ -6,6 +6,7 @@ using Disruptor.Surface.Sample.Relations;
 using Disruptor.Surface.Sample.Relations.Variants;
 using Disruptor.Surreal;
 using Disruptor.Surreal.Connection;
+using Disruptor.Surreal.Values;
 
 // Mirror of: surreal start --bind 127.0.0.1:8000 --default-namespace project-brain
 //                          --default-database workspace --username root --password secret
@@ -60,7 +61,18 @@ await DemoRelationTraversal(db);
 //    substrate and return hydrated rows independent of the seed-phase session.
 await DemoAsyncQueryTerminals(seededDesignIds[2], reviewId, db);
 
-return 0;
+// ── 8. Release smoke. Exercises the seven wire shapes from remaining-work.md §1 that
+//    have never touched a real SurrealDB. Each check seeds + acts + asserts, prints a
+//    single `smoke[N] PASS/FAIL — detail` verdict, and continues on failure so one run
+//    reports all seven. The process exits non-zero if any failed (Task 6 runs it live).
+var smokeFailures = await DemoReleaseSmoke(seededDesignIds, reviewId, db);
+
+// ── 9. Identifier-quoting probe (§2). One raw statement per emit position a
+//    reserved-word column name would render into, backtick-quoted, plus an unquoted
+//    control. DDL is rejected inside a transaction, so these run at the db level.
+await ProbeIdentifierQuoting(db);
+
+return smokeFailures == 0 ? 0 : 1;
 
 async Task<DesignId> SeedAndCommitDesign(string text, SurrealClient client)
 {
@@ -643,5 +655,429 @@ static async Task DemoAsyncQueryTerminals(DesignId designId, ReviewId reviewId, 
     }
 
     Console.WriteLine();
+}
+
+// (8) Release smoke. Seven behavioral checks against the live substrate, one per
+// remaining-work.md §1 row. Non-static: captures `workspace` for the Load*Async calls.
+// Returns the number of failed checks so the top-level flow can set the exit code.
+async Task<int> DemoReleaseSmoke(IReadOnlyList<DesignId> designIds, ReviewId seededReviewId, SurrealClient client)
+{
+    Console.WriteLine("--- Release smoke (remaining-work.md §1 live shapes) ---");
+
+    var failures = 0;
+    void Report(string item, bool pass, string detail)
+    {
+        if (!pass)
+        {
+            failures++;
+        }
+
+        Console.WriteLine($"  smoke[{item}] {(pass ? "PASS" : "FAIL")} — {detail}");
+    }
+
+    // Shared seed for items (1) and (5): a fresh design with two constraints — one with
+    // Notes set (containing "smoke"), one left untouched so its optional field is written
+    // as NONE (the write path omits the key). The unique description marker scopes the
+    // Notes predicates to just these two rows.
+    const string notesMarker = "notes-smoke-marker";
+    ConstraintId setConstraintId = default;
+    ConstraintId unsetConstraintId = default;
+    var notesSeeded = false;
+    try
+    {
+        var seed = new SurrealSession(Workspace.ReferenceRegistry);
+        var d = seed.Track(new Design
+        {
+            RepositoryRoot = "smoke.notes.repository_root",
+            Description = "smoke notes design",
+            Details = new Details { Header = "notes header", Summary = "notes summary", Text = "notes text" }
+        });
+        var cSet = seed.Track(new Constraint
+        {
+            Design = d,
+            Description = $"{notesMarker} set-row",
+            Notes = "constraint note carrying the smoke keyword"
+        });
+        var cUnset = seed.Track(new Constraint
+        {
+            Design = d,
+            Description = $"{notesMarker} unset-row"
+            // Notes untouched → null → omitted at save → stored as NONE.
+        });
+        await using var tx = await client.BeginTransactionAsync();
+        await seed.SaveAsync(d, tx);
+        await tx.CommitAsync();
+        setConstraintId = cSet.Id;
+        unsetConstraintId = cUnset.Id;
+        notesSeeded = true;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  (Notes seed for items 1/5 failed: {ex.GetType().Name}: {ex.Message})");
+    }
+
+    // (1) Eq(null) / IsNone() match rows whose field was omitted at save time.
+    try
+    {
+        if (!notesSeeded)
+        {
+            Report("1", false, "Notes seed did not commit — cannot evaluate NONE semantics");
+        }
+        else
+        {
+            var isNone = await Workspace.Query.Constraints
+                .Where(ConstraintQ.Description.Contains(notesMarker))
+                .Where(ConstraintQ.Notes.IsNone())
+                .ExecuteAsync(client);
+            var eqNull = await Workspace.Query.Constraints
+                .Where(ConstraintQ.Description.Contains(notesMarker))
+                .Where(ConstraintQ.Notes.Eq(null))
+                .ExecuteAsync(client);
+            var isNoneOk = isNone.Count == 1 && isNone[0].Id == unsetConstraintId;
+            var eqNullOk = eqNull.Count == 1 && eqNull[0].Id == unsetConstraintId;
+            Report("1", isNoneOk && eqNullOk,
+                $"IsNone→{isNone.Count} row(s), Eq(null)→{eqNull.Count} row(s); both must be exactly the single unset constraint");
+        }
+    }
+    catch (Exception ex)
+    {
+        Report("1", false, $"unexpected {ex.GetType().Name}: {ex.Message}");
+    }
+
+    // (2) [Version]-guarded UPDATE returns empty on version mismatch → SurrealVersionConflictException.
+    //     Deterministic recipe: stale read-mode snapshot, bump through a separate tx, then
+    //     save the stale entity in a fresh tx and expect the conflict.
+    var conflictDesignId = designIds[7];
+    try
+    {
+        // Stale snapshot (read-mode load — no transaction).
+        var staleSession = await workspace.LoadDesignAsync(client, conflictDesignId);
+        var staleDesign = staleSession.Get<Design>(conflictDesignId)
+                          ?? throw new InvalidOperationException($"design {conflictDesignId} did not hydrate");
+        var staleVersion = staleDesign.Version;
+
+        // Bump the version through a separate, independently-committed session.
+        await using (var bumpTx = await client.BeginTransactionAsync())
+        {
+            var bumpSession = await workspace.LoadDesignAsync(bumpTx, conflictDesignId);
+            var bumpDesign = bumpSession.Get<Design>(conflictDesignId)!;
+            bumpDesign.Description = "version-bump commit";
+            await bumpSession.SaveAsync(bumpDesign, bumpTx);
+            await bumpTx.CommitAsync();
+        }
+
+        // Save the stale entity — its guarded UPDATE (WHERE version = staleVersion) now
+        // matches no row, so the emitted SaveAsync body throws before commit.
+        var threw = false;
+        var detail = $"stale save did NOT throw — version guard failed to detect the conflict (stale snapshot held version {staleVersion})";
+        try
+        {
+            await using var staleTx = await client.BeginTransactionAsync();
+            staleDesign.Description = "stale lost-update attempt";
+            await staleSession.SaveAsync(staleDesign, staleTx);
+            await staleTx.CommitAsync();
+        }
+        catch (SurrealVersionConflictException ex)
+        {
+            threw = true;
+            detail = $"stale save threw SurrealVersionConflictException (expected version {ex.ExpectedVersion}, DB had moved on)";
+        }
+
+        Report("2", threw, detail);
+    }
+    catch (Exception ex)
+    {
+        Report("2", false, $"unexpected {ex.GetType().Name}: {ex.Message}");
+    }
+
+    // (2b) Two-concurrent-open-transactions variant. Recorded, never fails the run — it
+    //      documents WHICH exception surfaces (the library's version guard at SaveAsync,
+    //      or the substrate's MVCC SurrealConflictException at COMMIT). Task 6 records it.
+    var twoTxOutcome = "no exception — both transactions committed";
+    try
+    {
+        var twoTxDesignId = designIds[8];
+        await using var txA = await client.BeginTransactionAsync();
+        await using var txB = await client.BeginTransactionAsync();
+        var sessionA = await workspace.LoadDesignAsync(txA, twoTxDesignId);
+        var sessionB = await workspace.LoadDesignAsync(txB, twoTxDesignId);
+        var designA = sessionA.Get<Design>(twoTxDesignId)!;
+        var designB = sessionB.Get<Design>(twoTxDesignId)!;
+        designA.Description = "concurrent writer A";
+        designB.Description = "concurrent writer B";
+        await sessionA.SaveAsync(designA, txA);
+        await sessionB.SaveAsync(designB, txB);
+        await txA.CommitAsync();
+        await txB.CommitAsync();
+    }
+    catch (SurrealVersionConflictException)
+    {
+        twoTxOutcome = "SurrealVersionConflictException (library version guard, at SaveAsync)";
+    }
+    catch (SurrealConflictException)
+    {
+        twoTxOutcome = "SurrealConflictException (substrate MVCC, at COMMIT)";
+    }
+    catch (Exception ex)
+    {
+        twoTxOutcome = $"{ex.GetType().Name}: {ex.Message}";
+    }
+
+    Console.WriteLine($"  smoke[2b] NOTE (two open transactions) — surfaced: {twoTxOutcome}");
+
+    // (3) Bulk save coalesces contiguous same-table CREATEs into one INSERT INTO, and a
+    //     same-batch child sees the earlier parent statement. Fresh design saved first
+    //     (its CREATE is statement 1), then three payload-free constraints batch-saved —
+    //     they reference the already-saved parent, so they coalesce into one INSERT.
+    try
+    {
+        var bulkSession = new SurrealSession(Workspace.ReferenceRegistry);
+        var bulkDesign = bulkSession.Track(new Design
+        {
+            RepositoryRoot = "smoke.bulk.repository_root",
+            Description = "smoke bulk design",
+            Details = new Details { Header = "bulk header", Summary = "bulk summary", Text = "bulk text" }
+        });
+
+        await using var tx = await client.BeginTransactionAsync();
+        // Parent first — its CREATE is the earlier statement the children depend on.
+        await bulkSession.SaveAsync(bulkDesign, tx);
+
+        // Three new constraints on the same table, no inline Details (so nothing
+        // interleaves and the three CREATEs stay contiguous → one INSERT INTO constraints).
+        var c1 = new Constraint { Design = bulkDesign, Description = "bulk-smoke constraint alpha" };
+        var c2 = new Constraint { Design = bulkDesign, Description = "bulk-smoke constraint beta" };
+        var c3 = new Constraint { Design = bulkDesign, Description = "bulk-smoke constraint gamma" };
+        await bulkSession.SaveAsync(new IEntity[] { c1, c2, c3 }, tx);
+        await tx.CommitAsync();
+
+        // Reload after commit and count — a fresh design, so exactly the three we saved.
+        var reloaded = await workspace.LoadDesignAsync(client, bulkDesign.Id);
+        var reloadedDesign = reloaded.Get<Design>(bulkDesign.Id)!;
+        var count = reloadedDesign.Constraints.Count;
+        Report("3", count == 3, $"bulk-saved 3 constraints under one fresh parent in one tx; reload sees {count}");
+    }
+    catch (Exception ex)
+    {
+        Report("3", false, $"unexpected {ex.GetType().Name}: {ex.Message}");
+    }
+
+    // (4) Deterministic edge id + duplicate-update path + NONE payload binding. Save the
+    //     assesses edge with Note="first", then again with Note=null. Both saves derive
+    //     the same id via RecordId.ForEdge; the second lands ON DUPLICATE KEY UPDATE and
+    //     binds SurrealValue.None, so the row's note becomes NONE.
+    try
+    {
+        var edgeTargetDesignId = designIds[0]; // a design this review does not already assess
+        var expectedEdgeId = RecordId.ForEdge("assesses", seededReviewId, edgeTargetDesignId);
+
+        var first = new ReviewAssessesDesign { Source = seededReviewId, Target = edgeTargetDesignId, Note = "first" };
+        var second = new ReviewAssessesDesign { Source = seededReviewId, Target = edgeTargetDesignId, Note = null };
+        var firstId = ((IEntity)first).Id;
+        var secondId = ((IEntity)second).Id;
+        var idsMatch = firstId == expectedEdgeId && secondId == expectedEdgeId;
+
+        await using (var tx = await client.BeginTransactionAsync())
+        {
+            var s = new SurrealSession(Workspace.ReferenceRegistry);
+            await s.SaveAsync(first, tx);
+            await tx.CommitAsync();
+        }
+
+        await using (var tx = await client.BeginTransactionAsync())
+        {
+            var s = new SurrealSession(Workspace.ReferenceRegistry);
+            await s.SaveAsync(second, tx);
+            await tx.CommitAsync();
+        }
+
+        var selection = await client.QueryAsync(
+            "SELECT * FROM $_rid;",
+            new SurrealObject { ["_rid"] = new SurrealRecordIdValue(expectedEdgeId.ToSdk()) });
+        selection.EnsureSuccess();
+        var noteIsNone = EdgeNoteIsNone(selection);
+        Report("4", idsMatch && noteIsNone,
+            $"both saves carry id {expectedEdgeId} (ids match={idsMatch}); after the null re-save the row's note IS NONE = {noteIsNone}");
+    }
+    catch (Exception ex)
+    {
+        Report("4", false, $"unexpected {ex.GetType().Name}: {ex.Message}");
+    }
+
+    // (5) NONE-guarded string function skips unset rows instead of erroring the SELECT.
+    //     Reuses the items-1 seed: Notes.Contains("smoke") must return only the set row.
+    try
+    {
+        if (!notesSeeded)
+        {
+            Report("5", false, "Notes seed did not commit — cannot evaluate the NONE-guarded string function");
+        }
+        else
+        {
+            // ConstraintQ.Notes is PropertyExpr<string?>; the string operators are declared
+            // on PropertyExpr<string>. The nullable annotation is CLR-erased so the call
+            // binds — CS8620 is the documented "annotated form differs" warning (see
+            // PropertyExprStringExtensions), expected on any optional string column.
+#pragma warning disable CS8620
+            var contains = await Workspace.Query.Constraints
+                .Where(ConstraintQ.Description.Contains(notesMarker))
+                .Where(ConstraintQ.Notes.Contains("smoke"))
+                .ExecuteAsync(client);
+#pragma warning restore CS8620
+            var onlySet = contains.Count == 1 && contains[0].Id == setConstraintId;
+            Report("5", onlySet,
+                $"Notes.Contains(\"smoke\")→{contains.Count} row(s); SELECT did not error over the mixed set/unset rows and returned only the set row");
+        }
+    }
+    catch (Exception ex)
+    {
+        Report("5", false, $"unexpected {ex.GetType().Name}: {ex.Message}");
+    }
+
+    // (6) string::matches regex predicate. The seeded constraint descriptions end with
+    //     `seed-{n}`; the regex matches those and nothing else in the constraints table.
+    try
+    {
+        var matched = await Workspace.Query.Constraints
+            .Where(ConstraintQ.Description.Matches("seed-[0-9]+$"))
+            .ExecuteAsync(client);
+        var allSeeded = matched.All(c => c.Description.Contains("seed-"));
+        Report("6", matched.Count == designIds.Count && allSeeded,
+            $"string::matches(\"seed-[0-9]+$\")→{matched.Count} row(s); expected the {designIds.Count} seeded constraints only");
+    }
+    catch (Exception ex)
+    {
+        Report("6", false, $"unexpected {ex.GetType().Name}: {ex.Message}");
+    }
+
+    // (7) Audit round-trip. CREATE stamped created + updated + version=1 at seed time; an
+    //     UPDATE must leave created untouched, advance updated, and bump version by one.
+    try
+    {
+        var auditDesignId = designIds[5];
+        var before = await workspace.LoadDesignAsync(client, auditDesignId);
+        var beforeDesign = before.Get<Design>(auditDesignId)!;
+        var createdBefore = beforeDesign.CreatedAtUtc;
+        var updatedBefore = beforeDesign.UpdatedAtUtc;
+        var versionBefore = beforeDesign.Version;
+
+        await using (var tx = await client.BeginTransactionAsync())
+        {
+            var writeSession = await workspace.LoadDesignAsync(tx, auditDesignId);
+            var writeDesign = writeSession.Get<Design>(auditDesignId)!;
+            writeDesign.Description = "audit round-trip edit";
+            await writeSession.SaveAsync(writeDesign, tx);
+            await tx.CommitAsync();
+        }
+
+        var after = await workspace.LoadDesignAsync(client, auditDesignId);
+        var afterDesign = after.Get<Design>(auditDesignId)!;
+        var createdUnchanged = afterDesign.CreatedAtUtc == createdBefore;
+        var updatedAdvanced = afterDesign.UpdatedAtUtc > updatedBefore;
+        var versionBumped = afterDesign.Version == versionBefore + 1;
+        Report("7", createdUnchanged && updatedAdvanced && versionBumped,
+            $"created {(createdUnchanged ? "unchanged" : "CHANGED")}, updated {(updatedAdvanced ? "advanced" : "NOT advanced")}, version {versionBefore}→{afterDesign.Version}");
+    }
+    catch (Exception ex)
+    {
+        Report("7", false, $"unexpected {ex.GetType().Name}: {ex.Message}");
+    }
+
+    Console.WriteLine($"  release smoke: {(failures == 0 ? "all 7 checks PASSED" : $"{failures} check(s) FAILED")}");
+    Console.WriteLine();
+    return failures;
+
+    // Reads the `note` field off a single-row edge SELECT and reports whether it is NONE
+    // (the field is either absent from the row object or present as a null/none value).
+    static bool EdgeNoteIsNone(SurrealQueryResponse response)
+    {
+        var result = response.Take(0);
+        SurrealObjectValue? row = result switch
+        {
+            SurrealListValue { List: var rows } when rows.Count > 0 && rows[0] is SurrealObjectValue first => first,
+            SurrealObjectValue only => only,
+            _ => null
+        };
+        if (row is null)
+        {
+            return false; // no row came back — cannot confirm NONE
+        }
+
+        return !row.Object.TryGetValue("note", out var note) || note.IsNullish;
+    }
+}
+
+// (9) Identifier-quoting probe. Runs one raw statement per emit position a reserved-word
+// column name renders into (DEFINE FIELD/INDEX, CREATE SET, WHERE, ORDER BY, UPDATE SET,
+// subselect alias), backtick-quoted, plus an unquoted-`none` control. DDL is rejected
+// inside transactions, so every statement runs at the db level (the same call
+// Workspace.ApplySchemaAsync(db) uses). Prints OK/FAILED per probe; the control is
+// reported as observed behavior, not pass/fail.
+static async Task ProbeIdentifierQuoting(SurrealClient db)
+{
+    Console.WriteLine("--- Identifier-quoting probe (remaining-work.md §2) ---");
+
+    var probes = new (string Label, string Sql)[]
+    {
+        ("define-table",       "DEFINE TABLE IF NOT EXISTS quote_probe SCHEMAFULL;"),
+        ("define-field-order", "DEFINE FIELD IF NOT EXISTS `order` ON quote_probe TYPE string;"),
+        ("define-field-none",  "DEFINE FIELD IF NOT EXISTS `none` ON quote_probe TYPE option<string>;"),
+        ("define-index",       "DEFINE INDEX IF NOT EXISTS idx_quote_probe ON TABLE quote_probe COLUMNS `order`;"),
+        ("create-set",         "CREATE quote_probe:one SET `order` = 'a', `none` = 'x';"),
+        ("where-orderby",      "SELECT * FROM quote_probe WHERE `order` = 'a' ORDER BY `order` ASC;"),
+        ("update-set",         "UPDATE quote_probe:one SET `none` = 'y';"),
+        ("subselect-alias",    "SELECT *, (SELECT id FROM quote_probe) AS `group` FROM quote_probe;"),
+    };
+
+    foreach (var (label, sql) in probes)
+    {
+        try
+        {
+            var response = await db.QueryAsync(sql, bindings: null);
+            response.EnsureSuccess();
+            Console.WriteLine($"  quoting[{label}] OK");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  quoting[{label}] FAILED — {FirstLine(ex.Message)}");
+        }
+    }
+
+    // Control: the UNQUOTED reserved word `none`. This is EXPECTED to misbehave — `none`
+    // parses as the NONE literal, so `WHERE none = 'x'` is an always-false predicate that
+    // matches nothing even though quote_probe:one has none = 'x'. Reported, not pass/fail:
+    // Task 6 records whether it errors or silently matches zero rows.
+    try
+    {
+        var response = await db.QueryAsync("SELECT * FROM quote_probe WHERE none = 'x';", bindings: null);
+        response.EnsureSuccess();
+        var rowCount = RowCount(response);
+        Console.WriteLine(
+            $"  quoting[control-unquoted-none] CONTROL — statement accepted, matched {rowCount} row(s) " +
+            "(bare `none` parses as the NONE literal → always-false; the quoted probes above are the fix)");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  quoting[control-unquoted-none] CONTROL — errored: {FirstLine(ex.Message)}");
+    }
+
+    Console.WriteLine();
+
+    static string FirstLine(string message)
+    {
+        var newline = message.IndexOfAny(['\r', '\n']);
+        return newline < 0 ? message : message[..newline];
+    }
+
+    static int RowCount(SurrealQueryResponse response)
+    {
+        var result = response.Take(0);
+        return result switch
+        {
+            SurrealListValue { List: var rows } => rows.Count,
+            SurrealNoneValue => 0,
+            _ => 1
+        };
+    }
 }
 

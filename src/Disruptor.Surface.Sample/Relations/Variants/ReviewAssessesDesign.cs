@@ -8,4 +8,5 @@ public partial class ReviewAssessesDesign
 {
     [In] public partial ReviewId Source { get; set; }
     [Out] public partial DesignId Target { get; set; }
+    [Property] public partial string? Note { get; set; }
 }
