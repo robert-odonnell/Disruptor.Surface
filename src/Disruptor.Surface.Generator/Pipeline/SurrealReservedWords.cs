@@ -19,8 +19,11 @@ internal static class SurrealReservedWords
         "none", "null", "true", "false",
     };
 
-    /// <summary>The remaining 40 words of <c>RESERVED_KEYWORD</c>: emitted bare they raise
-    /// a loud parse/apply error and are fully rescued by backtick-quoting. CG059 (Warning).</summary>
+    /// <summary>The remaining 40 words of <c>RESERVED_KEYWORD</c>: emitted bare they fail
+    /// <em>loudly</em> (parse/apply error, caught at dev/apply time) rather than corrupting
+    /// silently — hence a warning, not an error. Backtick-quoting rescues them <em>per word</em>,
+    /// not uniformly: statement keywords like <c>select</c> still throw in DML even quoted
+    /// (see <c>docs/live-validation-2026-07-03.md</c> §3, B2.18–B2.20). CG059 (Warning).</summary>
     public static readonly HashSet<string> ReservedKeywords = new(System.StringComparer.Ordinal)
     {
         "after", "all", "alter", "before", "begin", "break", "by", "cancel", "commit",
