@@ -18,15 +18,28 @@ and the CG042–CG056 fail-closed diagnostics family.
    render bare into queries and DDL (`none` parses as the NONE literal). Fix is
    backtick-quoting at the `SurrealFormatter` chokepoint + `SchemaEmitter`, but it
    changes every emitted statement shape — validate against a live substrate first.
+   **Validated live 2026-07-03 against SurrealDB 3.1.4** (see
+   [`docs/live-validation-2026-07-03.md` §3](docs/live-validation-2026-07-03.md)).
+   Outcome is a **hybrid**, not "quote everywhere": backticks *do* rescue soft
+   reserved words (`order`/`group`/`value`) in every emit position, but value literals
+   (`none`/`null`/`true`/`false`) and `select` are **unrescuable** — `SET` fails
+   (`Expected an idiom`) and a bare `DEFINE FIELD `none`` silently poisons all reads of
+   the table (`Failed to get field definitions`). Follow-up PR: quote at the chokepoint +
+   the four emitters *and* add a reserved-word diagnostic rejecting the unrescuable set.
 2. **Variant duplicate-edge id drift** — RESOLVED (2026-07-02) by deterministic edge
    ids: the variant id anchor derives the edge row id from `(source, edge, target)`
    via `RecordId.ForEdge` before dispatch, so the duplicate path updates the same row
    id the session holds and `MarkSaved` stays truthful. A live-substrate smoke of the
-   duplicate path is still worthwhile before a release tag.
+   duplicate path is still worthwhile before a release tag. **Done 2026-07-03** —
+   smoke[4] PASS: both saves derive the same `assesses:…` id and the null re-save writes
+   NONE on the duplicate path ([validation §1](docs/live-validation-2026-07-03.md)).
 3. **NONE-semantics smoke test** — the `Eq(null)`→`IS NONE` compile and the
    version-guarded `UPDATE … WHERE version = $v` shape were verified against SDK
    precedent and pinned tests, but deserve one pass against a live v3 before a
-   release tag.
+   release tag. **Done 2026-07-03** — smoke[1]/[5]/[2] all PASS against SurrealDB
+   3.1.4: `IsNone`/`Eq(null)` match the omitted-field row, the NONE-guarded
+   `string::contains` skips unset rows, and the stale save throws
+   `SurrealVersionConflictException` ([validation §1–2](docs/live-validation-2026-07-03.md)).
 
 ## Still open — design/feature work
 

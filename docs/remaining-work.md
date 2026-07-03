@@ -10,6 +10,12 @@ questions that need an owner decision before someone picks the item up.
 
 ## 1. Live-substrate validation pass (do this first)
 
+> **DONE 2026-07-03** — ran against a live ephemeral SurrealDB **3.1.4** (memory
+> backend, fresh DB). **All 7 shapes PASS** (harness exit 0); full results, the item-2b
+> exception-ordering observation, and the quoting verdict are in
+> [`live-validation-2026-07-03.md`](live-validation-2026-07-03.md). No compile/emit
+> fallout — the pinned tests already encoded the shapes correctly.
+
 Everything in the PR was verified against the SDK's own usage, pinned-SQL tests, and
 the recording-fake harness — but none of it has touched a real SurrealDB v3 from the
 fix environment. Before the next release tag, run the sample harness
@@ -40,6 +46,16 @@ compile/emit, not the test's intent.
   ORDER BY, SET, subselect aliases). Alternative if quoting misbehaves anywhere: a
   generator diagnostic rejecting reserved-word names (smaller, but a word-list to
   maintain). **Owner call needed on which approach** — see Questions below.
+  **Live verdict 2026-07-03 (SurrealDB 3.1.4): do BOTH — it's a hybrid.** Backticks
+  *are* accepted in every emit position for soft reserved words (`order`/`group`/`value`
+  round-trip through DEFINE FIELD/INDEX, CREATE/UPDATE SET, WHERE, ORDER BY, subselect
+  alias), so the chokepoint-quoting fix is viable and should ship. But value literals
+  `none`/`null`/`true`/`false` and the keyword `select` are **unrescuable by quoting**:
+  `SET `none` = …` errors `Expected an idiom`, and a bare `DEFINE FIELD `none`` is
+  accepted yet silently poisons the whole table's reads (`Failed to get field
+  definitions`). So the reserved-word diagnostic is still needed — scoped to exactly
+  that unrescuable set. Full evidence + per-position table:
+  [`live-validation-2026-07-03.md` §3](live-validation-2026-07-03.md).
 - **Duplicate-path smoke for pre-existing data** — see Question 3.
 
 ## 3. Dev-ready backlog (no substrate needed to start)
@@ -67,6 +83,10 @@ In rough value order; details in `Improvements.md`:
 
 1. **Identifier quoting strategy** — quote everything (robust, big diff churn, needs
    live validation) vs. reserved-word diagnostic (fail-closed, needs a word list)?
+   **Now informed (live 2026-07-03):** the answer is neither-alone but *both* — quoting
+   works for the soft-reserved majority, but a small unrescuable value-literal set
+   (`none`/`null`/`true`/`false`/`select`) still needs a diagnostic. See §2 and
+   [`live-validation-2026-07-03.md` §3](live-validation-2026-07-03.md).
 2. **Non-nullable variant payload defaults** — a non-nullable `string` payload left
    at its (null) backing default still omits its binding on the duplicate-update
    path (pre-existing, flagged in the PR discussion). Options: emit a schema
