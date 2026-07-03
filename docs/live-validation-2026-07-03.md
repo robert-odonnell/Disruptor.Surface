@@ -63,6 +63,10 @@ read time. Both paths fail closed with a distinct, catchable exception type.
 
 ### Per-position verdict (verbatim `quoting[label]` lines)
 
+> Note: the "Probe statement" column reproduces each probe's SQL from the harness
+> source (`Program.cs`, `ProbeIdentifierQuoting`); the harness prints only the label and
+> verdict. Only the "Observed" column is printed output.
+
 | Emit position | Probe statement (backtick-quoted) | Observed |
 | --- | --- | --- |
 | `define-table` | `DEFINE TABLE … quote_probe SCHEMAFULL` | **OK** |
@@ -83,34 +87,44 @@ WHERE none = 'x'`) was expected by the harness comment to be *accepted and match
 (bare `none` parses as the NONE literal → always-false). Instead it **errored** —
 because it ran against `quote_probe`, whose `DEFINE FIELD `none`` had already poisoned
 all reads of that table (see below). On a *clean* table the predicted always-false
-behavior does hold (verified directly — see §3.1).
+behavior does hold (verified directly — Appendix B, B3.6).
 
 ### 3.1 Isolation — what actually failed, and why
 
 The harness runs all probes against one `quote_probe` table that has **both** an `order`
 column and a `none` column. That conflates two independent effects. Direct `surreal sql`
-isolation runs against fresh tables (each with a single column) untangle them:
+isolation sessions against fresh tables (each with a single column) untangle them; the
+raw transcript — every statement and its actual response, from a fresh ephemeral
+in-memory server — is **Appendix B** below, and every claim here cites its lines:
 
 - **Backtick quoting is accepted in *every* emit position for "soft" reserved words.**
   `` `order` ``, `` `group` ``, and `` `value` `` each round-trip cleanly through
-  DEFINE FIELD, DEFINE INDEX, CREATE … SET, WHERE, ORDER BY, and subselect alias on a
-  clean table — rows come back. The `create-set`/`where-orderby`/`subselect-alias`
-  FAILEDs above are **not** a rejection of the `order`/`group` backticks.
+  DEFINE FIELD, DEFINE INDEX, CREATE … SET, WHERE, ORDER BY, UPDATE … SET, and
+  subselect alias on a clean table — rows come back (Appendix B: B1.1–B1.7 for
+  `order`, B1.8–B1.13 for `group`, B1.14–B1.19 for `value`; the subselect alias
+  `AS `group`` is B1.7). The `create-set`/`where-orderby`/`subselect-alias` FAILEDs
+  above are **not** a rejection of the `order`/`group` backticks.
 - **The failures are caused by the `none` column.** `none`, `null`, `true`, `false`
   (SurrealQL *value literals*) and `select` (a statement keyword) cannot be rescued by
   backticks in DML:
-  - `CREATE … SET `none` = 'x'` → `Expected an idiom` (the quoted name still parses as
-    the value literal, which is not a valid assignment target);
-  - and, more dangerously, **`DEFINE FIELD `none` …` is *accepted* at define time but
-    silently poisons the table** — every subsequent `SELECT` against it errors with
-    `Failed to get field definitions`. That is why `where-orderby`, `subselect-alias`,
-    and the control (all SELECTs against `quote_probe`) failed even though `order`/`group`
-    themselves quote fine.
+  - `CREATE … SET `none` = 'x'` → `Expected an idiom` even though the name is
+    backtick-quoted (B2.3; same failure for `null`/`true`/`false` at B2.7/B2.11/B2.15,
+    and a syntax error for `select` at B2.19);
+  - and, more dangerously, **`DEFINE FIELD `none` …` is *accepted* at define time
+    (B2.2) but silently poisons the table** — even a plain `SELECT * FROM …` with no
+    WHERE clause then errors with `Failed to get field definitions` (B2.4; same for
+    the other four at B2.8/B2.12/B2.16/B2.20). That is why `where-orderby`,
+    `subselect-alias`, and the control (all SELECTs against `quote_probe`) failed even
+    though `order`/`group` themselves quote fine — B3.1–B3.5 reproduce the harness's
+    exact mixed-table shape: the two DEFINEs succeed (B3.2–B3.3), the combined
+    `SET `order` = 'a', `none` = 'x'` fails `Expected an idiom` (B3.4), and a
+    `WHERE `order``-only SELECT against that table fails
+    `Failed to get field definitions` (B3.5) purely because the `none` field exists.
 - **The underlying `none` silent-bug (Improvements.md item 1) is confirmed.** On a clean
-  table with no `none` column, `SELECT … WHERE none = 'a'` returns `[]` (matches 0 rows,
-  always-false), while `SELECT … WHERE `order` = 'a'` returns the row. So bare `none`
-  really is an always-false predicate — the exact hazard the quoting work exists to
-  remove.
+  table with no `none` column, `SELECT * FROM iso_order WHERE none = 'x'` is accepted
+  and returns `[]` — matches 0 rows, always-false (B3.6) — while the backtick-quoted
+  `WHERE `order` = 'b'` returns the row (B3.7). So bare `none` really is an
+  always-false predicate — the exact hazard the quoting work exists to remove.
 
 ### Recommendation
 
@@ -136,7 +150,7 @@ Quoting alone would give a false sense of safety for `none`-family columns (sche
 applies, reads then break at runtime); a diagnostic alone would needlessly reject
 `order`/`group`/`value`, which quoting handles perfectly. Do both.
 
-## Appendix — raw harness smoke/probe output
+## Appendix A — raw harness smoke/probe output
 
 ```
 --- Release smoke (remaining-work.md §1 live shapes) ---
@@ -160,4 +174,126 @@ applies, reads then break at runtime); a diagnostic alone would needlessly rejec
   quoting[update-set] FAILED — A user generated conversion error occured: Conversion("Expected an idiom")
   quoting[subselect-alias] FAILED — Failed to get field definitions
   quoting[control-unquoted-none] CONTROL — errored: Failed to get field definitions
+```
+
+## Appendix B — raw CLI isolation transcript
+
+Captured 2026-07-03 against a **fresh** ephemeral in-memory server (same recipe:
+`surreal start --bind 127.0.0.1:8000 --default-namespace project-brain
+--default-database workspace --username root --password secret`, no path arg; killed
+after the run). Three sessions, each a script piped to
+`surreal sql --endpoint http://127.0.0.1:8000 --username root --password secret
+--namespace project-brain --database workspace --hide-welcome`. The CLI prints one
+response per statement, in statement order; each `Bn.m` entry below pairs a statement
+with its actual response by that order. Statements and responses are verbatim.
+
+### Session B1 — soft reserved words on clean single-column tables
+
+```
+B1.1   > DEFINE TABLE IF NOT EXISTS iso_order SCHEMAFULL;
+       [NONE]
+B1.2   > DEFINE FIELD IF NOT EXISTS `order` ON iso_order TYPE string;
+       [NONE]
+B1.3   > DEFINE INDEX IF NOT EXISTS idx_iso_order ON TABLE iso_order COLUMNS `order`;
+       [NONE]
+B1.4   > CREATE iso_order:one SET `order` = 'a';
+       [[{ id: iso_order:one, order: 'a' }]]
+B1.5   > SELECT * FROM iso_order WHERE `order` = 'a' ORDER BY `order` ASC;
+       [[{ id: iso_order:one, order: 'a' }]]
+B1.6   > UPDATE iso_order:one SET `order` = 'b';
+       [[{ id: iso_order:one, order: 'b' }]]
+B1.7   > SELECT *, (SELECT id FROM iso_order) AS `group` FROM iso_order;
+       [[{ group: [{ id: iso_order:one }], id: iso_order:one, order: 'b' }]]
+B1.8   > DEFINE TABLE IF NOT EXISTS iso_group SCHEMAFULL;
+       [NONE]
+B1.9   > DEFINE FIELD IF NOT EXISTS `group` ON iso_group TYPE string;
+       [NONE]
+B1.10  > DEFINE INDEX IF NOT EXISTS idx_iso_group ON TABLE iso_group COLUMNS `group`;
+       [NONE]
+B1.11  > CREATE iso_group:one SET `group` = 'a';
+       [[{ group: 'a', id: iso_group:one }]]
+B1.12  > SELECT * FROM iso_group WHERE `group` = 'a' ORDER BY `group` ASC;
+       [[{ group: 'a', id: iso_group:one }]]
+B1.13  > UPDATE iso_group:one SET `group` = 'b';
+       [[{ group: 'b', id: iso_group:one }]]
+B1.14  > DEFINE TABLE IF NOT EXISTS iso_value SCHEMAFULL;
+       [NONE]
+B1.15  > DEFINE FIELD IF NOT EXISTS `value` ON iso_value TYPE string;
+       [NONE]
+B1.16  > DEFINE INDEX IF NOT EXISTS idx_iso_value ON TABLE iso_value COLUMNS `value`;
+       [NONE]
+B1.17  > CREATE iso_value:one SET `value` = 'a';
+       [[{ id: iso_value:one, value: 'a' }]]
+B1.18  > SELECT * FROM iso_value WHERE `value` = 'a' ORDER BY `value` ASC;
+       [[{ id: iso_value:one, value: 'a' }]]
+B1.19  > UPDATE iso_value:one SET `value` = 'b';
+       [[{ id: iso_value:one, value: 'b' }]]
+```
+
+### Session B2 — value literals + `select`, each on its own fresh table
+
+```
+B2.1   > DEFINE TABLE IF NOT EXISTS bad_none SCHEMAFULL;
+       [NONE]
+B2.2   > DEFINE FIELD IF NOT EXISTS `none` ON bad_none TYPE option<string>;
+       [NONE]
+B2.3   > CREATE bad_none:one SET `none` = 'x';
+       ['A user generated conversion error occured: Conversion("Expected an idiom")']
+B2.4   > SELECT * FROM bad_none;
+       ['Failed to get field definitions']
+B2.5   > DEFINE TABLE IF NOT EXISTS bad_null SCHEMAFULL;
+       [NONE]
+B2.6   > DEFINE FIELD IF NOT EXISTS `null` ON bad_null TYPE string;
+       [NONE]
+B2.7   > CREATE bad_null:one SET `null` = 'x';
+       ['A user generated conversion error occured: Conversion("Expected an idiom")']
+B2.8   > SELECT * FROM bad_null;
+       ['Failed to get field definitions']
+B2.9   > DEFINE TABLE IF NOT EXISTS bad_true SCHEMAFULL;
+       [NONE]
+B2.10  > DEFINE FIELD IF NOT EXISTS `true` ON bad_true TYPE string;
+       [NONE]
+B2.11  > CREATE bad_true:one SET `true` = 'x';
+       ['A user generated conversion error occured: Conversion("Expected an idiom")']
+B2.12  > SELECT * FROM bad_true;
+       ['Failed to get field definitions']
+B2.13  > DEFINE TABLE IF NOT EXISTS bad_false SCHEMAFULL;
+       [NONE]
+B2.14  > DEFINE FIELD IF NOT EXISTS `false` ON bad_false TYPE string;
+       [NONE]
+B2.15  > CREATE bad_false:one SET `false` = 'x';
+       ['A user generated conversion error occured: Conversion("Expected an idiom")']
+B2.16  > SELECT * FROM bad_false;
+       ['Failed to get field definitions']
+B2.17  > DEFINE TABLE IF NOT EXISTS bad_select SCHEMAFULL;
+       [NONE]
+B2.18  > DEFINE FIELD IF NOT EXISTS `select` ON bad_select TYPE string;
+       [NONE]
+B2.19  > CREATE bad_select:one SET `select` = 'x';
+       ['A user generated conversion error occured: Conversion("SyntaxError { diagnostic: Diagnostic { kind: Span { kind: Error, span: Span { offset: 6, len: 0 }, label: None }, next: Some(Diagnostic { kind: Cause(\\"Unexpected end of file, expected an expression\\"), next: None }) } }")']
+B2.20  > SELECT * FROM bad_select;
+       ['Failed to get field definitions']
+```
+
+### Session B3 — harness-confound reproduction + bare-`none` control
+
+`mix_probe` mirrors the harness's `quote_probe` (both an `order` and a `none` column);
+B3.6–B3.7 run against the clean `iso_order` table from session B1 (whose row holds
+`order = 'b'` after B1.6).
+
+```
+B3.1   > DEFINE TABLE IF NOT EXISTS mix_probe SCHEMAFULL;
+       [NONE]
+B3.2   > DEFINE FIELD IF NOT EXISTS `order` ON mix_probe TYPE string;
+       [NONE]
+B3.3   > DEFINE FIELD IF NOT EXISTS `none` ON mix_probe TYPE option<string>;
+       [NONE]
+B3.4   > CREATE mix_probe:one SET `order` = 'a', `none` = 'x';
+       ['A user generated conversion error occured: Conversion("Expected an idiom")']
+B3.5   > SELECT * FROM mix_probe WHERE `order` = 'a';
+       ['Failed to get field definitions']
+B3.6   > SELECT * FROM iso_order WHERE none = 'x';
+       [[]]
+B3.7   > SELECT * FROM iso_order WHERE `order` = 'b';
+       [[{ id: iso_order:one, order: 'b' }]]
 ```
