@@ -1498,11 +1498,13 @@ public sealed class EmissionShapeTests
         // Deterministic edge ids (2026-07-02): the lazy mint goes through __MintId,
         // which derives the id from (in, edge, out) via RecordId.ForEdge when both
         // endpoints are resolvable — so the id the session holds matches the row the
-        // UNIQUE(in,out) duplicate path updates. Random New() remains only as the
-        // unset-endpoint fallback (the save path still fails before dispatch then).
+        // UNIQUE(in,out) duplicate path updates. Unset endpoints throw instead of a
+        // random mint — endpoints must be set before Id is read.
         Assert.Contains("_id ??= __MintId();", src);
         Assert.Contains("global::Disruptor.Surface.Runtime.RecordId.ForEdge(\"restricts\", __inId, __outId).Value", src);
-        Assert.Contains(": global::M.RestrictsId.New();", src);
+        Assert.Contains(": throw new global::System.InvalidOperationException(", src);
+        Assert.Contains("Cannot derive the edge id for 'EpicRestriction'", src);
+        Assert.DoesNotContain("RestrictsId.New()", src);
         // Entity-typed endpoints try-resolve via the cached id backing field, falling
         // back to the entity ref's Id — never throwing (unset endpoints yield null).
         Assert.Contains("var __in = _sourceId ?? (_source is { } __v_source ? ((global::Disruptor.Surface.Runtime.IEntity)__v_source).Id : (global::Disruptor.Surface.Runtime.RecordId?)null);", src);

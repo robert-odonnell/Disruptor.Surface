@@ -346,11 +346,9 @@ internal static class RelationVariantEmitter
     /// emitted SaveAsync body runs, so a SaveAsync-local derive would arrive too late.
     /// </para>
     /// <para>
-    /// Precedence: a hydrated or user-assigned id wins (<c>??=</c> only mints when
-    /// <c>_id</c> is null). Endpoints that are unset (or nullable-and-null) at read time
-    /// are never derived from — <c>__MintId</c> falls back to a random Ulid mint, and
-    /// the save path's existing endpoint validation still fails before dispatch, so the
-    /// fallback id never reaches the substrate on that path.
+    /// Precedence: a hydrated id wins (<c>??=</c> only mints when <c>_id</c> is null —
+    /// Hydrate writes <c>_id</c> directly); endpoints that are unset at first read throw
+    /// instead of deriving, so no random id can ever be recorded by MarkSaved.
     /// </para>
     /// </summary>
     private static void EmitIdAnchor(
@@ -368,7 +366,7 @@ internal static class RelationVariantEmitter
             using (writer.Indent())
             {
                 writer.Line($"? new {idTypeFqn}(global::Disruptor.Surface.Runtime.RecordId.ForEdge(\"{edgeName}\", __inId, __outId).Value)");
-                writer.Line($": {idTypeFqn}.New();");
+                writer.Line($": throw new global::System.InvalidOperationException(\"Cannot derive the edge id for '{variant.Name}': endpoints '{variant.In!.Name}' and '{variant.Out!.Name}' must both be set before Id is read — edge ids are canonical, derived from (in, edge, out).\");");
             }
         }
 
@@ -402,8 +400,8 @@ internal static class RelationVariantEmitter
     /// <summary>
     /// Renders a null-safe <c>RecordId?</c> expression that resolves an endpoint's
     /// current value WITHOUT throwing — the id anchor's <c>__MintId</c> consumes it to
-    /// decide between the deterministic <c>ForEdge</c> derive and the random fallback.
-    /// Shapes mirror <see cref="EmitEndpointIdResolution"/> minus the throw:
+    /// decide between the deterministic <c>ForEdge</c> derive and throwing when an
+    /// endpoint isn't yet resolvable. Shapes mirror <see cref="EmitEndpointIdResolution"/> minus the throw:
     /// entity-typed reads the cached id (falling back to the entity ref's Id); typed-id
     /// converts the struct when its Value is populated (default-unset structs and null
     /// nullables yield null); union endpoints collapse via <c>RecordId.From</c>.

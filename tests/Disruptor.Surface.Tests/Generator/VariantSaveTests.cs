@@ -102,10 +102,25 @@ public sealed class VariantSaveTests
         // Deterministic derive from the (in, edge, out) triple via RecordId.ForEdge.
         Assert.Contains("global::Disruptor.Surface.Runtime.RecordId.ForEdge(\"touches\", __inId, __outId).Value", src);
         // Typed-id endpoints only derive from a populated struct — a default-unset or
-        // nullable-null endpoint yields null and falls back to the random mint (the
-        // save path still fails before dispatch for unset endpoints).
+        // nullable-null endpoint yields null and throws — endpoints must be set before
+        // Id is read.
         Assert.Contains("var __in = _source is { Value: not null } __v_source ? (global::Disruptor.Surface.Runtime.RecordId?)(global::Disruptor.Surface.Runtime.RecordId)__v_source : null;", src);
-        Assert.Contains(": global::M.TouchesId.New();", src);
+        Assert.Contains(": throw new global::System.InvalidOperationException(", src);
+        Assert.Contains("Cannot derive the edge id for 'CrossLink'", src);
+        Assert.DoesNotContain("TouchesId.New()", src);   // src is the variant's .g.cs only — safe scope
+    }
+
+    [Fact]
+    public void ReadingVariantId_BeforeEndpointsAreSet_Throws()
+    {
+        var asm = GeneratorHarness.CompileAndLoad(CrossAggregateModel);
+        var linkT = asm.GetType("M.CrossLink", throwOnError: true)!;
+        var variant = (IEntity)Activator.CreateInstance(linkT)!;
+
+        var ex = Assert.Throws<InvalidOperationException>(() => variant.Id);
+        Assert.Contains("Cannot derive the edge id for 'CrossLink'", ex.Message);
+        Assert.Contains("Source", ex.Message);
+        Assert.Contains("Target", ex.Message);
     }
 
     [Fact]
@@ -205,8 +220,8 @@ public sealed class VariantSaveTests
     public async Task E2E_NullableEndpoint_NullAtSave_StillFailsBeforeDispatch()
     {
         // Nullable endpoints left null keep their pre-derive failure behavior: the
-        // derive never runs from a null endpoint (__MintId falls back to a random
-        // mint), and the save path fails before any INSERT RELATION reaches the wire.
+        // derive never runs from a null endpoint (__MintId throws instead), so the
+        // save path fails before any INSERT RELATION reaches the wire.
         var source = """
             using Disruptor.Surface.Annotations;
             namespace M;

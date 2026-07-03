@@ -243,6 +243,26 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     }
 
     /// <summary>
+    /// Reads <paramref name="entity"/>'s id for a close-reason report, swallowing a
+    /// throw from the getter itself. A relation variant's <c>Id</c> derives from its
+    /// endpoints and throws when they aren't both resolvable yet (see the id anchor's
+    /// <c>__MintId</c>) — when THAT is the failure a catch block is reporting, a naive
+    /// second read would throw again and mask the original exception, leaving the
+    /// session never closed. <c>null</c> here means "id unavailable", not "no entity".
+    /// </summary>
+    private static RecordId? TryReadIdForCloseReason(IEntity entity)
+    {
+        try
+        {
+            return entity.Id;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Fail-close entry point for same-assembly query surfaces that mutate a
     /// caller-supplied session (<see cref="SurfaceQuery{T}.ExecuteIntoSessionAsync(SurrealSession, SurrealClient, CancellationToken)"/>):
     /// stamps the truthful close reason — never <see cref="SessionCloseKind.Abandoned"/>,
@@ -881,7 +901,7 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
         {
             // Fail-closed: any dispatch failure marks the session done. The app catches
             // and cancels the txn on its own.
-            Close(new SessionCloseReason(SessionCloseKind.SaveFailed, entity.Id, ex));
+            Close(new SessionCloseReason(SessionCloseKind.SaveFailed, TryReadIdForCloseReason(entity), ex));
             throw;
         }
     }
@@ -957,7 +977,7 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
             // Fail-closed: the batch is one logical Save. Same contract as the
             // single-entity overload, with its own close kind so diagnostics say
             // which write surface died.
-            Close(new SessionCloseReason(SessionCloseKind.BatchSaveFailed, current.Id, ex));
+            Close(new SessionCloseReason(SessionCloseKind.BatchSaveFailed, TryReadIdForCloseReason(current), ex));
             throw;
         }
     }
@@ -1326,7 +1346,7 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
             var kind = ex is CascadeRejectException
                 ? SessionCloseKind.RejectedDelete
                 : SessionCloseKind.DeleteFailed;
-            Close(new SessionCloseReason(kind, entity.Id, ex));
+            Close(new SessionCloseReason(kind, TryReadIdForCloseReason(entity), ex));
             throw;
         }
     }
