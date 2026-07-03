@@ -92,6 +92,12 @@ internal static class ModelValidation
                 args: [string.Join(" and ", collision.ParticipantFullNames.Select(n => $"'{n}'")), collision.CollidingName]);
         }
 
+        // CG058/CG059 — reserved-word collision on any user-controlled name that renders
+        // to a SurrealQL identifier (table, field, inline sub-field, edge, variant
+        // payload field). Independent of the rest of this table's validity — a
+        // reserved-word rename is needed regardless of what else is wrong with the table.
+        ValidateReservedWords(graph, pending);
+
         // CG045 — nested [Table] / [CompositionRoot]. The linker already pulled these
         // out of the graph, so nothing is emitted for them; this explains why. The
         // location was captured at extraction (issue model — already-failing build).
@@ -810,6 +816,69 @@ internal static class ModelValidation
             SkippedTables = skippedTables,
             PartialSuppressedTables = partialSuppressedTables,
         };
+    }
+
+    // CG058/CG059 — reserved-word collision on any user-controlled name that renders to a
+    // SurrealQL identifier. Value literals (none/null/true/false) misparse silently ->
+    // error; the other RESERVED_KEYWORD words fail loudly and are rescuable by future
+    // quoting -> warning. Covers every render point SchemaEmitter/RelationVariantEmitter
+    // turn a user name into: table names, entity fields (via SchemaEmitter.EmitsSchemaField
+    // — reused, not re-derived, so coverage matches emission exactly), inline
+    // element-collection sub-fields, forward-relation edge names, and relation-variant
+    // payload fields.
+    private static void ValidateReservedWords(ModelGraph graph, ImmutableArray<PendingDiagnostic>.Builder pending)
+    {
+        foreach (var table in graph.Tables)
+        {
+            // Table name (pluralized; rarely reserved, checked for completeness).
+            CheckName(pending, SurrealNaming.ToTableName(table.Name),
+                display: table.Name, typeKey: table.FullName, memberName: null);
+
+            foreach (var p in table.Properties.Where(SchemaEmitter.EmitsSchemaField))
+            {
+                CheckName(pending, SurrealNaming.ToFieldName(p.Name),
+                    display: $"{table.Name}.{p.Name}", typeKey: table.FullName, memberName: p.Name);
+
+                foreach (var im in p.InlineMembers)   // array<object> sub-fields (field.*.member)
+                {
+                    CheckName(pending, SurrealNaming.ToFieldName(im.Name),
+                        display: $"{table.Name}.{p.Name}.{im.Name}", typeKey: table.FullName, memberName: p.Name);
+                }
+            }
+        }
+
+        // Edge names — forward relation kinds only (ToEdgeName strips the trailing
+        // "Attribute" suffix; inverse kinds are never named on the wire, they reuse the
+        // paired forward kind's edge table).
+        foreach (var kind in graph.RelationKinds.Where(k => k.Direction == RelationDirection.Forward))
+        {
+            CheckName(pending, SurrealNaming.ToEdgeName(kind.Name),
+                display: kind.Name, typeKey: kind.FullName, memberName: null);
+        }
+
+        // Relation-variant payload fields.
+        foreach (var variant in graph.RelationVariants)
+        {
+            foreach (var p in variant.PayloadProperties)
+            {
+                CheckName(pending, p.FieldName,
+                    display: $"{variant.Name}.{p.Name}", typeKey: variant.FullName, memberName: p.Name);
+            }
+        }
+    }
+
+    private static void CheckName(
+        ImmutableArray<PendingDiagnostic>.Builder pending, string rendered,
+        string display, string typeKey, string? memberName)
+    {
+        if (SurrealReservedWords.ValueLiterals.Contains(rendered))
+        {
+            Add(pending, Diagnostics.ReservedValueLiteralName, args: [display, rendered], typeKey: typeKey, memberName: memberName);
+        }
+        else if (SurrealReservedWords.ReservedKeywords.Contains(rendered))
+        {
+            Add(pending, Diagnostics.ReservedKeywordName, args: [display, rendered], typeKey: typeKey, memberName: memberName);
+        }
     }
 
     /// <summary>
