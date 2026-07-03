@@ -4,7 +4,7 @@ description: SurrealSession is an in-memory snapshot (identity map + edge index 
 type: project
 originSessionId: 1e5d41a3-6a1f-4283-a81a-3bde6363f5b2
 ---
-The session knows nothing about read/write permissions. Domain code mutates freely (property setters, Track, AdoptIfUnbound). Edge writes (`RelateAsync` / `UnrelateAsync`) and entity writes (`SaveAsync` / `DeleteAsync`) dispatch immediately against the user-supplied `SurrealTransaction` — no buffered "dirty batch", no `CommitAsync` on the session.
+The session knows nothing about read/write permissions. Domain code mutates freely (property setters, Track, AdoptIfUnbound). Edge creation (`SaveAsync` against a relation-variant entity), edge deletion (`UnrelateAsync`), and entity writes (`SaveAsync` / `DeleteAsync`) dispatch immediately against the user-supplied `SurrealTransaction` — no buffered "dirty batch", no `CommitAsync` on the session.
 
 **Lifecycle:**
 - App calls `db.BeginTransactionAsync()` to get a `SurrealTransaction`.

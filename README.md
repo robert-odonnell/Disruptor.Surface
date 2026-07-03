@@ -4,7 +4,7 @@ A C# Roslyn source generator that turns `[Table]`-annotated partial classes into
 
 The library is aimed at domain models where aggregates matter. You describe the model with attributes; the generator emits the plumbing needed to load an aggregate into a `SurrealSession`, mutate the resulting C# objects synchronously, and dispatch the changes through a transaction your application owns. The library never opens or commits transactions on your behalf — cross-aggregate atomicity is whatever your code decides.
 
-**Requirements:** .NET 10. **License:** [MIT](LICENSE). **Package status:** not yet published to NuGet — for now, reference the projects directly from a checkout (see [Building](#building)).
+**Requirements:** .NET 10. **License:** [MIT](LICENSE). **Package status:** published to NuGet as `Disruptor.Surface.Runtime` + `Disruptor.Surface.Generator` (`0.1.0-preview.*`, see [quickstart](docs/quickstart.md)); building from a checkout also works (see [Building](#building)).
 
 > **Status: preview.** Functional end-to-end against a live SurrealDB v3, but the public API is still moving. See [`docs/notes.md`](docs/notes.md) for the engineering log and current preview tag. Not production-tested.
 

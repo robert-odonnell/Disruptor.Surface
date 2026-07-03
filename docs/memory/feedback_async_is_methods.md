@@ -1,6 +1,6 @@
 ---
 name: Sync read-side, async dispatch boundary
-description: Entity reads (properties, relation accessors, [Children]) are sync against the in-memory snapshot. Async surface is the dispatch boundary: SaveAsync, DeleteAsync, RelateAsync, UnrelateAsync, FetchAsync, plus Workspace.Load{Root}Async and Workspace.Query.{Table}.{ExecuteAsync,IdsAsync,LoadAsync}. Sync property setters / Track / AdoptIfUnbound stay sync (pure in-memory). Generator code that emits Task-returning property reads is wrong.
+description: Entity reads (properties, relation accessors, [Children]) are sync against the in-memory snapshot. Async surface is the dispatch boundary: SaveAsync, DeleteAsync, UnrelateAsync, FetchAsync, plus Workspace.Load{Root}Async and Workspace.Query.{Table}.{ExecuteAsync,IdsAsync,LoadAsync}. Sync property setters / Track / AdoptIfUnbound stay sync (pure in-memory). Generator code that emits Task-returning property reads is wrong.
 type: feedback
 originSessionId: 1e5d41a3-6a1f-4283-a81a-3bde6363f5b2
 ---
@@ -9,7 +9,7 @@ Inside the entity model every read is a sync property — `[Property]`, `[Refere
 **The async surface is the dispatch boundary** — anything that talks to the substrate:
 - `SurrealSession.SaveAsync(IEntity, SurrealTransaction, ct)` — per-entity Save.
 - `SurrealSession.DeleteAsync(IEntity, SurrealTransaction, ct)` — entity DELETE.
-- `SurrealSession.RelateAsync<TKind>(...)` / `UnrelateAsync<TKind>(...)` — edge writes.
+- `SurrealSession.SaveAsync(new TVariant { Source, Target }, tx)` — edge creation; `UnrelateAsync<TKind>(...)` — edge deletion.
 - `SurrealSession.FetchAsync(query, db|tx, ct)` — partial-merge top-up hydrate.
 - User's `[CompositionRoot]` partial's `Load{Root}Async(db|tx, id, ct)` — initial aggregate hydrate.
 - `Workspace.Query.{Table}(...)` terminals — `ExecuteAsync` / `IdsAsync` / `LoadAsync` / projection's `Select(...).ExecuteAsync`.

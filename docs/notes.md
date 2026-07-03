@@ -176,6 +176,10 @@ The Sample project's classes (`Design`, `Constraint`, `Epic`, `Feature`, `UserSt
 
 Newest first. One or two lines per preview. "Substantive" means architecture / behaviour / new public surface; polish (renames, doc edits, formatting) is omitted.
 
+### unreleased — stale-docs cleanup: streamed-txn/JSON-era comments removed, README package status reconciled (review finding 3) (DONE 2026-07-03)
+
+No code change. Deleted the orphaned streamed-server-side-transaction `<summary>` on `SurrealSession.SaveAsync`; fixed dangling `JsonProjectionRow` crefs (real type is `ValueProjectionRow`) and "real JSON" language in `Query/SurfaceProjection.cs`, `IProjectionRow.cs`, `PropertyExpr.cs`, `IIncludeNode.cs`, `SurfaceQuery.cs` to describe the CBOR/`SurrealValue` path; `README.md`'s package-status line now reflects NuGet publication; `docs/memory/` RelateAsync-as-current references updated to `SaveAsync`(variant)/`UnrelateAsync`.
+
 ### unreleased — SurrealSession.GetAll<T>() — batch entity snapshot for hydration flows (DONE 2026-07-03)
 
 Adds public `IReadOnlyCollection<T> GetAll<T>() where T : class, IEntity` to materialize all tracked entities of a given type, ordered by id (deterministic iteration). Companion to the single-entity `Get<T>(IRecordId)` for batch-mutate patterns and documented hydration-terminal examples. Closes review finding 2 — three doc sites (`quickstart.md`, `api.md`, `HydrationQuery.cs` sample) reference the method as shipped; adding it makes the docs correct with zero edits. **480/480 green** (478 prior + 2 net new).

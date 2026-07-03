@@ -875,25 +875,6 @@ public sealed class SurrealSession(IReferenceRegistry referenceRegistry) : IHydr
     // ──────────────────────────── boundary (async) ───────────────────────────
 
     /// <summary>
-    /// Flushes pending writes through a streamed server-side transaction. Each rendered
-    /// command is dispatched as its own RPC inside the txn (begin → N queries → commit),
-    /// so wire-side batch limits no longer cap commit size. The session closes on return
-    /// regardless of outcome — the one-shot invariant is "load → mutate → commit (or
-    /// fail), then loop."
-    /// <para>
-    /// Concurrency surfaces natively: if another writer's commit lands first and conflicts
-    /// with ours, SurrealDB raises a <see cref="SurrealConflictException"/> at COMMIT
-    /// (or earlier, on a conflicting write). The domain catches and decides whether to
-    /// reload-and-retry. No application-level lease, no CAS-on-sequence — the substrate
-    /// owns concurrency now.
-    /// </para>
-    /// <para>
-    /// Single exception boundary: any exception during commit marks the session closed
-    /// and rethrows. Nothing else in the runtime catches exceptions; everything else
-    /// throws freely and lands here.
-    /// </para>
-    /// </summary>
-    /// <summary>
     /// Per-entity Save: dispatches <paramref name="entity"/> (and its forward dependencies +
     /// new children, transitively) into <paramref name="tx"/>. Whole-entity always — every
     /// dispatched row is a <c>CREATE/UPDATE record:id CONTENT { … }</c>. Dependency-first

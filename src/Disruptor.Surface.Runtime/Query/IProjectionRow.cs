@@ -11,8 +11,8 @@ namespace Disruptor.Surface.Runtime.Query;
 /// <para>
 /// Two implementations live alongside this interface: <see cref="DiscoveryProjectionRow"/>
 /// for the construction-time probe pass that captures which fields the lambda reads
-/// (so the compiler can emit the right SELECT list), and <see cref="JsonProjectionRow"/>
-/// for the per-row materialise pass that reads each value out of the response JSON.
+/// (so the compiler can emit the right SELECT list), and <see cref="ValueProjectionRow"/>
+/// for the per-row materialise pass that reads each value out of the decoded response row.
 /// </para>
 /// </summary>
 public interface IProjectionRow
@@ -21,7 +21,7 @@ public interface IProjectionRow
     /// Read a single column from the row, deserialising into <typeparamref name="T"/>.
     /// During the construction-time discovery pass this records the field name and
     /// returns <c>default(T)!</c>; during a real materialise pass it reads the value
-    /// from the underlying JSON element.
+    /// from the underlying <see cref="Disruptor.Surreal.Values.SurrealObjectValue"/>.
     /// </summary>
     T Read<T>(PropertyExpr<T> property);
 }

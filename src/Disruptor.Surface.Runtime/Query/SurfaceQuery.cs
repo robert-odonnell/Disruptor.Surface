@@ -519,7 +519,7 @@ public sealed class SurfaceQuery<T>
     /// <summary>
     /// Recursively hydrate the included slices on a single row and mark each visited
     /// slice as loaded on the row's owner.
-    /// <see cref="IncludeChildrenNode"/> expands to a JSON array under the child-table
+    /// <see cref="IncludeChildrenNode"/> expands to a value array under the child-table
     /// alias; each element gets a fresh entity instance via the node's own
     /// <see cref="IncludeChildrenNode.Hydrator"/> callback (generator-emitted at codegen
     /// time, captures the right concrete <c>new T()</c> + <c>Hydrate</c>).
