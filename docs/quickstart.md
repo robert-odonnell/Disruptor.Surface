@@ -12,12 +12,12 @@ In a consumer project, reference the runtime package normally and the generator 
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="Disruptor.Surface.Runtime" Version="0.1.0-preview.*" />
-  <PackageReference Include="Disruptor.Surface.Generator" Version="0.1.0-preview.*" PrivateAssets="all" />
+  <PackageReference Include="Disruptor.Surface.Runtime" Version="1.0.0" />
+  <PackageReference Include="Disruptor.Surface.Generator" Version="1.0.0" PrivateAssets="all" />
 </ItemGroup>
 ```
 
-(See [`notes.md`](notes.md) for the latest preview tag; the public API is still moving.)
+(See [`notes.md`](notes.md) for the engineering log; `1.0` is an API-stability line, with post-1.0 additive work tracked in [`../Improvements.md`](../Improvements.md).)
 
 When working against this repository directly, use project references like the sample project:
 

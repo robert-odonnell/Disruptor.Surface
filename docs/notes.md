@@ -178,6 +178,10 @@ Newest first. One or two lines per preview. "Substantive" means architecture / b
 
 **preview.60 upgrade note:** edge rows written before preview.60 carry random Ulid ids (pre-deterministic-id era). Replaying a save against such a row updates the *old* row via `UNIQUE(in, out)` while the session derives the hash id — wipe/reseed dev databases when upgrading (preview-status policy; `remaining-work.md` §4 Q3).
 
+### 1.0.0 — first stable release (DONE 2026-07-03)
+
+Promotes the preview.61 surface to a stable `1.0.0` — **no code change from preview.61**; the version bump reflects that the library now builds on the stable `Disruptor.Surreal` 1.0.0 transport (no preview dependency) and that the core surface — aggregate load/save, snapshot-isolated sessions owned by the caller's transaction, typed ids, relation variants + union endpoints + shared-shape lift, entity indexes, audit/version markers, the query layer, and the `CG001`–`CG059` fail-closed diagnostics — is live-validated against SurrealDB v3.1.4 (7/7 smoke, `live-validation-2026-07-03.md`). `1.0` is an **API-stability line, not feature-completion**: post-1.0 additive work (live queries, `[Assert]`/PERMISSIONS, migration diff, the optional identifier-quoting layer, streaming/pagination, ecosystem packages) stays in `Improvements.md`.
+
 ### preview.61 — dependency: Disruptor.Surreal 0.1.0-preview.11 → 1.0.0 (DONE 2026-07-03)
 
 Bumped the transport SDK (`Disruptor.Surface.Runtime.csproj`) to the first stable
