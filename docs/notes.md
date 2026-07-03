@@ -178,11 +178,18 @@ Newest first. One or two lines per preview. "Substantive" means architecture / b
 
 **preview.60 upgrade note:** edge rows written before preview.60 carry random Ulid ids (pre-deterministic-id era). Replaying a save against such a row updates the *old* row via `UNIQUE(in, out)` while the session derives the hash id — wipe/reseed dev databases when upgrading (preview-status policy; `remaining-work.md` §4 Q3).
 
-### unreleased — CG058/CG059 reserved-word diagnostics (identifier-quoting reject-only fix) (DONE 2026-07-03)
+### preview.61 — dependency: Disruptor.Surreal 0.1.0-preview.11 → 1.0.0 (DONE 2026-07-03)
+
+Bumped the transport SDK (`Disruptor.Surface.Runtime.csproj`) to the first stable
+`Disruptor.Surreal` release. Pure version bump — 1.0.0 stabilises the preview API surface
+with no breaking changes (clean build, 484/484), so a stable `Disruptor.Surface` no longer
+depends on a preview transport.
+
+### preview.61 — CG058/CG059 reserved-word diagnostics (identifier-quoting reject-only fix) (DONE 2026-07-03)
 
 No version bump. Follow-up to the identifier-quoting verdict recorded in the preview.60 live-validation entry below: quoting rescues soft reserved words but not the four SurrealQL value literals, and quoting itself stays deferred — so this closes the gap with a reject-only diagnostic instead. Two-tier split of SurrealDB's `RESERVED_KEYWORD` set (`surrealdb/crates/core/src/syn/lexer/keywords.rs` @ tag `v3.1.4`, captured in the new `Pipeline/SurrealReservedWords.cs`): the four value literals (`none`/`null`/`true`/`false`) misparse *silently* — `parse_prime_expr` intercepts them before the identifier fallback, so a bare occurrence in a query becomes the literal, not a field reference, and no backtick-quoting rescues it — these are **CG058 (error)**. The other 40 words fail *loudly* (parse/apply error, caught at dev/apply time rather than silent corruption) — **CG059 (warning)**; the tiers split on loud-vs-silent, *not* on quoting-rescue (which is not uniform across the warning tier — `value` quotes cleanly but statement-keywords like `select` still throw even backtick-quoted, B2.18–B2.20). `ModelValidation.ValidateReservedWords` checks every render point that turns a user name into a SurrealQL identifier: table names, entity fields (reusing the new `SchemaEmitter.EmitsSchemaField` predicate — extracted verbatim from `EmitTableFields`'s inline filter so the check can't drift from what the emitter actually renders — instead of re-deriving the "does this render a column" test), inline element-collection sub-fields, forward-relation edge names, and relation-variant payload fields. Correction to a prior assumption: `order`/`group`/`type`/`count` are **not** in `RESERVED_KEYWORD` and must not fire — pinned by a dedicated negative test. **484/484 green** (480 prior + 4 net new).
 
-### unreleased — docs: correct reserved-word evidence in trackers (DONE 2026-07-03)
+### preview.61 — docs: correct reserved-word evidence in trackers (DONE 2026-07-03)
 
 No code change. Corrects `live-validation-2026-07-03.md` §3, `remaining-work.md` §2/§4-Q1,
 and `Improvements.md` item 1, whose "hybrid" recommendation and "`order`/`group`/`value` are
