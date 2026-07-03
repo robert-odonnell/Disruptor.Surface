@@ -14,18 +14,28 @@ and the CG042–CG056 fail-closed diagnostics family.
 
 ## Still open — needs a live SurrealDB to validate
 
-1. **SurrealQL identifier quoting** — properties named `Order`, `Group`, `None`, etc.
-   render bare into queries and DDL (`none` parses as the NONE literal). Fix is
-   backtick-quoting at the `SurrealFormatter` chokepoint + `SchemaEmitter`, but it
-   changes every emitted statement shape — validate against a live substrate first.
-   **Validated live 2026-07-03 against SurrealDB 3.1.4** (see
+1. **SurrealQL identifier quoting** — properties named `None`, `Value`, `Select`, etc.
+   render bare into queries and DDL (`none` parses as the NONE literal). A candidate fix
+   would be backtick-quoting at the `SurrealFormatter` chokepoint + `SchemaEmitter`, but
+   it would change every emitted statement shape — validated against a live substrate
+   first (2026-07-03 against SurrealDB 3.1.4; see
    [`docs/live-validation-2026-07-03.md` §3](docs/live-validation-2026-07-03.md)).
-   Outcome is a **hybrid**, not "quote everywhere": backticks *do* rescue soft
-   reserved words (`order`/`group`/`value`) in every emit position, but value literals
-   (`none`/`null`/`true`/`false`) and `select` are **unrescuable** — `SET` fails
-   (`Expected an idiom`) and a bare `DEFINE FIELD `none`` silently poisons all reads of
-   the table (`Failed to get field definitions`). Follow-up PR: quote at the chokepoint +
-   the four emitters *and* add a reserved-word diagnostic rejecting the unrescuable set.
+   **Status: reject-only diagnostic shipped (CG058/CG059); backtick-quoting
+   deferred/optional.** The live probe's original "hybrid" read ("`order`/`group`/
+   `value` are all soft-reserved, quote them") over-read the evidence — SurrealDB's own
+   parser source (`crates/core/src/syn/lexer/keywords.rs` @ tag `v3.1.4`, the 44-word
+   `RESERVED_KEYWORD` set — the exact set its `EscapeIdent` serializer backtick-quotes)
+   shows `order`/`group`/`type`/`count`/`limit`/`start` are **not** reserved; only
+   `value` (of that trio) is. **CG058 (error)** rejects the 4 unrescuable value
+   literals (`none`/`null`/`true`/`false`) at generate time — these misparse silently
+   and no quoting can rescue them. **CG059 (warning)** flags the other 40
+   `RESERVED_KEYWORD` words (incl. `value`/`select`) — these fail loudly (`Expected an
+   idiom` / poisoned reads: `Failed to get field definitions`), in principle rescuable
+   by quoting, but a warning is the shipped treatment. Backtick-quoting remains
+   deferred and optional: if it's picked up later it must escape
+   iff-in-`RESERVED_KEYWORD` (mirroring SurrealDB's `EscapeIdent`), never ship without
+   CG058 already in place, and be justified first by a still-missing live test of a
+   bare (unquoted) soft-reserved word actually failing.
 2. **Variant duplicate-edge id drift** — RESOLVED (2026-07-02) by deterministic edge
    ids: the variant id anchor derives the edge row id from `(source, edge, target)`
    via `RecordId.ForEdge` before dispatch, so the duplicate path updates the same row

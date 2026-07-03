@@ -61,6 +61,26 @@ read time. Both paths fail closed with a distinct, catchable exception type.
 
 ## 3. Identifier-quoting probe (§2)
 
+> **Correction (2026-07-03, post-parser-source review).** The classification and
+> recommendation below were revised after checking SurrealDB's own parser source. The
+> authoritative reserved-word set is the 44-word `RESERVED_KEYWORD` `phf::Set` in
+> `crates/core/src/syn/lexer/keywords.rs` @ tag `v3.1.4` — the exact set SurrealDB's own
+> `EscapeIdent` serializer backtick-quotes. `order`, `group`, `type`, `count`, `limit`,
+> `start`, `set`, `content`, `fetch`, `split`, and `default` are **not** in that set. The
+> probes below only ever exercised *backtick-quoted* forms of `order`/`group`/`value`
+> (Appendix B, session B1); no unquoted `order`/`group` control was run. Showing that the
+> quoted forms *work* does not show the bare forms *need* quoting — that inference was
+> over-broad, and the parser source disproves it for everything except `value`. Correct
+> two-tier split (now shipped as **CG058**/**CG059** — see `docs/notes.md`):
+> **hard/error** = the 4 value literals `none`/`null`/`true`/`false` (silent misparse —
+> SurrealQL reads them as the literal, not an identifier, so no quoting rescues them);
+> **soft/warning** = the other 40 `RESERVED_KEYWORD` words, including `value`, `select`,
+> `where`, `table` (loud failure — parse/apply error, in principle rescuable by quoting,
+> which is why they're a warning and not an error). The transcript and per-position
+> observations below are unchanged and remain valid raw evidence; only the "order/group/
+> value are all soft-reserved and need quoting" gloss was wrong — of that assumed trio,
+> only `value` actually is.
+
 ### Per-position verdict (verbatim `quoting[label]` lines)
 
 > Note: the "Probe statement" column reproduces each probe's SQL from the harness
@@ -104,6 +124,12 @@ in-memory server — is **Appendix B** below, and every claim here cites its lin
   `order`, B1.8–B1.13 for `group`, B1.14–B1.19 for `value`; the subselect alias
   `AS `group`` is B1.7). The `create-set`/`where-orderby`/`subselect-alias` FAILEDs
   above are **not** a rejection of the `order`/`group` backticks.
+  > **Correction:** only `value` is actually in SurrealDB's `RESERVED_KEYWORD` set
+  > (v3.1.4, `keywords.rs`); `order`/`group` are not reserved at all. The round-trip
+  > above is a real observation — backtick-quoting is harmless — but it does not mean
+  > `order`/`group` needed quoting: no bare/unquoted control for `order`/`group` was
+  > ever run (only the `none` control, B3.6), so this evidence never actually tested
+  > whether the bare forms fail.
 - **The failures are caused by the `none` column.** `none`, `null`, `true`, `false`
   (SurrealQL *value literals*) and `select` (a statement keyword) cannot be rescued by
   backticks in DML:
@@ -128,6 +154,32 @@ in-memory server — is **Appendix B** below, and every claim here cites its lin
 
 ### Recommendation
 
+**Superseded 2026-07-03 (post-parser-source review).** The original call below inferred a
+hybrid (quote everywhere reserved-adjacent *and* add a diagnostic) from the probe
+evidence; the correction at the top of §3 shows that inference over-read what "backticks
+are accepted" proves. Current, shipped decision:
+
+- **Reject-only, two-tier, shipped.** **CG058 (error)** on the 4 value literals
+  (`none`/`null`/`true`/`false`) — these misparse *silently* and no quoting can rescue
+  them. **CG059 (warning)** on the other 40 words in SurrealDB's `RESERVED_KEYWORD` set
+  (`keywords.rs` @ v3.1.4), including `value` and `select` — these fail *loudly* (a parse
+  or apply error), which quoting *could* in principle rescue, but a warning is the shipped
+  treatment: the generator flags them, the author renames or accepts the risk, no wire
+  behavior changes. `order`/`group`/`type`/`count`/`limit`/`start` etc. are correctly
+  *not* flagged — they are not in `RESERVED_KEYWORD`. See `docs/notes.md` (unreleased
+  CG058/CG059 entry) for the implementation.
+- **Backtick-quoting is deferred and optional**, not a follow-up PR already scoped to
+  ship. If it's ever picked up, it must: (a) escape iff-in-`RESERVED_KEYWORD`, mirroring
+  SurrealDB's own `EscapeIdent` serializer; (b) never ship without CG058 already in
+  place — quoting a value-literal name would turn today's loud failure into a
+  silently-accepted wrong query, which is strictly worse; (c) be justified first by a
+  live test of a *bare* (unquoted) soft-reserved word actually failing in the position
+  it's meant to fix — every probe in this report only ever ran backtick-quoted forms of
+  `order`/`group`/`value`, so it never established that the bare forms break.
+
+<details>
+<summary>Original 2026-07-03 recommendation (superseded by the correction above, kept for history)</summary>
+
 The pure "backticks accepted everywhere → just quote at the chokepoint" outcome did **not**
 hold, and the pure "any rejection → abandon quoting for a diagnostic" outcome is too
 blunt. The evidence points to a **hybrid**, and the owner call (remaining-work §4 Q1)
@@ -149,6 +201,11 @@ should be made on that basis:
 Quoting alone would give a false sense of safety for `none`-family columns (schema
 applies, reads then break at runtime); a diagnostic alone would needlessly reject
 `order`/`group`/`value`, which quoting handles perfectly. Do both.
+
+*(This "order`/`group`/`value` all soft-reserved, quote them" framing is exactly the
+over-broad inference the parser source corrected — `order`/`group` were never reserved.)*
+
+</details>
 
 ## Appendix A — raw harness smoke/probe output
 

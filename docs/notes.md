@@ -182,6 +182,28 @@ Newest first. One or two lines per preview. "Substantive" means architecture / b
 
 No version bump. Follow-up to the identifier-quoting verdict recorded in the preview.60 live-validation entry below: quoting rescues soft reserved words but not the four SurrealQL value literals, and quoting itself stays deferred — so this closes the gap with a reject-only diagnostic instead. Two-tier split of SurrealDB's `RESERVED_KEYWORD` set (`surrealdb/crates/core/src/syn/lexer/keywords.rs` @ tag `v3.1.4`, captured in the new `Pipeline/SurrealReservedWords.cs`): the four value literals (`none`/`null`/`true`/`false`) misparse *silently* — `parse_prime_expr` intercepts them before the identifier fallback, so a bare occurrence in a query becomes the literal, not a field reference, and no backtick-quoting rescues it — these are **CG058 (error)**. The other 40 words fail *loudly* (parse/apply error) and are rescuable by future quoting — **CG059 (warning)**. `ModelValidation.ValidateReservedWords` checks every render point that turns a user name into a SurrealQL identifier: table names, entity fields (reusing the new `SchemaEmitter.EmitsSchemaField` predicate — extracted verbatim from `EmitTableFields`'s inline filter so the check can't drift from what the emitter actually renders — instead of re-deriving the "does this render a column" test), inline element-collection sub-fields, forward-relation edge names, and relation-variant payload fields. Correction to a prior assumption: `order`/`group`/`type`/`count` are **not** in `RESERVED_KEYWORD` and must not fire — pinned by a dedicated negative test. **484/484 green** (480 prior + 4 net new).
 
+### unreleased — docs: correct reserved-word evidence in trackers (DONE 2026-07-03)
+
+No code change. Corrects `live-validation-2026-07-03.md` §3, `remaining-work.md` §2/§4-Q1,
+and `Improvements.md` item 1, whose "hybrid" recommendation and "`order`/`group`/`value` are
+soft reserved words rescued by backticks" classification predated the CG058/CG059
+parser-source grounding above and over-read the probe: showing backtick-quoted `order`/
+`group` round-trip cleanly never showed the *bare* forms need quoting (no unquoted
+`order`/`group` control was ever run). The 44-word `RESERVED_KEYWORD` set (`keywords.rs`
+@ v3.1.4) proves `order`/`group`/`type`/`count`/`limit`/`start`/`set`/`content`/`fetch`/
+`split`/`default` are not reserved at all; only `value` (of the assumed trio) actually is.
+Reclassified as two-tier across all three docs: 4 error-tier value literals
+(`none`/`null`/`true`/`false`, silent misparse, unrescuable), 40 warning-tier
+`RESERVED_KEYWORD` words incl. `select`/`value`/`where`/`table` (loud, in principle
+rescuable). Recommendation updated from "implement quoting + diagnostic, do both" to
+reject-only two-tier **shipped** (CG058/CG059, superseded text kept in a collapsed
+`<details>` for history); backtick-quoting is deferred/optional and gated on (a) escape
+iff-in-`RESERVED_KEYWORD` mirroring `EscapeIdent`, (b) never shipping without CG058
+already in place, (c) a still-missing bare-soft-word live test. `remaining-work.md` §4 Q1
+marked RESOLVED with the reject-only decision. Appendix B's raw CLI transcript is
+untouched — only the "these words are reserved" interpretive gloss was wrong, not the
+observed data.
+
 ### preview.60 — live-substrate validation run: 7/7 smoke PASS + identifier-quoting verdict (remaining-work §1/§2) (DONE 2026-07-03)
 
 No code change — ran the section-8/9 harness against a live ephemeral **SurrealDB 3.1.4** (memory backend, fresh DB) and recorded results in [`docs/live-validation-2026-07-03.md`](live-validation-2026-07-03.md). **All 7 §1 smoke shapes PASS** (harness exit 0), no compile/emit fallout — the pinned tests already encoded the shapes. Item-2b ordering confirmed: the `[Version]` guard throws `SurrealVersionConflictException` first for a stale-snapshot save, while two concurrently-open transactions (both snapshots fresh at read) slip past the guard and conflict at COMMIT as substrate-MVCC `SurrealConflictException`. Identifier-quoting §2 verdict is a **hybrid**, not "quote everywhere": backticks rescue soft reserved words (`order`/`group`/`value`) in every emit position (DEFINE FIELD/INDEX, CREATE/UPDATE SET, WHERE/ORDER BY, subselect alias), but value literals `none`/`null`/`true`/`false` and `select` are unrescuable — `SET` errors `Expected an idiom` and a bare `DEFINE FIELD `none`` silently poisons all table reads (`Failed to get field definitions`). Follow-up PR should quote at the `SurrealFormatter.Identifier()` chokepoint + the four emitters *and* add a reserved-word diagnostic scoped to the unrescuable value-literal set. Trackers annotated: `Improvements.md` items 1–3, `remaining-work.md` §1/§2/§4-Q1. **480/480 green** (docs-only; no test delta).
